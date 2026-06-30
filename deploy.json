@@ -3,7 +3,7 @@
   "github_repo": "velog-auto-poster",
   "release_asset": "VelogPoster.zip",
   "default_bump": "patch",
-  "app_display_name": "벨로그 자동 포스팅",
+  "app_display_name": "Velog Auto Poster",
   "version": {
     "file": "paths.py",
     "variable": "APP_VERSION"
