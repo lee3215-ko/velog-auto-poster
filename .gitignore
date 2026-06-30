@@ -1,0 +1,22 @@
+# Build
+dist/
+build/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Release artifacts
+*.zip
+
+# User data (계정·설정 — GitHub에 올리지 않음)
+velog_settings.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

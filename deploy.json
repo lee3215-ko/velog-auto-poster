@@ -1,0 +1,28 @@
+{
+  "github_owner": "lee3215-ko",
+  "github_repo": "velog-auto-poster",
+  "release_asset": "VelogPoster.zip",
+  "default_bump": "patch",
+  "app_display_name": "벨로그 자동 포스팅",
+  "version": {
+    "file": "paths.py",
+    "variable": "APP_VERSION"
+  },
+  "build": {
+    "script": "build.bat",
+    "dist_dir": "dist/VelogPoster"
+  },
+  "git_add": [
+    "README.md",
+    "paths.py",
+    "updater.py",
+    "update_ui.py",
+    "velog_gui.py",
+    "velog_poster.py",
+    "tempmail_generator.py",
+    "requirements.txt",
+    "VelogPoster.spec",
+    "build.bat",
+    "run.bat"
+  ]
+}
