@@ -1,6 +1,6 @@
-﻿"""??踰꾩쟾쨌?낅뜲?댄듃 URL (諛고룷 ??publish.ps1 ???먮룞 媛깆떊)."""
+﻿"""앱 버전·업데이트 URL (배포 시 publish.ps1 이 자동 갱신)."""
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_NAME = "VelogPoster"
 EXE_NAME = "VelogPoster.exe"
 ZIP_INNER_FOLDER = "VelogPoster"

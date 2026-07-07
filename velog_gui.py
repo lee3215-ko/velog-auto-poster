@@ -114,6 +114,8 @@ class VelogApp(tk.Tk):
         self.image_folder = tk.StringVar()
         self.anchor_text = tk.StringVar()
         self.anchor_url = tk.StringVar()
+        self.homepage_search = tk.StringVar()
+        self._collapse_state = {"image": False, "advanced": False, "account": False}
         self.status = tk.StringVar(value="대기 중 — 계정을 등록한 뒤 [전체 출간 시작]을 누르세요.")
         self.tab_summary = tk.StringVar(value="계정 0개")
         self.progress_text = tk.StringVar(value="")
@@ -121,6 +123,7 @@ class VelogApp(tk.Tk):
         self.tabs: list[dict] = []
         self._active_tab: dict | None = None
         self.anchors: list[dict[str, str]] = []
+        self.homepages: list[str] = []
         self._events: queue.Queue[tuple[str, str]] = queue.Queue()
         self._poster: VelogPoster | None = None
         self._worker: threading.Thread | None = None
@@ -523,18 +526,71 @@ class VelogApp(tk.Tk):
         self.tm_log_box.tag_config("info", foreground="#94a3b8")
 
     def _build_inputs(self, parent: ttk.Frame) -> None:
-        # 공통 설정
-        common = self._section(parent, "공통 설정", "모든 계정에 동일하게 적용됩니다.")
-        common.columnconfigure(1, weight=1)
-        ttk.Label(common, text="이미지 폴더", style="Field.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 8),
+        # 이미지 · 사이트 URL (접기/펴기)
+        img_outer = ttk.Frame(parent, style="CardBorder.TFrame")
+        img_outer.pack(fill="x", pady=(0, 10))
+        img_card = ttk.Frame(img_outer, style="Card.TFrame", padding=(12, 10))
+        img_card.pack(fill="x", padx=1, pady=1)
+        self.image_btn = ttk.Button(
+            img_card,
+            text="▸  이미지 · 사이트 URL",
+            style="Ghost.TButton",
+            command=lambda: self._toggle_section("image"),
         )
-        ttk.Entry(common, textvariable=self.image_folder, font=(FONT, 9)).grid(
-            row=0, column=1, sticky="ew", ipady=4,
+        self.image_btn.pack(fill="x")
+        self.image_body = ttk.Frame(img_card, style="Card.TFrame")
+        self.image_body.columnconfigure(1, weight=1)
+
+        ttk.Label(self.image_body, text="이미지 폴더", style="Field.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=(8, 0),
         )
-        btn_folder = ttk.Button(common, text="찾기", style="Pick.TButton", command=self._browse_folder)
-        btn_folder.grid(row=0, column=2, padx=(6, 0))
+        ttk.Entry(self.image_body, textvariable=self.image_folder, font=(FONT, 9)).grid(
+            row=0, column=1, sticky="ew", ipady=4, pady=(8, 0),
+        )
+        btn_folder = ttk.Button(
+            self.image_body, text="찾기", style="Pick.TButton", command=self._browse_folder,
+        )
+        btn_folder.grid(row=0, column=2, padx=(6, 0), pady=(8, 0))
         ToolTip(btn_folder, "글 상단에 넣을 이미지가 있는 폴더를 선택합니다.")
+
+        ttk.Label(self.image_body, text="사이트 URL", style="Field.TLabel").grid(
+            row=1, column=0, sticky="nw", padx=(0, 8), pady=(12, 0),
+        )
+        hp_wrap = ttk.Frame(self.image_body, style="Card.TFrame")
+        hp_wrap.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(12, 0))
+        hp_wrap.columnconfigure(0, weight=1)
+        ttk.Label(
+            hp_wrap,
+            text="이미지 클릭 시 무작위로 연결 · 아래에 URL을 붙여넣어 일괄 추가",
+            style="Hint.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Label(hp_wrap, text="검색", style="Hint.TLabel").grid(row=1, column=0, sticky="w")
+        search_entry = ttk.Entry(hp_wrap, textvariable=self.homepage_search, font=(FONT, 9))
+        search_entry.grid(row=2, column=0, columnspan=2, sticky="ew", ipady=3, pady=(2, 4))
+        search_entry.bind("<KeyRelease>", lambda _e: self._refresh_homepage_list())
+        self.homepage_list = tk.Listbox(
+            hp_wrap, height=4, font=(FONT, 9), relief="solid", borderwidth=1,
+            activestyle="none", highlightthickness=0, selectmode="extended",
+        )
+        self.homepage_list.grid(row=3, column=0, columnspan=2, sticky="ew")
+        hp_sb = ttk.Scrollbar(hp_wrap, orient="vertical", command=self.homepage_list.yview)
+        hp_sb.grid(row=3, column=2, sticky="ns")
+        self.homepage_list.configure(yscrollcommand=hp_sb.set)
+        ttk.Button(
+            hp_wrap, text="선택 삭제", style="Pick.TButton", command=self._delete_homepage,
+        ).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Label(hp_wrap, text="URL 일괄 추가 (줄바꿈·쉼표 구분)", style="Hint.TLabel").grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(10, 2),
+        )
+        self.homepage_bulk = tk.Text(
+            hp_wrap, height=3, font=(FONT, 9), relief="solid", borderwidth=1,
+            wrap="word", highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=ACCENT,
+        )
+        self.homepage_bulk.grid(row=6, column=0, columnspan=3, sticky="ew")
+        ttk.Button(
+            hp_wrap, text="일괄 추가", style="Pick.TButton", command=self._bulk_add_homepages,
+        ).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
         # 고급 설정 (접기/펴기)
         adv_outer = ttk.Frame(parent, style="CardBorder.TFrame")
@@ -543,11 +599,10 @@ class VelogApp(tk.Tk):
         adv_card.pack(fill="x", padx=1, pady=1)
         self.adv_btn = ttk.Button(
             adv_card, text="▸  고급 설정 (프로필 · 앵커)", style="Ghost.TButton",
-            command=self._toggle_advanced,
+            command=lambda: self._toggle_section("advanced"),
         )
         self.adv_btn.pack(fill="x")
         self.adv_body = ttk.Frame(adv_card, style="Card.TFrame")
-        self._advanced_open = False
 
         ttk.Label(self.adv_body, text="프로필 이름 후보", style="Field.TLabel").pack(anchor="w", pady=(8, 2))
         ttk.Label(
@@ -594,11 +649,26 @@ class VelogApp(tk.Tk):
             self.adv_body, text="선택 삭제", style="Pick.TButton", command=self._delete_anchor,
         ).pack(anchor="e", pady=(4, 0))
 
-        # 계정 등록
-        card_body = self._section(
-            parent, "계정 등록",
-            "아이디와 인증 메일함만 입력해도 추가할 수 있습니다.",
+        # 계정 등록 (접기/펴기)
+        acc_outer = ttk.Frame(parent, style="CardBorder.TFrame")
+        acc_outer.pack(fill="x", pady=(0, 10))
+        acc_card = ttk.Frame(acc_outer, style="Card.TFrame", padding=(12, 10))
+        acc_card.pack(fill="x", padx=1, pady=1)
+        self.account_btn = ttk.Button(
+            acc_card,
+            text="▸  계정 등록",
+            style="Ghost.TButton",
+            command=lambda: self._toggle_section("account"),
         )
+        self.account_btn.pack(fill="x")
+        self.account_body = ttk.Frame(acc_card, style="Card.TFrame")
+        ttk.Label(
+            self.account_body,
+            text="아이디와 인증 메일함만 입력해도 추가할 수 있습니다.",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(8, 6))
+        card_body = ttk.Frame(self.account_body, style="Card.TFrame")
+        card_body.pack(fill="x")
         card_body.columnconfigure(1, weight=1)
         self._row(card_body, 0, "벨로그 아이디", self.velog_id, None)
         self._row(card_body, 1, "인증 메일함", self.inbox_url, None)
@@ -626,14 +696,27 @@ class VelogApp(tk.Tk):
         btn_bulk.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ToolTip(btn_bulk, "아이디와 메일함 URL을 번갈아 붙여넣어 한 번에 등록합니다.")
 
-    def _toggle_advanced(self) -> None:
-        if self._advanced_open:
-            self.adv_body.pack_forget()
-            self.adv_btn.configure(text="▸  고급 설정 (프로필 · 앵커)")
+    _SECTION_LABELS = {
+        "image": ("▸  이미지 · 사이트 URL", "▾  이미지 · 사이트 URL"),
+        "advanced": ("▸  고급 설정 (프로필 · 앵커)", "▾  고급 설정 (프로필 · 앵커)"),
+        "account": ("▸  계정 등록", "▾  계정 등록"),
+    }
+
+    def _toggle_section(self, key: str) -> None:
+        bodies = {
+            "image": (self.image_btn, self.image_body),
+            "advanced": (self.adv_btn, self.adv_body),
+            "account": (self.account_btn, self.account_body),
+        }
+        btn, body = bodies[key]
+        collapsed, expanded = self._SECTION_LABELS[key]
+        if self._collapse_state[key]:
+            body.pack_forget()
+            btn.configure(text=collapsed)
         else:
-            self.adv_body.pack(fill="x", pady=(8, 0))
-            self.adv_btn.configure(text="▾  고급 설정 (프로필 · 앵커)")
-        self._advanced_open = not self._advanced_open
+            body.pack(fill="x", pady=(8, 0))
+            btn.configure(text=expanded)
+        self._collapse_state[key] = not self._collapse_state[key]
 
     def _build_list(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent, style="Bg.TFrame")
@@ -854,8 +937,13 @@ class VelogApp(tk.Tk):
     # -- 파일/폴더 선택 ---------------------------------------------------
     def _browse_manuscript(self) -> None:
         path = filedialog.askopenfilename(
-            parent=self, title="원고 텍스트 파일 선택",
-            filetypes=[("텍스트 파일", "*.txt"), ("모든 파일", "*.*")],
+            parent=self, title="원고 파일 선택",
+            filetypes=[
+                ("원고 파일", "*.txt *.html *.htm"),
+                ("텍스트", "*.txt"),
+                ("HTML", "*.html *.htm"),
+                ("모든 파일", "*.*"),
+            ],
         )
         if path:
             self.manuscript.set(path)
@@ -1073,7 +1161,12 @@ class VelogApp(tk.Tk):
             return
         paths = filedialog.askopenfilenames(
             parent=self, title=f"{len(sel)}개 계정에 배정할 원고 파일 선택",
-            filetypes=[("텍스트 파일", "*.txt"), ("모든 파일", "*.*")],
+            filetypes=[
+                ("원고 파일", "*.txt *.html *.htm"),
+                ("텍스트", "*.txt"),
+                ("HTML", "*.html *.htm"),
+                ("모든 파일", "*.*"),
+            ],
         )
         if not paths:
             return
@@ -1111,8 +1204,13 @@ class VelogApp(tk.Tk):
         if col != "#5":
             return
         path = filedialog.askopenfilename(
-            parent=self, title="원고 텍스트 파일 선택",
-            filetypes=[("텍스트 파일", "*.txt"), ("모든 파일", "*.*")],
+            parent=self, title="원고 파일 선택",
+            filetypes=[
+                ("원고 파일", "*.txt *.html *.htm"),
+                ("텍스트", "*.txt"),
+                ("HTML", "*.html *.htm"),
+                ("모든 파일", "*.*"),
+            ],
         )
         if not path:
             return
@@ -1272,8 +1370,15 @@ class VelogApp(tk.Tk):
         self._poster = VelogPoster(self._post_event, self._on_result)
         profile_names = self._parse_profile_names()
         anchors = [dict(a) for a in self.anchors]
+        homepages = list(self.homepages)
         accounts = [
-            dict(a, image_folder=image_folder, profile_names=profile_names, anchors=anchors)
+            dict(
+                a,
+                image_folder=image_folder,
+                profile_names=profile_names,
+                anchors=anchors,
+                homepages=homepages,
+            )
             for a in pending
         ]
         self._worker = threading.Thread(target=self._run, args=(accounts,), daemon=True)
@@ -1312,6 +1417,52 @@ class VelogApp(tk.Tk):
         self.anchor_list.delete(0, "end")
         for a in self.anchors:
             self.anchor_list.insert("end", f"{a['anchor']}  →  {a['url']}")
+
+    def _delete_homepage(self) -> None:
+        selected = {self.homepage_list.get(i) for i in self.homepage_list.curselection()}
+        if not selected:
+            return
+        self.homepages = [u for u in self.homepages if u not in selected]
+        self._refresh_homepage_list()
+        self._save_settings()
+
+    def _bulk_add_homepages(self) -> None:
+        raw = self.homepage_bulk.get("1.0", "end").strip()
+        if not raw:
+            messagebox.showwarning("입력 확인", "추가할 URL을 입력해 주세요.", parent=self)
+            return
+        parts = re.split(r"[\s,;]+", raw)
+        added = 0
+        skipped = 0
+        for part in parts:
+            token = part.strip()
+            if not token:
+                continue
+            try:
+                url = normalize_url(token)
+            except PostingError:
+                skipped += 1
+                continue
+            if url in self.homepages:
+                skipped += 1
+                continue
+            self.homepages.append(url)
+            added += 1
+        self.homepage_bulk.delete("1.0", "end")
+        self._refresh_homepage_list()
+        self._save_settings()
+        messagebox.showinfo(
+            "일괄 추가 완료",
+            f"추가: {added}개\n건너뜀(중복·오류): {skipped}개",
+            parent=self,
+        )
+
+    def _refresh_homepage_list(self) -> None:
+        query = self.homepage_search.get().strip().lower()
+        self.homepage_list.delete(0, "end")
+        for url in self.homepages:
+            if not query or query in url.lower():
+                self.homepage_list.insert("end", url)
 
     def _parse_profile_names(self) -> list[str]:
         raw = self.profile_text.get("1.0", "end")
@@ -1654,6 +1805,17 @@ class VelogApp(tk.Tk):
                     for a in anchors
                     if isinstance(a, dict) and a.get("anchor") and a.get("url")
                 ]
+            pages = data.get("homepages", [])
+            if isinstance(pages, list):
+                self.homepages = []
+                for item in pages:
+                    raw = str(item).strip()
+                    if not raw:
+                        continue
+                    try:
+                        self.homepages.append(normalize_url(raw))
+                    except PostingError:
+                        continue
             generated = data.get("generated_emails", [])
             if isinstance(generated, list):
                 self.generated_emails = [
@@ -1672,6 +1834,7 @@ class VelogApp(tk.Tk):
         self.profile_text.delete("1.0", "end")
         self.profile_text.insert("1.0", ", ".join(names))
         self._refresh_anchor_list()
+        self._refresh_homepage_list()
         self._rebuild_tabs()
         if hasattr(self, "tm_tree"):
             self._refresh_tm_tree()
@@ -1685,6 +1848,7 @@ class VelogApp(tk.Tk):
                         "image_folder": self.image_folder.get().strip(),
                         "profile_names": self._parse_profile_names(),
                         "anchors": self.anchors,
+                        "homepages": self.homepages,
                         "tabs": tabs,
                         "generated_emails": self.generated_emails,
                     },

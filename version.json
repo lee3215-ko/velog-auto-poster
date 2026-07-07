@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.0",
+    "version":  "1.0.1",
     "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "First release: auto posting, TempMail, auto-update"
+    "notes":  "HTML 원고 지원, 해시태그 자동 입력, 사이트 URL 일괄 추가, UI 접기, 이미지 링크 버그 수정, 시작 시 자동 업데이트"
 }

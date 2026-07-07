@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import shutil
 import socket
 import string
@@ -110,8 +111,100 @@ def extract_velog_link(body: str) -> str:
     return candidates[-1]
 
 
-def read_manuscript(file_path: str) -> tuple[str, str]:
-    """원고 파일을 (제목, 본문) 으로 읽는다. 첫 줄=제목, 이후=본문."""
+def _strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def _is_html_manuscript(path: Path, text: str) -> bool:
+    if path.suffix.lower() in {".html", ".htm"}:
+        return True
+    return bool(re.search(r"<h1[\s>]", text, re.IGNORECASE))
+
+
+def _normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
+
+
+def _parse_tag_line(line: str) -> list[str] | None:
+    """한 줄이 #태그 #태그 형식이면 태그 목록을 반환."""
+    stripped = line.strip()
+    if "#" not in stripped:
+        return None
+    tags = [part.strip() for part in stripped.split("#") if part.strip()]
+    if not tags:
+        return None
+    rebuilt = " ".join(f"#{tag}" for tag in tags)
+    if _normalize_ws(rebuilt) != _normalize_ws(stripped):
+        return None
+    return tags
+
+
+def extract_hashtags(text: str) -> tuple[str, list[str]]:
+    """원고 맨 아래 #태그 줄을 분리한다. (#키워드 #키워드2 형식, 키워드에 공백 가능)"""
+    lines = text.splitlines()
+    tags: list[str] = []
+    while lines:
+        stripped = lines[-1].strip()
+        if not stripped:
+            lines.pop()
+            continue
+        parsed = _parse_tag_line(stripped)
+        if not parsed:
+            break
+        tags = parsed + tags
+        lines.pop()
+    body = "\n".join(lines).rstrip("\n")
+    return body, tags
+
+
+def extract_summary(body: str, max_len: int = 150) -> str:
+    """출간 소개란용 — 원고 상단 본문을 평문으로 추출."""
+    text = body
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"#{1,6}\s+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    for chunk in re.split(r"(?<=[.!?。])\s+|\n+", text):
+        chunk = chunk.strip()
+        if chunk:
+            return chunk[:max_len]
+    return text[:max_len]
+
+
+def _parse_markdown_manuscript(text: str) -> tuple[str, str, list[str]]:
+    lines = text.splitlines()
+    if not lines or not lines[0].strip():
+        raise PostingError("원고 첫 줄에 제목이 없습니다.")
+    title = lines[0].strip()
+    body, tags = extract_hashtags("\n".join(lines[1:]).lstrip("\n"))
+    if not body.strip():
+        raise PostingError("원고 본문이 없습니다.")
+    return title, body, tags
+
+
+def _parse_html_manuscript(text: str) -> tuple[str, str, list[str]]:
+    match = re.search(r"<h1\b[^>]*>(.*?)</h1>", text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        raise PostingError("HTML 원고에서 <h1> 제목을 찾지 못했습니다.")
+    title = _strip_html(match.group(1))
+    if not title:
+        raise PostingError("HTML 원고의 <h1> 제목이 비어 있습니다.")
+    body_without_h1 = (text[: match.start()] + text[match.end() :]).strip()
+    body, tags = extract_hashtags(body_without_h1)
+    if not body.strip():
+        raise PostingError("HTML 원고 본문이 없습니다.")
+    return title, body, tags
+
+
+def read_manuscript(file_path: str) -> tuple[str, str, list[str]]:
+    """원고 파일을 (제목, 본문, 태그) 로 읽는다.
+
+  - 마크다운: 첫 줄=제목, 맨 아래 #태그
+  - HTML: <h1> 제목(위치 무관), 맨 아래 #태그
+    """
     path = Path(file_path)
     if not path.is_file():
         raise PostingError(f"원고 파일을 찾지 못했습니다: {path.name}")
@@ -122,14 +215,9 @@ def read_manuscript(file_path: str) -> tuple[str, str]:
     except OSError as exc:
         raise PostingError(f"원고 파일을 읽지 못했습니다: {path.name}") from exc
 
-    lines = text.splitlines()
-    if not lines or not lines[0].strip():
-        raise PostingError("원고 첫 줄에 제목이 없습니다.")
-    title = lines[0].strip()
-    body = "\n".join(lines[1:]).lstrip("\n")
-    if not body.strip():
-        raise PostingError("원고 본문이 없습니다.")
-    return title, body
+    if _is_html_manuscript(path, text):
+        return _parse_html_manuscript(text)
+    return _parse_markdown_manuscript(text)
 
 
 def find_chrome() -> Path:
@@ -254,8 +342,10 @@ class VelogPoster:
         """한 계정의 전체 흐름을 수행한다."""
         velog_id = account["velog_id"].strip()
         inbox_url = normalize_url(account["inbox_url"])
-        title, body = read_manuscript(account["manuscript_path"])
+        title, body, tags = read_manuscript(account["manuscript_path"])
+        summary = extract_summary(body)
         image_folder = (account.get("image_folder") or "").strip()
+        homepages = [str(u).strip() for u in (account.get("homepages") or []) if str(u).strip()]
         parse_tempmail_address(inbox_url)  # 사전 검증
 
         # 원고 제일 아래에 앵커텍스트 링크를 추가한다. (등록된 것 중 무작위)
@@ -284,13 +374,13 @@ class VelogPoster:
             self.log("로그인 중.. (기존 계정)", "info")
         # 회원가입 단계에서 재연결했을 수 있으니 연결을 보장한다.
         self._ensure_connected(pw)
-        target = self._write_post(self._first_page(), title, body)
+        target = self._write_post(self._first_page(), title, body, tags=tags)
 
         if image_folder:
-            # [테스트] 등록 이미지에 홈페이지(앵커 URL) 링크를 건다.
-            self._insert_random_image(target, image_folder, link_url=anchor_url)
+            image_link = random.choice(homepages) if homepages else ""
+            self._insert_random_image(target, image_folder, link_url=image_link)
 
-        url = self._publish(pw, target)
+        url = self._publish(pw, target, tags, summary=summary)
         if url and self.on_result is not None:
             try:
                 self.on_result(velog_id, url)
@@ -764,7 +854,7 @@ class VelogPoster:
         self.log("약관 동의 체크박스를 자동으로 누르지 못했습니다. 창에서 직접 체크해 주세요.", "error")
 
     # -- 글 작성 ----------------------------------------------------------
-    def _write_post(self, page: Page, title: str, body: str) -> Page:
+    def _write_post(self, page: Page, title: str, body: str, tags: list[str] | None = None) -> Page:
         assert self._context is not None
         # 인증 후 velog 탭으로 이동
         target = next(
@@ -780,6 +870,12 @@ class VelogPoster:
         self.log("새 글 작성 버튼을 누르는 중...", "info")
         self._click_write_button(target)
         self._wait("작성 화면이 준비되기를 기다리는 중...", _jitter(4))
+
+        tag_list = [t.strip().lstrip("#").strip() for t in (tags or []) if t.strip()]
+        if tag_list:
+            self.log(f"원고 해시태그 {len(tag_list)}개 → 태그 입력란에 먼저 등록합니다.", "info")
+            if not self._fill_tags(target, tag_list):
+                self.log("태그 자동 입력에 실패했습니다. 작성 화면에서 직접 입력해 주세요.", "error")
 
         # 제목 입력 (붙여넣기) — 포커스 경쟁으로 가끔 실패하므로 검증 후 재시도.
         self.log("제목을 입력하는 중...", "info")
@@ -926,7 +1022,7 @@ class VelogPoster:
                 now = editor.evaluate("(el) => el.CodeMirror.getValue()")
             except Error:
                 continue
-            if "![" in now and now != before:
+            if ("![" in now or "<img" in now.lower()) and now != before:
                 self.log("이미지가 본문에 등록되었습니다.", "info")
                 if link_url:
                     self._link_image(target, editor, link_url)
@@ -934,20 +1030,33 @@ class VelogPoster:
         raise PostingError("이미지 업로드가 시간 내에 끝나지 않았습니다.")
 
     def _link_image(self, target: Page, editor, link_url: str) -> None:
-        """본문 첫 이미지 마크다운 ![..](..) 을 [![..](..)](link_url) 로 감싸
-        이미지 클릭 시 홈페이지로 이동하게 한다."""
+        """본문 첫 이미지에 홈페이지 링크를 연결한다 (마크다운/HTML)."""
         try:
             wrapped = editor.evaluate(
                 """(el, url) => {
                     const cm = el.CodeMirror;
                     let v = cm.getValue();
-                    const m = v.match(/!\\[[^\\]]*\\]\\([^)]*\\)/);
-                    if (!m) return false;
-                    const img = m[0];
-                    // 이미 링크로 감싸져 있으면 건너뛴다.
-                    const idx = v.indexOf(img);
-                    if (idx > 0 && v[idx - 1] === '[') return false;
-                    v = v.replace(img, '[' + img + '](' + url + ')');
+                    const mdRe = /!\\[[^\\]]*\\]\\([^)]*\\)/;
+                    const md = mdRe.exec(v);
+                    if (md) {
+                        const img = md[0];
+                        const idx = md.index;
+                        if (idx > 0 && v.charAt(idx - 1) === '[') return true;
+                        v = v.slice(0, idx) + '[' + img + '](' + url + ')' + v.slice(idx + img.length);
+                    } else {
+                        const htmlRe = /<img\\b[^>]*>/i;
+                        const hm = htmlRe.exec(v);
+                        if (!hm) return false;
+                        const tag = hm[0];
+                        const idx = hm.index;
+                        const before = v.slice(Math.max(0, idx - 80), idx);
+                        if (/<a\\b[^>]*>\\s*$/i.test(before)) return true;
+                        v = v.slice(0, idx)
+                          + '<a href="' + url + '" target="_blank" rel="noopener noreferrer">'
+                          + tag + '</a>' + v.slice(idx + tag.length);
+                    }
+                    // 이미지 링크 감싸기 실패로 남는 고립된 '[' 제거
+                    v = v.replace(/^\\[\\s*\\r?\\n(?=!\\[)/, '');
                     cm.setValue(v);
                     return true;
                 }""",
@@ -958,8 +1067,53 @@ class VelogPoster:
         except Error:
             self.log("이미지 링크 연결에 실패했습니다(이미지는 정상 등록됨).", "info")
 
+    def _fill_tags(self, target: Page, tags: list[str]) -> bool:
+        """작성 화면/출간 패널의 '태그를 입력하세요' input 에 태그를 등록."""
+        if not tags:
+            return True
+        try:
+            tag_input = target.locator('input[placeholder="태그를 입력하세요"]').first
+            tag_input.wait_for(state="visible", timeout=15_000)
+        except Error:
+            return False
+
+        added = 0
+        for keyword in tags:
+            if not keyword:
+                continue
+            try:
+                tag_input.click(timeout=5_000)
+                self._sleep(_jitter(0.35, 0.2))
+                self._copy_to_clipboard(target, keyword)
+                tag_input.fill("")
+                self._sleep(_jitter(0.2, 0.1))
+                target.keyboard.press("Control+v")
+                self._sleep(_jitter(0.4, 0.2))
+                target.keyboard.press("Enter")
+                self._sleep(_jitter(0.55, 0.3))
+                added += 1
+            except Error:
+                self.log(f"태그 입력 실패: {keyword}", "error")
+        if added:
+            self.log(f"태그 {added}개 입력 완료.", "success")
+        return added > 0
+
+    def _fill_publish_summary(self, page: Page, summary: str) -> None:
+        """출간 패널 소개란 입력."""
+        if not summary:
+            return
+        self._sleep(_jitter(0.8, 0.4))
+        desc = page.get_by_placeholder("당신의 포스트를 짧게 소개해보세요")
+        desc.wait_for(state="visible", timeout=12_000)
+        desc.click(timeout=5_000)
+        self._sleep(_jitter(0.3, 0.2))
+        desc.fill("")
+        desc.fill(summary)
+        self._sleep(_jitter(0.5, 0.3))
+        self.log(f"소개 입력: {summary[:40]}{'…' if len(summary) > 40 else ''}", "info")
+
     # -- 출간 ------------------------------------------------------------
-    def _publish(self, pw, target: Page) -> str | None:
+    def _publish(self, pw, target: Page, tags: list[str] | None = None, summary: str = "") -> str | None:
         """출간 단계.
 
         Cloudflare Turnstile 은 출간 패널이 '처음 렌더링되는 순간'의 브라우저
@@ -979,8 +1133,10 @@ class VelogPoster:
         if not self._endpoint:
             return None
 
-        panel_opened = False  # 출간 패널(첫 '출간하기')을 이미 눌렀는지
+        panel_opened = False
+        summary_filled = False
         clicked_publish = False
+        summary_text = (summary or "").strip()
         # 패널 열기 → (끊고 인증 통과 대기) → 활성화되면 최종 출간 클릭, 을 감시한다.
         for _ in range(120):  # 약 6분
             if self._stop.wait(0):
@@ -1013,13 +1169,23 @@ class VelogPoster:
                             panel_opened = True
                         # 클릭 직후 곧바로 연결을 끊어(아래 finally),
                         # 인증이 깨끗한 상태에서 검증되도록 한다.
-                    elif not final.first.is_disabled():
-                        # 인증 통과 상태 → 최종 출간 클릭 후, 연결을 끊고
-                        # 깨끗한 상태에서 게시글 주소로 리다이렉트되길 기다린다.
-                        self.log("인증 통과 확인 → 자동으로 출간합니다.", "info")
-                        self._sleep(_jitter(0.4, 0.3))
-                        final.first.click(timeout=15_000)
-                        clicked_publish = True
+                    else:
+                        if summary_text and not summary_filled:
+                            try:
+                                self._fill_publish_summary(page, summary_text)
+                                summary_filled = True
+                            except (Error, PWTimeoutError):
+                                self.log(
+                                    "소개 자동 입력에 실패했습니다. 출간 패널에서 직접 입력해 주세요.",
+                                    "error",
+                                )
+                        if not final.first.is_disabled() and not clicked_publish:
+                            # 인증 통과 상태 → 최종 출간 클릭 후, 연결을 끊고
+                            # 깨끗한 상태에서 게시글 주소로 리다이렉트되길 기다린다.
+                            self.log("인증 통과 확인 → 자동으로 출간합니다.", "info")
+                            self._sleep(_jitter(0.4, 0.3))
+                            final.first.click(timeout=15_000)
+                            clicked_publish = True
                     # else: 패널은 열렸지만 아직 인증 미통과 → 끊고 대기.
             except (Error, PWTimeoutError):
                 pass

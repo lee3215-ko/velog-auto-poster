@@ -26,26 +26,49 @@ def schedule_update_check(
     current_version: str,
     app_name: str = APP_NAME,
     exe_name: str = EXE_NAME,
-    delay_ms: int = 2500,
+    delay_ms: int = 1500,
     zip_inner_folder: str | None = ZIP_INNER_FOLDER,
+    auto_apply: bool = True,
 ) -> None:
+    """앱 시작 시 GitHub version.json 확인 → 새 버전이면 업데이트 안내(또는 자동 적용)."""
     if not version_url.strip():
         return
 
     def worker() -> None:
         info = check_for_update(version_url, current_version, app_name=app_name)
         if info is not None:
-            root.after(0, lambda: _show_dialog(root, info, current_version, app_name, exe_name, zip_inner_folder))
+            root.after(
+                0,
+                lambda: _show_dialog(
+                    root, info, current_version, app_name, exe_name, zip_inner_folder, auto_apply,
+                ),
+            )
 
     root.after(delay_ms, lambda: threading.Thread(target=worker, daemon=True).start())
 
 
-def _show_dialog(root, info: UpdateInfo, current_version: str, app_name: str, exe_name: str, zip_inner_folder):
+def _show_dialog(
+    root,
+    info: UpdateInfo,
+    current_version: str,
+    app_name: str,
+    exe_name: str,
+    zip_inner_folder,
+    auto_apply: bool,
+):
     message = f"새 버전 {info.version}이 있습니다.\n(현재: {current_version})"
     if info.notes:
         message += f"\n\n{info.notes}"
 
     if can_auto_update() and info.url:
+        if auto_apply:
+            message += (
+                "\n\n앱을 종료한 뒤 자동으로 업데이트합니다."
+                "\n(계정·설정은 그대로 유지됩니다)"
+            )
+            if messagebox.askokcancel("업데이트", message, parent=root):
+                _auto_update(root, info, app_name, exe_name, zip_inner_folder)
+            return
         message += (
             "\n\n「예」= 자동 업데이트 후 재실행"
             "\n(계정·설정은 그대로 유지됩니다)"
