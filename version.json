@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.4",
-    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "자동 업데이트 수정: version.json BOM 파싱 오류, 업데이터 안정화"
+    "version": "1.0.5",
+    "url": "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "notes": "업데이트 창 중앙 배치, CMD 창 없이 조용히 자동 업데이트"
 }

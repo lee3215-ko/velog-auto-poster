@@ -201,62 +201,78 @@ def download_file(
                     on_progress(downloaded, total)
 
 
-def _write_update_batch(batch_path: Path, preserve_files: frozenset[str]) -> None:
-    preserve_list = ",".join(sorted(preserve_files))
-    batch_path.write_text(
-        rf"""@echo off
-setlocal EnableExtensions
-set "ZIP=%~1"
-set "INSTALL=%~2"
-set "EXE=%~3"
-set "INNER=%~4"
-set "WAITEXE=%~5"
-set "STAGING=%TEMP%\app_update_%RANDOM%"
-set "BACKUP=%TEMP%\app_update_backup_%RANDOM%"
-
-:wait
-timeout /t 2 /nobreak >nul
-tasklist /FI "IMAGENAME eq %WAITEXE%" 2>nul | find /I "%WAITEXE%" >nul
-if not errorlevel 1 goto wait
-
-for %%F in ({preserve_list}) do (
-  if exist "%INSTALL%\%%F" (
-    if not exist "%BACKUP%" mkdir "%BACKUP%"
-    copy /Y "%INSTALL%\%%F" "%BACKUP%\%%F" >nul
-  )
+def _write_update_script(script_path: Path, preserve_files: frozenset[str]) -> None:
+    preserve_array = ", ".join(f'"{name}"' for name in sorted(preserve_files))
+    script_path.write_text(
+        rf"""param(
+    [string]$Zip,
+    [string]$Install,
+    [string]$Exe,
+    [string]$Inner,
+    [string]$WaitExe
 )
+$ErrorActionPreference = 'Stop'
+$Staging = Join-Path $env:TEMP ("app_update_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$Backup = Join-Path $env:TEMP ("app_update_backup_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$Preserve = @({preserve_array})
+$ProcName = [System.IO.Path]::GetFileNameWithoutExtension($WaitExe)
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath $env:ZIP -DestinationPath $env:STAGING -Force"
-if errorlevel 1 goto fail
+while (Get-Process -Name $ProcName -ErrorAction SilentlyContinue) {{
+    Start-Sleep -Seconds 2
+}}
 
-if exist "%STAGING%\%INNER%" (
-  robocopy "%STAGING%\%INNER%" "%INSTALL%" /E /IS /IT /R:3 /W:1 /XF {preserve_list} >nul
-) else (
-  robocopy "%STAGING%" "%INSTALL%" /E /IS /IT /R:3 /W:1 /XF {preserve_list} >nul
-)
-if errorlevel 8 goto fail
+foreach ($fileName in $Preserve) {{
+    $src = Join-Path $Install $fileName
+    if (Test-Path -LiteralPath $src) {{
+        New-Item -ItemType Directory -Path $Backup -Force | Out-Null
+        Copy-Item -LiteralPath $src -Destination (Join-Path $Backup $fileName) -Force
+    }}
+}}
 
-for %%F in ({preserve_list}) do (
-  if exist "%BACKUP%\%%F" copy /Y "%BACKUP%\%%F" "%INSTALL%\%%F" >nul
-)
+Expand-Archive -LiteralPath $Zip -DestinationPath $Staging -Force
 
-rd /s /q "%STAGING%" 2>nul
-rd /s /q "%BACKUP%" 2>nul
-del /f /q "%ZIP%" 2>nul
-start "" "%EXE%"
-endlocal
-del "%~f0"
-exit /b 0
+$source = $Staging
+$innerPath = Join-Path $Staging $Inner
+if (Test-Path -LiteralPath $innerPath) {{
+    $source = $innerPath
+}}
 
-:fail
-rd /s /q "%STAGING%" 2>nul
-rd /s /q "%BACKUP%" 2>nul
-msg * "Update failed. Download the zip manually from GitHub Releases."
-endlocal
-del "%~f0"
-exit /b 1
+$xfArgs = @()
+foreach ($fileName in $Preserve) {{
+    $xfArgs += '/XF'
+    $xfArgs += $fileName
+}}
+& robocopy $source $Install /E /IS /IT /R:3 /W:1 @xfArgs | Out-Null
+if ($LASTEXITCODE -ge 8) {{
+    throw "robocopy failed with exit code $LASTEXITCODE"
+}}
+
+foreach ($fileName in $Preserve) {{
+    $bak = Join-Path $Backup $fileName
+    if (Test-Path -LiteralPath $bak) {{
+        Copy-Item -LiteralPath $bak -Destination (Join-Path $Install $fileName) -Force
+    }}
+}}
+
+Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $Backup -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
+Start-Process -FilePath $Exe
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 """,
         encoding="utf-8",
+    )
+
+
+def _launch_hidden(args: list[str]) -> None:
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    subprocess.Popen(
+        args,
+        startupinfo=startupinfo,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        close_fds=True,
     )
 
 
@@ -274,21 +290,23 @@ def schedule_apply_update(
     target_dir = install_dir or get_install_dir()
     inner = zip_inner_folder or target_dir.name
     exe_path = target_dir / exe_name
-    batch_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.bat"
-    _write_update_batch(batch_path, _PRESERVE_FILES)
+    script_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.ps1"
+    _write_update_script(script_path, _PRESERVE_FILES)
 
-    creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-    subprocess.Popen(
+    _launch_hidden(
         [
-            "cmd.exe",
-            "/c",
-            str(batch_path),
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+            str(script_path),
             str(zip_path),
             str(target_dir),
             str(exe_path),
             inner,
             exe_name,
         ],
-        creationflags=creationflags,
-        close_fds=True,
     )
