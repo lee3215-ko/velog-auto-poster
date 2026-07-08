@@ -1,5 +1,5 @@
 {
-    "version": "1.0.3",
-    "url": "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes": "자동 업데이트 테스트용 (1.0.1→1.0.3)"
+    "version":  "1.0.4",
+    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "notes":  "자동 업데이트 수정: version.json BOM 파싱 오류, 업데이터 안정화"
 }
