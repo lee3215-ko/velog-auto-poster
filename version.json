@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.2",
+    "version":  "1.0.3",
     "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "발행완료/발행실패 폴더로 원고 자동 이동, 해시태그·HTML 원고 개선"
+    "notes":  "자동 업데이트 테스트용 (1.0.1→1.0.3)"
 }
