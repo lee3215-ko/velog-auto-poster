@@ -220,6 +220,28 @@ def read_manuscript(file_path: str) -> tuple[str, str, list[str]]:
     return _parse_markdown_manuscript(text)
 
 
+MANUSCRIPT_DONE_DIR = "발행완료"
+MANUSCRIPT_FAILED_DIR = "발행실패"
+
+
+def relocate_manuscript(manuscript_path: str, *, success: bool) -> str:
+    """원고 파일을 같은 폴더의 발행완료/발행실패 하위 폴더로 옮긴다."""
+    src = Path(manuscript_path)
+    if not src.is_file():
+        raise PostingError(f"원고 파일을 찾지 못했습니다: {src.name}")
+    dest_dir = src.parent / (MANUSCRIPT_DONE_DIR if success else MANUSCRIPT_FAILED_DIR)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    if dest.exists():
+        stem, suffix = src.stem, src.suffix
+        n = 2
+        while dest.exists():
+            dest = dest_dir / f"{stem}_{n}{suffix}"
+            n += 1
+    shutil.move(str(src), str(dest))
+    return str(dest)
+
+
 def find_chrome() -> Path:
     """설치된 실제 Google Chrome 실행 파일을 찾는다."""
     keys = ["LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"]
@@ -270,11 +292,13 @@ def make_bio(name: str) -> str:
 # 메인 엔진
 # ---------------------------------------------------------------------------
 class VelogPoster:
-    def __init__(self, log: LogCallback, on_result=None) -> None:
+    def __init__(self, log: LogCallback, on_result=None, on_failed=None) -> None:
         self._emit = log
         self._prefix = ""  # 진행 중 계정 번호 표시 (예: "[2/5] ")
         # on_result(velog_id, url): 한 계정 발행이 끝나면 결과 URL 을 알린다.
+        # on_failed(velog_id, manuscript_path): 발행 실패 시 원고 정리용.
         self.on_result = on_result
+        self.on_failed = on_failed
         self._stop = threading.Event()
         self._process: subprocess.Popen | None = None
         self._browser = None
@@ -322,12 +346,15 @@ class VelogPoster:
                     self.log(f"{label}: 출간 완료 ✅", "success")
                 except PostingError as exc:
                     self.log(f"{label}: {exc}", "error")
+                    self._notify_failed(label, account)
                 except PWTimeoutError:
                     self.log(f"{label}: 화면 요소를 시간 내에 찾지 못했습니다.", "error")
+                    self._notify_failed(label, account)
                 except Error as exc:
                     if self._stop.is_set():
                         break
                     self.log(f"{label}: 브라우저 오류 - {exc}", "error")
+                    self._notify_failed(label, account)
                 finally:
                     # 다음 계정을 위해 이 계정의 Chrome 을 완전히 닫고 정리한다.
                     self._teardown_account()
@@ -337,6 +364,17 @@ class VelogPoster:
             self.log("작업을 중단했습니다.", "info")
         else:
             self.log(f"전체 완료: {completed}/{total}개 계정 출간 🎉", "success")
+
+    def _notify_failed(self, velog_id: str, account: dict[str, str]) -> None:
+        if self.on_failed is None:
+            return
+        path = str(account.get("manuscript_path", "")).strip()
+        if not path:
+            return
+        try:
+            self.on_failed(velog_id, path)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _run_one(self, pw, chrome: Path, account: dict[str, str]) -> None:
         """한 계정의 전체 흐름을 수행한다."""

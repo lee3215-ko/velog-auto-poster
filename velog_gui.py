@@ -32,6 +32,9 @@ from velog_poster import (
     normalize_url,
     parse_tempmail_address,
     read_manuscript,
+    relocate_manuscript,
+    MANUSCRIPT_DONE_DIR,
+    MANUSCRIPT_FAILED_DIR,
 )
 
 
@@ -1367,7 +1370,7 @@ class VelogApp(tk.Tk):
         self._save_settings()
         self._set_running(True)
         self._append(f"[{tab['title']}] 미발행 {len(pending)}개 계정 자동 출간을 시작합니다.", "info")
-        self._poster = VelogPoster(self._post_event, self._on_result)
+        self._poster = VelogPoster(self._post_event, self._on_result, self._on_failed)
         profile_names = self._parse_profile_names()
         anchors = [dict(a) for a in self.anchors]
         homepages = list(self.homepages)
@@ -1386,6 +1389,9 @@ class VelogApp(tk.Tk):
 
     def _on_result(self, velog_id: str, url: str) -> None:
         self._events.put((f"{velog_id}\t{url}", "result"))
+
+    def _on_failed(self, velog_id: str, manuscript_path: str) -> None:
+        self._events.put((f"{velog_id}\t{manuscript_path}", "failed"))
 
     def _add_anchor(self) -> None:
         text = self.anchor_text.get().strip()
@@ -1518,6 +1524,10 @@ class VelogApp(tk.Tk):
                     self._set_progress(self._run_done, self._run_total)
                     self._mark_published(velog_id, url)
                     continue
+                if level == "failed":
+                    velog_id, _, manuscript_path = message.partition("\t")
+                    self._mark_failed(velog_id, manuscript_path)
+                    continue
                 self.status.set(message)
                 tag = "success" if level == "success" else ("error" if level == "error" else "info")
                 self._append(message, tag)
@@ -1531,21 +1541,55 @@ class VelogApp(tk.Tk):
             return
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         accounts = tab["accounts"]
+        target: dict | None = None
         for acc in accounts:
             if acc.get("velog_id") == velog_id and not acc.get("published_url"):
-                acc["published_url"] = url
-                acc["published_at"] = now
+                target = acc
                 break
-        else:
+        if target is None:
             for acc in accounts:
                 if acc.get("velog_id") == velog_id:
-                    acc["published_url"] = url
-                    acc["published_at"] = now
+                    target = acc
                     break
+        if target is None:
+            return
+        target["published_url"] = url
+        target["published_at"] = now
+        self._relocate_manuscript(target, success=True)
         self._fill_tree(tab)
         self._update_summary()
         self._save_settings()
         self._append(f"{velog_id} 발행됨: {url}", "success")
+
+    def _mark_failed(self, velog_id: str, manuscript_path: str) -> None:
+        tab = self._active_tab or self._current_tab()
+        if tab is None:
+            return
+        for acc in tab["accounts"]:
+            if acc.get("velog_id") != velog_id:
+                continue
+            if manuscript_path and acc.get("manuscript_path", "") != manuscript_path:
+                continue
+            self._relocate_manuscript(acc, success=False)
+            break
+        self._fill_tree(tab)
+        self._save_settings()
+        self._append(f"{velog_id} 발행 실패 — 원고를 {MANUSCRIPT_FAILED_DIR} 폴더로 옮겼습니다.", "error")
+
+    def _relocate_manuscript(self, acc: dict, *, success: bool) -> None:
+        path = str(acc.get("manuscript_path", "")).strip()
+        if not path:
+            return
+        folder = MANUSCRIPT_DONE_DIR if success else MANUSCRIPT_FAILED_DIR
+        try:
+            new_path = relocate_manuscript(path, success=success)
+            if success:
+                acc["manuscript_path"] = ""
+            else:
+                acc["manuscript_path"] = new_path
+            self._append(f"원고 이동 → {folder}/{Path(new_path).name}", "info")
+        except (PostingError, OSError) as exc:
+            self._append(f"원고 이동 실패 ({Path(path).name}): {exc}", "error")
 
     def _set_running(self, running: bool) -> None:
         self.start_btn.configure(state="disabled" if running else "normal")
