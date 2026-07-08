@@ -54,7 +54,9 @@ function Write-VersionJson($cfg, [string]$Version, [string]$ReleaseNotes) {
         url     = $downloadUrl
         notes   = $ReleaseNotes
     } | ConvertTo-Json -Depth 3
-    Set-Content -Path (Join-Path $Root "version.json") -Value $payload -Encoding UTF8
+    $path = Join-Path $Root "version.json"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($path, $payload, $utf8NoBom)
 }
 
 function Ensure-GitRemote($cfg) {

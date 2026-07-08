@@ -58,6 +58,14 @@ def _github_api_url(raw_url: str) -> str | None:
     )
 
 
+def _decode_json_bytes(data: bytes) -> dict:
+    text = data.decode("utf-8-sig")
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("version.json must be a JSON object")
+    return payload
+
+
 def _fetch_via_github_api(api_url: str, user_agent: str) -> dict | None:
     request = urllib.request.Request(
         api_url,
@@ -66,13 +74,10 @@ def _fetch_via_github_api(api_url: str, user_agent: str) -> dict | None:
             "Accept": "application/vnd.github+json",
         },
     )
-    with urllib.request.urlopen(request, timeout=8) as response:
-        meta = json.loads(response.read().decode("utf-8"))
-    content = base64.b64decode(meta["content"]).decode("utf-8")
-    payload = json.loads(content)
-    if not isinstance(payload, dict):
-        raise ValueError("version.json must be a JSON object")
-    return payload
+    with urllib.request.urlopen(request, timeout=12) as response:
+        meta = json.loads(response.read().decode("utf-8-sig"))
+    content = base64.b64decode(meta["content"]).decode("utf-8-sig")
+    return _decode_json_bytes(content.encode("utf-8"))
 
 
 def _fetch_via_raw_url(raw_url: str, user_agent: str) -> dict:
@@ -84,17 +89,49 @@ def _fetch_via_raw_url(raw_url: str, user_agent: str) -> dict:
         busted_url,
         headers={"User-Agent": user_agent, "Cache-Control": "no-cache"},
     )
-    with urllib.request.urlopen(request, timeout=8) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("version.json must be a JSON object")
-    return payload
+    with urllib.request.urlopen(request, timeout=12) as response:
+        return _decode_json_bytes(response.read())
+
+
+def _fetch_via_releases_api(owner: str, repo: str, user_agent: str) -> dict | None:
+    """version.json 이 깨져 있어도 최신 Release 정보를 가져온다."""
+    import requests
+
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    response = requests.get(
+        api_url,
+        headers={"User-Agent": user_agent, "Accept": "application/vnd.github+json"},
+        timeout=12,
+    )
+    if not response.ok:
+        return None
+    data = response.json()
+    tag = str(data.get("tag_name", "")).strip().lstrip("v")
+    if not tag:
+        return None
+    download = ""
+    for asset in data.get("assets", []):
+        name = str(asset.get("name", ""))
+        if name.lower().endswith(".zip"):
+            download = str(asset.get("browser_download_url", "")).strip()
+            break
+    if not download:
+        download = f"https://github.com/{owner}/{repo}/releases/latest/download/VelogPoster.zip"
+    return {
+        "version": tag,
+        "url": download,
+        "notes": str(data.get("body", "")).strip(),
+    }
 
 
 def fetch_version_payload(version_url: str, user_agent: str) -> dict | None:
     url = version_url.strip()
     if not url:
         return None
+    match = _RAW_GITHUB_RE.match(url)
+    owner = match.group("owner") if match else ""
+    repo = match.group("repo") if match else ""
+
     api_url = _github_api_url(url)
     if api_url:
         try:
@@ -104,7 +141,13 @@ def fetch_version_payload(version_url: str, user_agent: str) -> dict | None:
     try:
         return _fetch_via_raw_url(url, user_agent)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
-        return None
+        pass
+    if owner and repo:
+        try:
+            return _fetch_via_releases_api(owner, repo, user_agent)
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 def check_for_update(version_url: str, current_version: str, *, app_name: str = "App") -> UpdateInfo | None:
