@@ -239,13 +239,32 @@ if (Test-Path -LiteralPath $innerPath) {{
 
 $xfArgs = @()
 foreach ($fileName in $Preserve) {{
-    $xfArgs += '/XF'
     $xfArgs += $fileName
 }}
-& robocopy $source $Install /E /IS /IT /R:3 /W:1 @xfArgs | Out-Null
-if ($LASTEXITCODE -ge 8) {{
-    throw "robocopy failed with exit code $LASTEXITCODE"
+
+function Copy-UpdateTree {{
+    param(
+        [string]$Source,
+        [string]$Dest,
+        [string[]]$Exclude
+    )
+    $excludeSet = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($name in $Exclude) {{ [void]$excludeSet.Add($name) }}
+    New-Item -ItemType Directory -Path $Dest -Force | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {{
+        if ($excludeSet.Contains($item.Name)) {{ continue }}
+        $target = Join-Path $Dest $item.Name
+        if ($item.PSIsContainer) {{
+            Copy-UpdateTree -Source $item.FullName -Dest $target -Exclude $Exclude
+        }} else {{
+            Copy-Item -LiteralPath $item.FullName -Destination $target -Force
+        }}
+    }}
 }}
+
+Copy-UpdateTree -Source $source -Dest $Install -Exclude $xfArgs
 
 foreach ($fileName in $Preserve) {{
     $bak = Join-Path $Backup $fileName
@@ -264,12 +283,32 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
     )
 
 
-def _launch_hidden(args: list[str]) -> None:
+def _quote_cmd_arg(value: str) -> str:
+    text = str(value)
+    if not text or any(ch in text for ch in ' \t"'):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def _launch_hidden(script_path: Path, script_args: list[str]) -> None:
+    """WScript로 PowerShell을 완전히 숨긴 상태로 실행한다."""
+    quoted_args = " ".join(_quote_cmd_arg(arg) for arg in script_args)
+    ps_command = (
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden "
+        f'-File "{script_path}" {quoted_args}'
+    )
+    vbs_path = script_path.with_suffix(".vbs")
+    vbs_path.write_text(
+        'Set sh = CreateObject("WScript.Shell")\r\n'
+        f'sh.Run "{ps_command.replace(chr(34), chr(34) * 2)}", 0, False\r\n',
+        encoding="utf-8",
+    )
+
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
     subprocess.Popen(
-        args,
+        ["wscript.exe", "//B", "//Nologo", str(vbs_path)],
         startupinfo=startupinfo,
         creationflags=subprocess.CREATE_NO_WINDOW,
         close_fds=True,
@@ -294,19 +333,6 @@ def schedule_apply_update(
     _write_update_script(script_path, _PRESERVE_FILES)
 
     _launch_hidden(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-WindowStyle",
-            "Hidden",
-            "-File",
-            str(script_path),
-            str(zip_path),
-            str(target_dir),
-            str(exe_path),
-            inner,
-            exe_name,
-        ],
+        script_path,
+        [str(zip_path), str(target_dir), str(exe_path), inner, exe_name],
     )
