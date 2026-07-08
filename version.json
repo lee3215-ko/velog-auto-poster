@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.6",
+    "version":  "1.0.7",
     "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "CMD 창 완전 숨김: WScript+PowerShell, robocopy 제거"
+    "notes":  "실행 로그 전용 탭 추가, 계정 목록 가독성 개선"
 }

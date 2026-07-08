@@ -121,6 +121,7 @@ class VelogApp(tk.Tk):
         self._collapse_state = {"image": False, "advanced": False, "account": False}
         self.status = tk.StringVar(value="대기 중 — 계정을 등록한 뒤 [전체 출간 시작]을 누르세요.")
         self.tab_summary = tk.StringVar(value="계정 0개")
+        self.log_summary = tk.StringVar(value="로그 0줄")
         self.progress_text = tk.StringVar(value="")
 
         self.tabs: list[dict] = []
@@ -208,10 +209,10 @@ class VelogApp(tk.Tk):
         st.configure("Danger.TButton", background="#fee2e2", foreground="#b91c1c",
                      font=(FONT, 9, "bold"), borderwidth=0, padding=(12, 8))
         st.map("Danger.TButton", background=[("active", "#fecaca")])
-        st.configure("Treeview", rowheight=32, font=(FONT, 9), background=CARD,
+        st.configure("Treeview", rowheight=40, font=(FONT, 10), background=CARD,
                      fieldbackground=CARD, borderwidth=0)
-        st.configure("Treeview.Heading", font=(FONT, 9, "bold"), background="#f8fafc",
-                     foreground=INK, relief="flat")
+        st.configure("Treeview.Heading", font=(FONT, 10, "bold"), background="#f1f5f9",
+                     foreground=INK, relief="flat", padding=(8, 6))
         st.configure("green.Horizontal.TProgressbar", troughcolor="#e2e8f0",
                      background=ACCENT, borderwidth=0, lightcolor=ACCENT, darkcolor=ACCENT)
 
@@ -245,6 +246,7 @@ class VelogApp(tk.Tk):
         items = (
             ("posting", "벨로그 포스팅"),
             ("tempmail", "임시 메일 생성"),
+            ("log", "실행 로그"),
         )
         for index, (key, label) in enumerate(items):
             cell = tk.Frame(inner, bg=NAV_BAR_BG)
@@ -346,11 +348,14 @@ class VelogApp(tk.Tk):
 
         posting_frame = ttk.Frame(content, style="Bg.TFrame", padding=(18, 14))
         tempmail_frame = ttk.Frame(content, style="Bg.TFrame", padding=(18, 14))
+        log_frame = ttk.Frame(content, style="Bg.TFrame", padding=(18, 14))
         self._main_views["posting"] = posting_frame
         self._main_views["tempmail"] = tempmail_frame
+        self._main_views["log"] = log_frame
 
         self._build_posting_tab(posting_frame)
         self._build_tempmail_tab(tempmail_frame)
+        self._build_log_tab(log_frame)
         self._switch_main_view("posting")
 
     def _build_posting_tab(self, root: ttk.Frame) -> None:
@@ -364,21 +369,18 @@ class VelogApp(tk.Tk):
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
-        # 본문 (좌 | 중 | 우) — PanedWindow 로 크기 조절 가능
+        # 본문 (좌 | 우) — 계정 목록에 넓은 공간
         body = ttk.Panedwindow(root, orient="horizontal")
         body.pack(fill="both", expand=True)
 
         left_wrap = ttk.Frame(body, style="Bg.TFrame")
         center = ttk.Frame(body, style="Bg.TFrame")
-        logf = ttk.Frame(body, style="Bg.TFrame")
         body.add(left_wrap, weight=0)
-        body.add(center, weight=3)
-        body.add(logf, weight=1)
+        body.add(center, weight=1)
 
         sidebar = self._scrollable_sidebar(left_wrap)
         self._build_inputs(sidebar)
         self._build_list(center)
-        self._build_log(logf)
 
         # 하단 실행 바
         bottom = ttk.Frame(root, style="Bg.TFrame")
@@ -723,12 +725,16 @@ class VelogApp(tk.Tk):
 
     def _build_list(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent, style="Bg.TFrame")
-        top.pack(fill="x", pady=(0, 8))
-        ttk.Label(top, text="계정 목록", style="LogTitle.TLabel").pack(side="left")
-        ttk.Label(top, textvariable=self.tab_summary, style="Stat.TLabel").pack(side="right")
+        top.pack(fill="x", pady=(0, 10))
+        ttk.Label(top, text="계정 목록", style="Title.TLabel").pack(side="left")
+        summary_wrap = ttk.Frame(top, style="CardBorder.TFrame")
+        summary_wrap.pack(side="right")
+        ttk.Label(
+            summary_wrap, textvariable=self.tab_summary, style="Stat.TLabel",
+        ).pack(padx=1, pady=1)
 
         btns = ttk.Frame(parent, style="Bg.TFrame")
-        btns.pack(fill="x", pady=(0, 6))
+        btns.pack(fill="x", pady=(0, 8))
         for text, cmd in (
             ("＋ 탭 추가", self._add_tab),
             ("이름 변경", self._rename_tab),
@@ -736,12 +742,12 @@ class VelogApp(tk.Tk):
             ("원고 일괄 지정", self._bulk_assign_manuscripts),
         ):
             ttk.Button(btns, text=text, style="Pick.TButton", command=cmd).pack(
-                side="left", padx=(0, 4),
+                side="left", padx=(0, 6),
             )
 
         nb_wrap = ttk.Frame(parent, style="CardBorder.TFrame")
         nb_wrap.pack(fill="both", expand=True)
-        nb_inner = ttk.Frame(nb_wrap, style="Card.TFrame", padding=4)
+        nb_inner = ttk.Frame(nb_wrap, style="Card.TFrame", padding=8)
         nb_inner.pack(fill="both", expand=True, padx=1, pady=1)
         self.notebook = ttk.Notebook(nb_inner)
         self.notebook.pack(fill="both", expand=True)
@@ -751,12 +757,12 @@ class VelogApp(tk.Tk):
         self.empty_label = ttk.Label(
             nb_inner,
             text="등록된 계정이 없습니다.\n왼쪽에서 계정을 추가하거나 일괄 등록하세요.",
-            style="Sub.TLabel", justify="center",
+            style="Sub.TLabel", justify="center", font=(FONT, 11),
         )
 
         # 범례
         legend = ttk.Frame(parent, style="Bg.TFrame")
-        legend.pack(fill="x", pady=(8, 0))
+        legend.pack(fill="x", pady=(10, 0))
         for color, fg, label in (
             (DONE_BG, DONE_FG, "발행 완료"),
             ("#fff3bf", "#5c3c00", "메일 불일치"),
@@ -764,9 +770,9 @@ class VelogApp(tk.Tk):
         ):
             chip = tk.Label(
                 legend, text=f"  {label}  ", bg=color, fg=fg,
-                font=(FONT, 8), padx=4, pady=2,
+                font=(FONT, 9), padx=6, pady=3,
             )
-            chip.pack(side="left", padx=(0, 6))
+            chip.pack(side="left", padx=(0, 8))
         ttk.Label(
             legend,
             text="원고 더블클릭 · 결과 더블클릭=URL · Ctrl+C=복사 · Del=삭제",
@@ -788,15 +794,17 @@ class VelogApp(tk.Tk):
         tree.heading("inbox", text="인증 메일함")
         tree.heading("manuscript", text="원고")
         tree.heading("result", text="발행 결과")
-        tree.column("no", width=36, stretch=False, anchor="center")
-        tree.column("id", width=150, stretch=False)
-        tree.column("status", width=100, stretch=False, anchor="center")
-        tree.column("inbox", width=200, stretch=False)
-        tree.column("manuscript", width=120, stretch=False)
-        tree.column("result", width=280, stretch=True)
+        tree.column("no", width=44, stretch=False, anchor="center", minwidth=44)
+        tree.column("id", width=180, stretch=False, minwidth=140)
+        tree.column("status", width=88, stretch=False, anchor="center", minwidth=72)
+        tree.column("inbox", width=280, stretch=True, minwidth=180)
+        tree.column("manuscript", width=200, stretch=True, minwidth=140)
+        tree.column("result", width=320, stretch=True, minwidth=200)
         tree.tag_configure("done", background=DONE_BG, foreground=DONE_FG)
         tree.tag_configure("expired", background="#ffe3e3", foreground="#c92a2a")
         tree.tag_configure("mismatch", background="#fff3bf", foreground="#5c3c00")
+        tree.tag_configure("even", background="#ffffff")
+        tree.tag_configure("odd", background="#f4f7fb")
         tree.grid(row=0, column=0, sticky="nsew")
         tree.bind("<<TreeviewSelect>>", self._on_select)
         tree.bind("<Double-1>", self._on_double_click)
@@ -804,7 +812,9 @@ class VelogApp(tk.Tk):
         tree.bind("<Control-C>", self._copy_urls)
         sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
-        tree.configure(yscrollcommand=sb.set)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
         return frame, tree
 
     def _rebuild_tabs(self) -> None:
@@ -893,20 +903,32 @@ class VelogApp(tk.Tk):
         self.notebook.select(i)
         self._rename_tab()
 
-    def _build_log(self, parent: ttk.Frame) -> None:
-        head = ttk.Frame(parent, style="Bg.TFrame")
-        head.pack(fill="x", pady=(0, 6))
-        ttk.Label(head, text="실행 로그", style="LogTitle.TLabel").pack(side="left")
-        ttk.Button(head, text="지우기", style="Pick.TButton", command=self._clear_log).pack(side="right")
+    def _build_log_tab(self, root: ttk.Frame) -> None:
+        header = ttk.Frame(root, style="Bg.TFrame")
+        header.pack(fill="x", pady=(0, 12))
+        ttk.Label(header, text="실행 로그", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="출간·업데이트·오류 메시지가 시간순으로 기록됩니다.",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
 
-        wrap = ttk.Frame(parent, style="CardBorder.TFrame")
+        toolbar = ttk.Frame(root, style="Bg.TFrame")
+        toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Label(toolbar, textvariable=self.log_summary, style="Stat.TLabel").pack(side="left")
+        btn_row = ttk.Frame(toolbar, style="Bg.TFrame")
+        btn_row.pack(side="right")
+        ttk.Button(btn_row, text="전체 복사", style="Pick.TButton", command=self._copy_log).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_row, text="지우기", style="Pick.TButton", command=self._clear_log).pack(side="left")
+
+        wrap = ttk.Frame(root, style="CardBorder.TFrame")
         wrap.pack(fill="both", expand=True)
         inner = ttk.Frame(wrap, style="Bg.TFrame")
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         self.log_box = tk.Text(
-            inner, bg="#0f172a", fg="#cbd5e1", insertbackground="#fff",
-            relief="flat", padx=12, pady=10, font=("Consolas", 9),
-            state="disabled", wrap="word", highlightthickness=0,
+            inner, bg="#0f172a", fg="#e2e8f0", insertbackground="#fff",
+            relief="flat", padx=16, pady=14, font=("Consolas", 11),
+            state="disabled", wrap="word", highlightthickness=0, spacing1=2, spacing3=2,
         )
         self.log_box.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(inner, orient="vertical", command=self.log_box.yview)
@@ -916,10 +938,22 @@ class VelogApp(tk.Tk):
         self.log_box.tag_config("error", foreground="#f87171")
         self.log_box.tag_config("info", foreground="#94a3b8")
 
+    def _build_log(self, parent: ttk.Frame) -> None:
+        self._build_log_tab(parent)
+
     def _clear_log(self) -> None:
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
+        self.log_summary.set("로그 0줄")
+
+    def _copy_log(self) -> None:
+        text = self.log_box.get("1.0", "end-1c").strip()
+        if not text:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status.set("실행 로그를 클립보드에 복사했습니다.")
 
     def _row(self, parent, row, label, var, browse) -> None:
         ttk.Label(parent, text=label, style="Field.TLabel").grid(
@@ -1275,7 +1309,7 @@ class VelogApp(tk.Tk):
             vid = acc.get("velog_id", "")
             if acc.get("mail_mismatch"):
                 vid = "⚠ " + vid
-            tree.insert("", "end", iid=str(index), tags=self._row_tags(acc),
+            tree.insert("", "end", iid=str(index), tags=self._row_tags(acc, index),
                         values=(index + 1, vid, status, acc.get("inbox_url", ""), man, result))
 
     def _status_text(self, acc: dict) -> str:
@@ -1286,8 +1320,8 @@ class VelogApp(tk.Tk):
             return "만료"
         return f"{rem:.1f}일"
 
-    def _row_tags(self, acc: dict) -> tuple:
-        tags = []
+    def _row_tags(self, acc: dict, index: int = 0) -> tuple:
+        tags = ["even" if index % 2 == 0 else "odd"]
         if acc.get("published_url"):
             tags.append("done")
         if self._remaining_days(acc.get("created_at", "")) <= 0:
@@ -1318,7 +1352,7 @@ class VelogApp(tk.Tk):
                     continue
                 acc = tab["accounts"][idx]
                 tree.set(iid, "status", self._status_text(acc))
-                tree.item(iid, tags=self._row_tags(acc))
+                tree.item(iid, tags=self._row_tags(acc, idx))
         self._update_summary()
         self.after(60_000, self._tick_gauges)
 
@@ -1369,6 +1403,7 @@ class VelogApp(tk.Tk):
         self._set_progress(0, self._run_total)
         self._save_settings()
         self._set_running(True)
+        self._switch_main_view("log")
         self._append(f"[{tab['title']}] 미발행 {len(pending)}개 계정 자동 출간을 시작합니다.", "info")
         self._poster = VelogPoster(self._post_event, self._on_result, self._on_failed)
         profile_names = self._parse_profile_names()
@@ -1607,6 +1642,8 @@ class VelogApp(tk.Tk):
         self.log_box.insert("end", f"[{ts}] {message}\n", tag)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+        line_count = int(self.log_box.index("end-1c").split(".")[0])
+        self.log_summary.set(f"로그 {line_count}줄")
 
     @staticmethod
     def _clean_accounts(raw: list, now_iso: str) -> list:
