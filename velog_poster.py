@@ -407,9 +407,11 @@ class VelogPoster:
         link = self._wait_for_verification(page, inbox_url, prev_uuid)
         self._open_link(pw, page, link)
         page = self._first_page()  # cloudflare 우회로 재연결됐을 수 있음
-        is_signup = self._handle_signup_if_needed(pw, page, account)
+        is_signup, profile_name = self._handle_signup_if_needed(pw, page, account)
         if not is_signup:
             self.log("로그인 중.. (기존 계정)", "info")
+        elif profile_name:
+            self._set_blog_title(page, profile_name)
         # 회원가입 단계에서 재연결했을 수 있으니 연결을 보장한다.
         self._ensure_connected(pw)
         target = self._write_post(self._first_page(), title, body, tags=tags)
@@ -716,9 +718,9 @@ class VelogPoster:
         self._wait_if_cloudflare(pw, page)
 
     # -- 신규 계정 회원가입 ----------------------------------------------
-    def _handle_signup_if_needed(self, pw, page: Page, account: dict) -> bool:
+    def _handle_signup_if_needed(self, pw, page: Page, account: dict) -> tuple[bool, str | None]:
         """인증 링크를 열었을 때 '환영합니다' 회원가입 폼이 뜨면 자동으로 가입한다.
-        가입을 진행했으면 True, 이미 가입된 계정이면 False 를 반환한다."""
+        (가입 여부, 사용한 프로필 이름) 을 반환한다."""
         profile_input = page.get_by_placeholder("프로필 이름을 입력하세요")
         appeared = False
         for _ in range(6):  # 폼이 뜰 시간을 잠깐 준다
@@ -730,7 +732,7 @@ class VelogPoster:
                 pass
             self._sleep(1)
         if not appeared:
-            return False  # 이미 가입된 계정
+            return False, None  # 이미 가입된 계정
 
         self.log("회원가입 중.. (신규 계정)", "info")
         names = account.get("profile_names") or DEFAULT_PROFILE_NAMES
@@ -769,7 +771,7 @@ class VelogPoster:
         self._submit_signup(pw, page, profile_input)
         self.log("회원가입을 완료했습니다.", "success")
         self._sleep(_jitter(2))
-        return True
+        return True, name
 
     def _submit_signup(self, pw, page: Page, profile_input) -> None:
         """가입 버튼을 누른다. 버튼이 곧바로 활성화돼 있으면 바로 클릭하고,
@@ -844,6 +846,54 @@ class VelogPoster:
             except Error:
                 return True
         return False
+
+    def _set_blog_title(self, page: Page, title: str) -> None:
+        """신규 가입 직후 설정 페이지에서 벨로그 제목을 프로필 이름으로 바꾼다."""
+        self.log("벨로그 제목을 설정하는 중...", "info")
+        self._goto(page, "https://velog.io/setting")
+        self._sleep(_jitter(2, 0.5))
+
+        try:
+            title_heading = page.get_by_role("heading", name="벨로그 제목", exact=True)
+            title_heading.wait_for(state="visible", timeout=15_000)
+            setting_row = title_heading.locator(
+                'xpath=ancestor::div[contains(@class,"SettingRow")][1]'
+            )
+            edit_btn = setting_row.get_by_role("button", name="수정", exact=True)
+            edit_btn.wait_for(state="visible", timeout=10_000)
+            edit_btn.click()
+            self._sleep(_jitter(0.6, 0.3))
+
+            title_input = page.get_by_placeholder("벨로그 제목")
+            title_input.wait_for(state="visible", timeout=10_000)
+            title_input.click()
+            self._sleep(_jitter(0.3, 0.2))
+            title_input.fill("")
+            self._sleep(_jitter(0.2, 0.1))
+            title_input.fill(title)
+            self._sleep(_jitter(0.5, 0.3))
+
+            for btn_name in ("저장", "확인", "완료"):
+                save_btn = page.get_by_role("button", name=btn_name, exact=True)
+                clicked = False
+                for i in range(save_btn.count()):
+                    candidate = save_btn.nth(i)
+                    try:
+                        if candidate.is_visible():
+                            candidate.click()
+                            clicked = True
+                            break
+                    except Error:
+                        continue
+                if clicked:
+                    break
+            else:
+                title_input.press("Enter")
+
+            self._sleep(_jitter(1.2, 0.4))
+            self.log(f"벨로그 제목을 '{title}'(으)로 변경했습니다.", "success")
+        except Error as exc:
+            self.log(f"벨로그 제목 설정 실패(출간은 계속): {exc}", "info")
 
     def _ensure_connected(self, pw) -> None:
         """signup 단계에서 연결을 끊었을 수 있으니, 끊겨 있으면 재연결한다."""
@@ -1074,13 +1124,23 @@ class VelogPoster:
                 """(el, url) => {
                     const cm = el.CodeMirror;
                     let v = cm.getValue();
-                    const mdRe = /!\\[[^\\]]*\\]\\([^)]*\\)/;
+                    const esc = (s) => String(s)
+                        .replace(/&/g, '&amp;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/</g, '&lt;');
+
+                    const mdRe = /!\\[([^\\]]*)\\]\\(([^)]+)\\)/;
                     const md = mdRe.exec(v);
                     if (md) {
-                        const img = md[0];
                         const idx = md.index;
-                        if (idx > 0 && v.charAt(idx - 1) === '[') return true;
-                        v = v.slice(0, idx) + '[' + img + '](' + url + ')' + v.slice(idx + img.length);
+                        const alt = md[1] || '';
+                        const imgUrl = md[2].trim();
+                        const before = v.slice(Math.max(0, idx - 2), idx);
+                        if (/\\]\\($/.test(before)) return true;
+                        const linked = '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">'
+                            + '<img src="' + esc(imgUrl) + '" alt="' + esc(alt) + '">'
+                            + '</a>';
+                        v = v.slice(0, idx) + linked + v.slice(idx + md[0].length);
                     } else {
                         const htmlRe = /<img\\b[^>]*>/i;
                         const hm = htmlRe.exec(v);
@@ -1090,11 +1150,10 @@ class VelogPoster:
                         const before = v.slice(Math.max(0, idx - 80), idx);
                         if (/<a\\b[^>]*>\\s*$/i.test(before)) return true;
                         v = v.slice(0, idx)
-                          + '<a href="' + url + '" target="_blank" rel="noopener noreferrer">'
+                          + '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">'
                           + tag + '</a>' + v.slice(idx + tag.length);
                     }
-                    // 이미지 링크 감싸기 실패로 남는 고립된 '[' 제거
-                    v = v.replace(/^\\[\\s*\\r?\\n(?=!\\[)/, '');
+                    v = v.replace(/^\\[\\s*\\r?\\n(?=!<a\\b|!\\[)/, '');
                     cm.setValue(v);
                     return true;
                 }""",

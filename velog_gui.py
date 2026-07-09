@@ -126,6 +126,9 @@ class VelogApp(tk.Tk):
 
         self.tabs: list[dict] = []
         self._active_tab: dict | None = None
+        self._tab_highlight_index: int | None = None
+        self._tab_highlight_job: str | None = None
+        self.nb_wrap: ttk.Frame | None = None
         self.anchors: list[dict[str, str]] = []
         self.homepages: list[str] = []
         self._events: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -186,6 +189,7 @@ class VelogApp(tk.Tk):
         st.configure("Bg.TFrame", background=BG)
         st.configure("Card.TFrame", background=CARD)
         st.configure("CardBorder.TFrame", background=BORDER)
+        st.configure("TabHighlight.TFrame", background=ACCENT_LIGHT)
         st.configure("Title.TLabel", background=BG, foreground=INK, font=(FONT, 20, "bold"))
         st.configure("Sub.TLabel", background=BG, foreground=SUBTLE, font=(FONT, 9))
         st.configure("Section.TLabel", background=CARD, foreground=INK, font=(FONT, 11, "bold"))
@@ -675,8 +679,8 @@ class VelogApp(tk.Tk):
         card_body = ttk.Frame(self.account_body, style="Card.TFrame")
         card_body.pack(fill="x")
         card_body.columnconfigure(1, weight=1)
-        self._row(card_body, 0, "벨로그 아이디", self.velog_id, None)
-        self._row(card_body, 1, "인증 메일함", self.inbox_url, None)
+        self._row(card_body, 0, "벨로그 아이디", self.velog_id, None, shortcut=self._open_velog_login)
+        self._row(card_body, 1, "인증 메일함", self.inbox_url, None, shortcut=self._open_inbox_url)
         self._row(card_body, 2, "원고 파일", self.manuscript, self._browse_manuscript)
 
         fb = ttk.Frame(card_body, style="Card.TFrame")
@@ -747,6 +751,7 @@ class VelogApp(tk.Tk):
 
         nb_wrap = ttk.Frame(parent, style="CardBorder.TFrame")
         nb_wrap.pack(fill="both", expand=True)
+        self.nb_wrap = nb_wrap
         nb_inner = ttk.Frame(nb_wrap, style="Card.TFrame", padding=8)
         nb_inner.pack(fill="both", expand=True, padx=1, pady=1)
         self.notebook = ttk.Notebook(nb_inner)
@@ -817,6 +822,32 @@ class VelogApp(tk.Tk):
         tree.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
         return frame, tree
 
+    def _flash_tab_added(self, tab_index: int) -> None:
+        self._tab_highlight_index = tab_index
+        self._apply_tab_highlight()
+        if self._tab_highlight_job is not None:
+            self.after_cancel(self._tab_highlight_job)
+        self._tab_highlight_job = self.after(8000, self._clear_tab_highlight)
+
+    def _apply_tab_highlight(self) -> None:
+        for i, tab in enumerate(self.tabs):
+            title = tab["title"]
+            if i == self._tab_highlight_index:
+                self.notebook.tab(i, text=f"● {title}")
+            else:
+                self.notebook.tab(i, text=title)
+        if self.nb_wrap is not None:
+            style = "TabHighlight.TFrame" if self._tab_highlight_index is not None else "CardBorder.TFrame"
+            self.nb_wrap.configure(style=style)
+
+    def _clear_tab_highlight(self) -> None:
+        self._tab_highlight_index = None
+        self._tab_highlight_job = None
+        for i, tab in enumerate(self.tabs):
+            self.notebook.tab(i, text=tab["title"])
+        if self.nb_wrap is not None:
+            self.nb_wrap.configure(style="CardBorder.TFrame")
+
     def _rebuild_tabs(self) -> None:
         for tid in self.notebook.tabs():
             self.notebook.forget(tid)
@@ -828,6 +859,7 @@ class VelogApp(tk.Tk):
             tab["tree"] = tree
             self.notebook.add(frame, text=tab["title"])
             self._fill_tree(tab)
+        self._apply_tab_highlight()
         self._update_summary()
 
     def _update_summary(self) -> None:
@@ -955,17 +987,37 @@ class VelogApp(tk.Tk):
         self.clipboard_append(text)
         self.status.set("실행 로그를 클립보드에 복사했습니다.")
 
-    def _row(self, parent, row, label, var, browse) -> None:
+    def _row(self, parent, row, label, var, browse, shortcut=None) -> None:
+        pady = (0 if row == 0 else 8, 0)
         ttk.Label(parent, text=label, style="Field.TLabel").grid(
-            row=row, column=0, sticky="w", padx=(0, 8), pady=(0 if row == 0 else 8, 0),
+            row=row, column=0, sticky="w", padx=(0, 8), pady=pady,
         )
         ttk.Entry(parent, textvariable=var, font=(FONT, 9)).grid(
-            row=row, column=1, sticky="ew", ipady=5, pady=(0 if row == 0 else 8, 0),
+            row=row, column=1, sticky="ew", ipady=5, pady=pady,
         )
+        col = 2
+        if shortcut is not None:
+            ttk.Button(parent, text="↗", style="Pick.TButton", width=4, command=shortcut).grid(
+                row=row, column=col, padx=(6, 0), pady=pady,
+            )
+            col += 1
         if browse is not None:
             ttk.Button(parent, text="찾기", style="Pick.TButton", command=browse).grid(
-                row=row, column=2, padx=(6, 0), pady=(0 if row == 0 else 8, 0),
+                row=row, column=col, padx=(6, 0), pady=pady,
             )
+
+    def _open_velog_login(self) -> None:
+        webbrowser.open("https://velog.io/")
+
+    def _open_inbox_url(self) -> None:
+        raw = self.inbox_url.get().strip()
+        if not raw:
+            messagebox.showwarning("URL 확인", "인증 메일함 URL을 입력해 주세요.", parent=self)
+            return
+        try:
+            webbrowser.open(normalize_url(raw))
+        except PostingError as exc:
+            messagebox.showwarning("URL 확인", str(exc), parent=self)
 
     def _bind_shortcuts(self) -> None:
         self.bind("<Control-Return>", lambda _e: self._add_account())
@@ -1838,10 +1890,21 @@ class VelogApp(tk.Tk):
             messagebox.showinfo("추가 결과", "추가할 새 계정이 없습니다 (이미 등록됨).", parent=self)
             return
 
+        try:
+            tab_index = self.notebook.index(self.notebook.select())
+        except Exception:
+            tab_index = 0
         self._refresh_tree()
         self._save_settings()
         self._switch_main_view("posting")
-        messagebox.showinfo("추가 완료", f"{added}개 계정이 포스팅 탭 목록에 추가되었습니다.", parent=self)
+        self.notebook.select(tab_index)
+        self._flash_tab_added(tab_index)
+        tab_title = self.tabs[tab_index]["title"] if tab_index < len(self.tabs) else "현재 탭"
+        messagebox.showinfo(
+            "추가 완료",
+            f"{added}개 계정이 「{tab_title}」 탭에 추가되었습니다.",
+            parent=self,
+        )
 
     def _delete_generated(self) -> None:
         sel = self._tm_selected_indices()
