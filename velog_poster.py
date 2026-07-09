@@ -854,17 +854,30 @@ class VelogPoster:
         self._sleep(_jitter(2, 0.5))
 
         try:
-            title_heading = page.get_by_role("heading", name="벨로그 제목", exact=True)
-            title_heading.wait_for(state="visible", timeout=15_000)
-            setting_row = title_heading.locator(
-                'xpath=ancestor::div[contains(@class,"SettingRow")][1]'
+            row = page.locator('div[class*="SettingRow"]').filter(
+                has=page.locator('h3', has_text="벨로그 제목"),
+            ).first
+            row.wait_for(state="visible", timeout=15_000)
+
+            edit_candidates = row.locator(
+                'button[class*="SettingEditButton"], div.editWrapper button, button:has-text("수정")'
             )
-            edit_btn = setting_row.get_by_role("button", name="수정", exact=True)
+            if edit_candidates.count() > 0:
+                edit_btn = edit_candidates.first
+            else:
+                edit_btn = page.locator(
+                    'xpath=//h3[normalize-space()="벨로그 제목"]'
+                    '/ancestor::div[contains(@class,"SettingRow")][1]'
+                    '//button[contains(@class,"SettingEditButton") or normalize-space()="수정"]'
+                ).first
             edit_btn.wait_for(state="visible", timeout=10_000)
+            edit_btn.scroll_into_view_if_needed()
             edit_btn.click()
             self._sleep(_jitter(0.6, 0.3))
 
-            title_input = page.get_by_placeholder("벨로그 제목")
+            title_input = row.locator('input[placeholder="벨로그 제목"]').first
+            if title_input.count() == 0 or not title_input.is_visible():
+                title_input = page.get_by_placeholder("벨로그 제목").first
             title_input.wait_for(state="visible", timeout=10_000)
             title_input.click()
             self._sleep(_jitter(0.3, 0.2))
@@ -873,21 +886,26 @@ class VelogPoster:
             title_input.fill(title)
             self._sleep(_jitter(0.5, 0.3))
 
-            for btn_name in ("저장", "확인", "완료"):
-                save_btn = page.get_by_role("button", name=btn_name, exact=True)
-                clicked = False
-                for i in range(save_btn.count()):
-                    candidate = save_btn.nth(i)
-                    try:
-                        if candidate.is_visible():
-                            candidate.click()
-                            clicked = True
-                            break
-                    except Error:
-                        continue
-                if clicked:
-                    break
-            else:
+            clicked = False
+            for selector in (
+                row.locator('button:has-text("저장")'),
+                row.locator('button:has-text("확인")'),
+                row.locator('button:has-text("완료")'),
+                row.locator('button[class*="SettingEditButton"]'),
+                page.locator('button:has-text("저장")'),
+                page.locator('button:has-text("확인")'),
+            ):
+                if selector.count() == 0:
+                    continue
+                candidate = selector.first
+                try:
+                    if candidate.is_visible():
+                        candidate.click()
+                        clicked = True
+                        break
+                except Error:
+                    continue
+            if not clicked:
                 title_input.press("Enter")
 
             self._sleep(_jitter(1.2, 0.4))
