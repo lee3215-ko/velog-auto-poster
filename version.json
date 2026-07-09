@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.8",
+    "version":  "1.0.9",
     "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "신규가입 벨로그 제목 설정, 계정탭 하이라이트, 마크다운 이미지 링크, 바로가기 버튼"
+    "notes":  "임시메일 목록 탭별 음영, 탭 선택 추가, 추가 후 탭 유지"
 }

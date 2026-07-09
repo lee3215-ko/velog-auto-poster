@@ -71,6 +71,14 @@ DONE_BG = "#dcfce7"
 DONE_FG = "#166534"
 GAUGE_DAYS = 6.0
 GAUGE_SEGMENTS = 6
+TM_TAB_COLORS = (
+    ("#dcfce7", "#166534"),
+    ("#dbeafe", "#1d4ed8"),
+    ("#fef3c7", "#92400e"),
+    ("#ede9fe", "#5b21b6"),
+    ("#ffe4e6", "#be123c"),
+    ("#ccfbf1", "#0f766e"),
+)
 
 
 class ToolTip:
@@ -126,8 +134,6 @@ class VelogApp(tk.Tk):
 
         self.tabs: list[dict] = []
         self._active_tab: dict | None = None
-        self._tab_highlight_index: int | None = None
-        self._tab_highlight_job: str | None = None
         self.nb_wrap: ttk.Frame | None = None
         self.anchors: list[dict[str, str]] = []
         self.homepages: list[str] = []
@@ -189,7 +195,6 @@ class VelogApp(tk.Tk):
         st.configure("Bg.TFrame", background=BG)
         st.configure("Card.TFrame", background=CARD)
         st.configure("CardBorder.TFrame", background=BORDER)
-        st.configure("TabHighlight.TFrame", background=ACCENT_LIGHT)
         st.configure("Title.TLabel", background=BG, foreground=INK, font=(FONT, 20, "bold"))
         st.configure("Sub.TLabel", background=BG, foreground=SUBTLE, font=(FONT, 9))
         st.configure("Section.TLabel", background=CARD, foreground=INK, font=(FONT, 11, "bold"))
@@ -474,21 +479,31 @@ class VelogApp(tk.Tk):
         head = ttk.Frame(list_inner, style="Card.TFrame")
         head.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(head, text="생성된 임시 메일", style="Section.TLabel").pack(side="left")
-        ttk.Label(head, text="더블클릭=URL 열기 · Ctrl+C=URL 복사", style="Hint.TLabel").pack(side="right")
+        ttk.Label(
+            head,
+            text="추가된 항목은 탭별 색으로 표시 · 더블클릭=URL · Ctrl+C=복사",
+            style="Hint.TLabel",
+        ).pack(side="right")
 
         tree_wrap = ttk.Frame(list_inner, style="Card.TFrame")
         tree_wrap.grid(row=1, column=0, sticky="nsew")
         tree_wrap.rowconfigure(0, weight=1)
         tree_wrap.columnconfigure(0, weight=1)
         self.tm_tree = ttk.Treeview(
-            tree_wrap, columns=("email", "url", "created"), show="headings", selectmode="extended",
+            tree_wrap,
+            columns=("email", "url", "created", "added_tab"),
+            show="headings",
+            selectmode="extended",
         )
         self.tm_tree.heading("email", text="이메일 주소")
         self.tm_tree.heading("url", text="복사한 URL (메일함)")
         self.tm_tree.heading("created", text="생성 시각")
-        self.tm_tree.column("email", width=220, stretch=False)
-        self.tm_tree.column("url", width=420, stretch=True)
-        self.tm_tree.column("created", width=130, stretch=False)
+        self.tm_tree.heading("added_tab", text="추가된 탭")
+        self.tm_tree.column("email", width=200, stretch=False)
+        self.tm_tree.column("url", width=340, stretch=True)
+        self.tm_tree.column("created", width=120, stretch=False)
+        self.tm_tree.column("added_tab", width=100, stretch=False, anchor="center")
+        self.tm_tree.tag_configure("tm_pending", background="#ffffff")
         self.tm_tree.grid(row=0, column=0, sticky="nsew")
         self.tm_tree.bind("<Double-1>", self._on_tm_double_click)
         self.tm_tree.bind("<Control-c>", self._copy_tm_urls)
@@ -822,31 +837,64 @@ class VelogApp(tk.Tk):
         tree.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
         return frame, tree
 
-    def _flash_tab_added(self, tab_index: int) -> None:
-        self._tab_highlight_index = tab_index
-        self._apply_tab_highlight()
-        if self._tab_highlight_job is not None:
-            self.after_cancel(self._tab_highlight_job)
-        self._tab_highlight_job = self.after(8000, self._clear_tab_highlight)
+    def _tm_tab_tag(self, tab_index: int) -> str:
+        return f"tm_tab_{tab_index}"
 
-    def _apply_tab_highlight(self) -> None:
-        for i, tab in enumerate(self.tabs):
-            title = tab["title"]
-            if i == self._tab_highlight_index:
-                self.notebook.tab(i, text=f"● {title}")
-            else:
-                self.notebook.tab(i, text=title)
-        if self.nb_wrap is not None:
-            style = "TabHighlight.TFrame" if self._tab_highlight_index is not None else "CardBorder.TFrame"
-            self.nb_wrap.configure(style=style)
+    def _ensure_tm_tab_tags(self) -> None:
+        if not hasattr(self, "tm_tree"):
+            return
+        for i in range(len(self.tabs)):
+            bg, fg = TM_TAB_COLORS[i % len(TM_TAB_COLORS)]
+            self.tm_tree.tag_configure(self._tm_tab_tag(i), background=bg, foreground=fg)
 
-    def _clear_tab_highlight(self) -> None:
-        self._tab_highlight_index = None
-        self._tab_highlight_job = None
+    def _ask_account_tab(self) -> int | None:
+        """계정을 추가할 탭을 선택한다. 탭이 1개면 0, 2개 이상이면 선택 창."""
+        if len(self.tabs) <= 1:
+            return 0
+
+        win = tk.Toplevel(self)
+        win.title("탭 선택")
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="어느 탭의 계정 목록에 추가할까요?",
+            style="Section.TLabel",
+        ).pack(anchor="w", pady=(0, 10))
+
+        try:
+            default_index = self.notebook.index(self.notebook.select())
+        except Exception:
+            default_index = 0
+        choice = tk.IntVar(value=default_index)
         for i, tab in enumerate(self.tabs):
-            self.notebook.tab(i, text=tab["title"])
-        if self.nb_wrap is not None:
-            self.nb_wrap.configure(style="CardBorder.TFrame")
+            ttk.Radiobutton(frame, text=tab["title"], variable=choice, value=i).pack(anchor="w", pady=2)
+
+        result: list[int | None] = [None]
+
+        def confirm() -> None:
+            result[0] = choice.get()
+            win.destroy()
+
+        def cancel() -> None:
+            win.destroy()
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill="x", pady=(14, 0))
+        ttk.Button(btn_row, text="확인", style="Primary.TButton", command=confirm).pack(side="right")
+        ttk.Button(btn_row, text="취소", style="Ghost.TButton", command=cancel).pack(side="right", padx=(0, 8))
+
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        win.update_idletasks()
+        px = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        py = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{max(px, 0)}+{max(py, 0)}")
+        self.wait_window(win)
+        return result[0]
 
     def _rebuild_tabs(self) -> None:
         for tid in self.notebook.tabs():
@@ -859,8 +907,10 @@ class VelogApp(tk.Tk):
             tab["tree"] = tree
             self.notebook.add(frame, text=tab["title"])
             self._fill_tree(tab)
-        self._apply_tab_highlight()
         self._update_summary()
+        if hasattr(self, "tm_tree"):
+            self._ensure_tm_tab_tags()
+            self._refresh_tm_tree()
 
     def _update_summary(self) -> None:
         tab = self._current_tab()
@@ -1711,11 +1761,27 @@ class VelogApp(tk.Tk):
 
     # -- 임시 메일 생성 ---------------------------------------------------
     def _refresh_tm_tree(self) -> None:
+        self._ensure_tm_tab_tags()
         self.tm_tree.delete(*self.tm_tree.get_children())
         for index, item in enumerate(self.generated_emails):
+            added_tab = item.get("added_tab", "").strip()
+            tab_index = item.get("added_tab_index", "")
+            tags: tuple[str, ...]
+            if added_tab and tab_index != "":
+                try:
+                    tags = (self._tm_tab_tag(int(tab_index)),)
+                except (TypeError, ValueError):
+                    tags = ("tm_pending",)
+            else:
+                tags = ("tm_pending",)
             self.tm_tree.insert(
-                "", "end", iid=str(index),
-                values=(item.get("email", ""), item.get("inbox_url", ""), item.get("created_at", "")),
+                "", "end", iid=str(index), tags=tags,
+                values=(
+                    item.get("email", ""),
+                    item.get("inbox_url", ""),
+                    item.get("created_at", ""),
+                    added_tab or "—",
+                ),
             )
 
     def _append_tm_log(self, message: str, tag: str = "") -> None:
@@ -1865,8 +1931,17 @@ class VelogApp(tk.Tk):
             )
             return
 
+        tab_index = self._ask_account_tab()
+        if tab_index is None:
+            return
+        if tab_index < 0 or tab_index >= len(self.tabs):
+            return
+
+        target_tab = self.tabs[tab_index]
         now_iso = datetime.now().isoformat(timespec="seconds")
-        existing = {(a.get("velog_id"), a.get("inbox_url")) for a in self.accounts}
+        existing = {
+            (a.get("velog_id"), a.get("inbox_url")) for a in target_tab["accounts"]
+        }
         added = 0
         for i in indices:
             item = self.generated_emails[i]
@@ -1876,7 +1951,7 @@ class VelogApp(tk.Tk):
                 continue
             if (email, url) in existing:
                 continue
-            self.accounts.append({
+            target_tab["accounts"].append({
                 "velog_id": email,
                 "inbox_url": url,
                 "manuscript_path": "",
@@ -1884,27 +1959,19 @@ class VelogApp(tk.Tk):
                 "mail_mismatch": "",
             })
             existing.add((email, url))
+            item["added_tab"] = target_tab["title"]
+            item["added_tab_index"] = tab_index
             added += 1
 
         if added == 0:
             messagebox.showinfo("추가 결과", "추가할 새 계정이 없습니다 (이미 등록됨).", parent=self)
             return
 
-        try:
-            tab_index = self.notebook.index(self.notebook.select())
-        except Exception:
-            tab_index = 0
-        self._refresh_tree()
+        self._fill_tree(target_tab)
+        self._update_summary()
+        self._refresh_tm_tree()
         self._save_settings()
-        self._switch_main_view("posting")
-        self.notebook.select(tab_index)
-        self._flash_tab_added(tab_index)
-        tab_title = self.tabs[tab_index]["title"] if tab_index < len(self.tabs) else "현재 탭"
-        messagebox.showinfo(
-            "추가 완료",
-            f"{added}개 계정이 「{tab_title}」 탭에 추가되었습니다.",
-            parent=self,
-        )
+        self.tm_status.set(f"{added}개 계정이 「{target_tab['title']}」 탭에 추가되었습니다.")
 
     def _delete_generated(self) -> None:
         sel = self._tm_selected_indices()
@@ -1967,6 +2034,8 @@ class VelogApp(tk.Tk):
                         "email": str(g.get("email", "")),
                         "inbox_url": str(g.get("inbox_url", "")),
                         "created_at": str(g.get("created_at", "")),
+                        "added_tab": str(g.get("added_tab", "")),
+                        "added_tab_index": g.get("added_tab_index", ""),
                     }
                     for g in generated
                     if isinstance(g, dict) and g.get("email") and g.get("inbox_url")
