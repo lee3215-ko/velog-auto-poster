@@ -712,8 +712,10 @@ class TempMailGenerator:
         return 0
 
     def _wait_for_welcome_match(self, page: Page, require_new: str = "") -> None:
-        """상단 이메일 = 환영 메일 본문 이메일 일치할 때까지 대기."""
+        """상단 이메일 = 환영 메일 본문 이메일 일치할 때까지 대기.
+        불일치가 계속되면 30초마다 페이지를 새로고침한다."""
         self.log("상단 이메일과 환영 메일 본문 일치를 확인하는 중...", "info")
+        last_refresh = time.monotonic()
         for attempt in range(40):
             if self._stop.is_set():
                 raise PostingError("사용자가 작업을 중단했습니다.")
@@ -733,6 +735,15 @@ class TempMailGenerator:
                 if body:
                     msg += f", 본문={body}"
                 self.log(msg, "info")
+
+            if time.monotonic() - last_refresh >= 30:
+                self.log("일치 대기 중 — 페이지를 새로고침합니다...", "info")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30_000)
+                    self._sleep(_jitter(2.5, 1.0))
+                except Error as exc:
+                    self.log(f"새로고침 실패(계속 대기): {exc}", "info")
+                last_refresh = time.monotonic()
 
         raise PostingError(
             "환영 메일 본문과 상단 이메일이 일치하지 않습니다. "

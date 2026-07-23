@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.11",
-    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "?낅뜲?댄듃"
+    "version": "1.0.12",
+    "url": "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "notes": "임시메일 일치 대기 중 30초마다 페이지 새로고침"
 }
