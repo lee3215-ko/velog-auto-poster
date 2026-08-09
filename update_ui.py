@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import tempfile
 import threading
-import urllib.error
 import webbrowser
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 from paths import APP_NAME, EXE_NAME, ZIP_INNER_FOLDER
@@ -43,6 +43,7 @@ def _ask_update(root, title: str, message: str, *, kind: str) -> bool | None:
     dialog.transient(root)
     dialog.grab_set()
     dialog.resizable(False, False)
+    dialog.attributes("-topmost", True)
 
     frame = ttk.Frame(dialog, padding=16)
     frame.pack(fill="both", expand=True)
@@ -69,6 +70,8 @@ def _ask_update(root, title: str, message: str, *, kind: str) -> bool | None:
 
     dialog.protocol("WM_DELETE_WINDOW", lambda: close(None if kind == "yesnocancel" else False))
     _center_on_parent(dialog, root)
+    dialog.lift()
+    dialog.focus_force()
     root.wait_window(dialog)
     return result
 
@@ -89,7 +92,10 @@ def schedule_update_check(
         return
 
     def worker() -> None:
-        info = check_for_update(version_url, current_version, app_name=app_name)
+        try:
+            info = check_for_update(version_url, current_version, app_name=app_name)
+        except Exception:  # noqa: BLE001
+            return
         if info is not None:
             root.after(
                 0,
@@ -117,7 +123,7 @@ def _show_dialog(
     if can_auto_update() and info.url:
         if auto_apply:
             message += (
-                "\n\n앱을 종료한 뒤 자동으로 업데이트합니다."
+                "\n\n확인을 누르면 다운로드 후 앱을 종료하고 자동 업데이트합니다."
                 "\n(계정·설정은 그대로 유지됩니다)"
             )
             if _ask_update(root, "업데이트", message, kind="okcancel"):
@@ -142,58 +148,93 @@ def _show_dialog(
 
 def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner_folder):
     import tkinter as tk
-    from pathlib import Path
 
     dialog = tk.Toplevel(root)
     dialog.title("업데이트 중")
-    dialog.geometry("340x100")
+    dialog.geometry("360x120")
     dialog.transient(root)
     dialog.grab_set()
     dialog.resizable(False, False)
+    dialog.attributes("-topmost", True)
+    dialog.protocol("WM_DELETE_WINDOW", lambda: None)
 
-    status = ttk.Label(dialog, text="다운로드 중...")
+    status = ttk.Label(dialog, text="다운로드 준비 중...")
     status.pack(padx=16, pady=(16, 8))
-    bar = ttk.Progressbar(dialog, length=300, mode="determinate")
+    bar = ttk.Progressbar(dialog, length=320, mode="indeterminate")
     bar.pack(padx=16, pady=8)
+    bar.start(12)
     _center_on_parent(dialog, root)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.update()
 
-    def on_progress(done: int, total: int) -> None:
-        if total > 0:
-            pct = min(int(done * 100 / total), 100)
-            root.after(0, lambda: (bar.configure(value=pct), status.configure(text=f"다운로드 {pct}%")))
-        else:
-            root.after(0, lambda: status.configure(text="다운로드 중..."))
+    def set_status(text: str, *, determinate: bool = False, value: int = 0) -> None:
+        def apply() -> None:
+            status.configure(text=text)
+            if determinate:
+                if str(bar["mode"]) != "determinate":
+                    bar.stop()
+                    bar.configure(mode="determinate", maximum=100, value=value)
+                else:
+                    bar.configure(value=value)
+            dialog.lift()
+
+        root.after(0, apply)
+
+    def fail(exc: BaseException) -> None:
+        def apply() -> None:
+            try:
+                dialog.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            messagebox.showerror(
+                "업데이트 실패",
+                f"업데이트에 실패했습니다.\n\n{exc}\n\n"
+                "브라우저에서 최신 zip을 받아 설치 폴더에 덮어써 주세요.",
+                parent=root,
+            )
+            if info.url:
+                webbrowser.open(info.url)
+
+        root.after(0, apply)
 
     def worker() -> None:
         zip_path = Path(tempfile.gettempdir()) / f"{app_name}-{info.version}.zip"
         try:
+            set_status("다운로드 중...")
+
+            def on_progress(done: int, total: int) -> None:
+                if total > 0:
+                    pct = min(int(done * 100 / total), 100)
+                    set_status(f"다운로드 {pct}%", determinate=True, value=pct)
+                else:
+                    mb = done / (1024 * 1024)
+                    set_status(f"다운로드 중... {mb:.1f} MB")
+
             download_file(
                 info.url,
                 zip_path,
                 user_agent=f"{app_name}/{info.version}",
                 on_progress=on_progress,
             )
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            root.after(0, dialog.destroy)
-            root.after(0, lambda: messagebox.showerror("업데이트 실패", str(exc), parent=root))
+            set_status("설치 준비 중...", determinate=True, value=100)
+            schedule_apply_update(
+                zip_path,
+                exe_name=exe_name,
+                zip_inner_folder=zip_inner_folder,
+                app_slug=app_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            fail(exc)
             return
 
         def finish() -> None:
             try:
-                schedule_apply_update(
-                    zip_path,
-                    exe_name=exe_name,
-                    zip_inner_folder=zip_inner_folder,
-                    app_slug=app_name,
-                )
-            except RuntimeError as exc:
-                messagebox.showerror("업데이트 실패", str(exc), parent=root)
                 dialog.destroy()
-                return
-            dialog.destroy()
+            except Exception:  # noqa: BLE001
+                pass
             root.quit()
 
-        root.after(0, lambda: status.configure(text="설치 준비 중..."))
-        root.after(500, finish)
+        root.after(300, finish)
 
     threading.Thread(target=worker, daemon=True).start()

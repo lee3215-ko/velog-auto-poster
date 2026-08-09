@@ -185,11 +185,35 @@ def download_file(
     user_agent: str,
     on_progress: ProgressCallback | None = None,
 ) -> None:
-    request = urllib.request.Request(url.strip(), headers={"User-Agent": user_agent})
+    """zip 다운로드. requests 우선(인증서·리다이렉트), 실패 시 urllib."""
+    import requests
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    headers = {"User-Agent": user_agent, "Accept": "application/octet-stream"}
+    try:
+        with requests.get(url.strip(), headers=headers, stream=True, timeout=120) as response:
+            response.raise_for_status()
+            total = int(response.headers.get("Content-Length", 0) or 0)
+            downloaded = 0
+            with dest.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=256 * 1024):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    if on_progress is not None:
+                        on_progress(downloaded, total)
+        if dest.stat().st_size < 1024:
+            raise OSError("다운로드한 파일이 비정상적으로 작습니다.")
+        return
+    except Exception:
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+
+    request = urllib.request.Request(url.strip(), headers=headers)
     with urllib.request.urlopen(request, timeout=120) as response:
         total = int(response.headers.get("Content-Length", 0) or 0)
         downloaded = 0
-        dest.parent.mkdir(parents=True, exist_ok=True)
         with dest.open("wb") as handle:
             while True:
                 chunk = response.read(256 * 1024)
@@ -199,118 +223,132 @@ def download_file(
                 downloaded += len(chunk)
                 if on_progress is not None:
                     on_progress(downloaded, total)
+    if dest.stat().st_size < 1024:
+        raise OSError("다운로드한 파일이 비정상적으로 작습니다.")
 
 
 def _write_update_script(script_path: Path, preserve_files: frozenset[str]) -> None:
     preserve_array = ", ".join(f'"{name}"' for name in sorted(preserve_files))
     script_path.write_text(
-        rf"""param(
-    [string]$Zip,
-    [string]$Install,
-    [string]$Exe,
-    [string]$Inner,
-    [string]$WaitExe
-)
+        rf"""param([Parameter(Mandatory=$true)][string]$ArgsFile)
 $ErrorActionPreference = 'Stop'
+$argsJson = Get-Content -LiteralPath $ArgsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+$Zip = [string]$argsJson.Zip
+$Install = [string]$argsJson.Install
+$Exe = [string]$argsJson.Exe
+$Inner = [string]$argsJson.Inner
+$WaitExe = [string]$argsJson.WaitExe
 $Staging = Join-Path $env:TEMP ("app_update_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $Backup = Join-Path $env:TEMP ("app_update_backup_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $Preserve = @({preserve_array})
 $ProcName = [System.IO.Path]::GetFileNameWithoutExtension($WaitExe)
+$log = Join-Path $env:TEMP "VelogPoster_update.log"
 
-while (Get-Process -Name $ProcName -ErrorAction SilentlyContinue) {{
-    Start-Sleep -Seconds 2
+function Write-UpdateLog([string]$msg) {{
+    Add-Content -LiteralPath $log -Value ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $msg) -Encoding UTF8
 }}
 
-foreach ($fileName in $Preserve) {{
-    $src = Join-Path $Install $fileName
-    if (Test-Path -LiteralPath $src) {{
-        New-Item -ItemType Directory -Path $Backup -Force | Out-Null
-        Copy-Item -LiteralPath $src -Destination (Join-Path $Backup $fileName) -Force
+try {{
+    Write-UpdateLog ("wait process=" + $ProcName)
+    while (Get-Process -Name $ProcName -ErrorAction SilentlyContinue) {{
+        Start-Sleep -Seconds 2
     }}
-}}
 
-Expand-Archive -LiteralPath $Zip -DestinationPath $Staging -Force
-
-$source = $Staging
-$innerPath = Join-Path $Staging $Inner
-if (Test-Path -LiteralPath $innerPath) {{
-    $source = $innerPath
-}}
-
-$xfArgs = @()
-foreach ($fileName in $Preserve) {{
-    $xfArgs += $fileName
-}}
-
-function Copy-UpdateTree {{
-    param(
-        [string]$Source,
-        [string]$Dest,
-        [string[]]$Exclude
-    )
-    $excludeSet = [System.Collections.Generic.HashSet[string]]::new(
-        [StringComparer]::OrdinalIgnoreCase
-    )
-    foreach ($name in $Exclude) {{ [void]$excludeSet.Add($name) }}
-    New-Item -ItemType Directory -Path $Dest -Force | Out-Null
-    foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {{
-        if ($excludeSet.Contains($item.Name)) {{ continue }}
-        $target = Join-Path $Dest $item.Name
-        if ($item.PSIsContainer) {{
-            Copy-UpdateTree -Source $item.FullName -Dest $target -Exclude $Exclude
-        }} else {{
-            Copy-Item -LiteralPath $item.FullName -Destination $target -Force
+    foreach ($fileName in $Preserve) {{
+        $src = Join-Path $Install $fileName
+        if (Test-Path -LiteralPath $src) {{
+            New-Item -ItemType Directory -Path $Backup -Force | Out-Null
+            Copy-Item -LiteralPath $src -Destination (Join-Path $Backup $fileName) -Force
         }}
     }}
-}}
 
-Copy-UpdateTree -Source $source -Dest $Install -Exclude $xfArgs
+    Write-UpdateLog ("expand " + $Zip)
+    Expand-Archive -LiteralPath $Zip -DestinationPath $Staging -Force
 
-foreach ($fileName in $Preserve) {{
-    $bak = Join-Path $Backup $fileName
-    if (Test-Path -LiteralPath $bak) {{
-        Copy-Item -LiteralPath $bak -Destination (Join-Path $Install $fileName) -Force
+    $source = $Staging
+    $innerPath = Join-Path $Staging $Inner
+    if (Test-Path -LiteralPath $innerPath) {{
+        $source = $innerPath
     }}
-}}
 
-Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $Backup -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
-Start-Process -FilePath $Exe
-Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+    function Copy-UpdateTree {{
+        param(
+            [string]$Source,
+            [string]$Dest,
+            [string[]]$Exclude
+        )
+        $excludeSet = [System.Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::OrdinalIgnoreCase
+        )
+        foreach ($name in $Exclude) {{ [void]$excludeSet.Add($name) }}
+        New-Item -ItemType Directory -Path $Dest -Force | Out-Null
+        foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {{
+            if ($excludeSet.Contains($item.Name)) {{ continue }}
+            $target = Join-Path $Dest $item.Name
+            if ($item.PSIsContainer) {{
+                Copy-UpdateTree -Source $item.FullName -Dest $target -Exclude $Exclude
+            }} else {{
+                Copy-Item -LiteralPath $item.FullName -Destination $target -Force
+            }}
+        }}
+    }}
+
+    Write-UpdateLog ("copy " + $source + " -> " + $Install)
+    Copy-UpdateTree -Source $source -Dest $Install -Exclude $Preserve
+
+    foreach ($fileName in $Preserve) {{
+        $bak = Join-Path $Backup $fileName
+        if (Test-Path -LiteralPath $bak) {{
+            Copy-Item -LiteralPath $bak -Destination (Join-Path $Install $fileName) -Force
+        }}
+    }}
+
+    Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Backup -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $ArgsFile -Force -ErrorAction SilentlyContinue
+    Write-UpdateLog ("start " + $Exe)
+    Start-Process -FilePath $Exe
+}} catch {{
+    Write-UpdateLog ("FAIL " + $_.Exception.Message)
+    try {{
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            ("업데이트 실패: " + $_.Exception.Message),
+            "VelogPoster",
+            "OK",
+            "Error"
+        ) | Out-Null
+    }} catch {{}}
+}} finally {{
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}}
 """,
         encoding="utf-8",
     )
 
 
-def _quote_cmd_arg(value: str) -> str:
-    text = str(value)
-    if not text or any(ch in text for ch in ' \t"'):
-        return '"' + text.replace('"', '""') + '"'
-    return text
-
-
-def _launch_hidden(script_path: Path, script_args: list[str]) -> None:
-    """WScript로 PowerShell을 완전히 숨긴 상태로 실행한다."""
-    quoted_args = " ".join(_quote_cmd_arg(arg) for arg in script_args)
-    ps_command = (
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden "
-        f'-File "{script_path}" {quoted_args}'
-    )
-    vbs_path = script_path.with_suffix(".vbs")
-    vbs_path.write_text(
-        'Set sh = CreateObject("WScript.Shell")\r\n'
-        f'sh.Run "{ps_command.replace(chr(34), chr(34) * 2)}", 0, False\r\n',
-        encoding="utf-8",
-    )
-
+def _launch_hidden(script_path: Path, args_file: Path) -> None:
+    """PowerShell을 콘솔 없이 실행한다. 경로는 ArgsFile(JSON)로 전달."""
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
+    creationflags = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0)
     subprocess.Popen(
-        ["wscript.exe", "//B", "//Nologo", str(vbs_path)],
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+            str(script_path),
+            "-ArgsFile",
+            str(args_file),
+        ],
         startupinfo=startupinfo,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=creationflags,
         close_fds=True,
     )
 
@@ -329,10 +367,21 @@ def schedule_apply_update(
     target_dir = install_dir or get_install_dir()
     inner = zip_inner_folder or target_dir.name
     exe_path = target_dir / exe_name
-    script_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.ps1"
+    temp_dir = Path(tempfile.gettempdir())
+    script_path = temp_dir / f"{app_slug}_update_{os.getpid()}.ps1"
+    args_file = temp_dir / f"{app_slug}_update_{os.getpid()}.json"
     _write_update_script(script_path, _PRESERVE_FILES)
-
-    _launch_hidden(
-        script_path,
-        [str(zip_path), str(target_dir), str(exe_path), inner, exe_name],
+    args_file.write_text(
+        json.dumps(
+            {
+                "Zip": str(zip_path),
+                "Install": str(target_dir),
+                "Exe": str(exe_path),
+                "Inner": inner,
+                "WaitExe": exe_name,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
+    _launch_hidden(script_path, args_file)
