@@ -6,11 +6,20 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-# git/pyinstaller write progress to stderr; treat as non-terminating for native commands
-$PSNativeCommandUseErrorActionPreference = $false
 $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
 . (Join-Path $PSScriptRoot "gh-env.ps1")
+
+function Invoke-Soft {
+    # git/pyinstaller 가 stderr 로 경고를 내도 중단하지 않는다.
+    param([scriptblock]$Block)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $Block
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    return $code
+}
 
 function Read-DeployConfig {
     Get-Content (Join-Path $Root "deploy.json") -Raw | ConvertFrom-Json
@@ -148,8 +157,8 @@ if (-not $SkipBuild) {
     Write-Host "[1/4] Building..."
     $buildScript = Join-Path $Root $cfg.build.script
     if (-not (Test-Path $buildScript)) { throw "Build script missing: $($cfg.build.script)" }
-    & $buildScript
-    if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+    $buildCode = Invoke-Soft { & $buildScript }
+    if ($buildCode -ne 0) { throw "Build failed" }
 }
 
 $distDir = Join-Path $Root ($cfg.build.dist_dir -replace "/", "\")
@@ -169,25 +178,24 @@ Ensure-GitRemote $cfg
 Ensure-GhAuth
 
 Write-Host "[3/4] Pushing to GitHub..."
-$addArgs = @()
-foreach ($item in $cfg.git_add) {
-    $addArgs += $item
+Invoke-Soft {
+    foreach ($item in $cfg.git_add) {
+        git add -- $item 2>$null
+    }
+    git add deploy.json deploy.bat version.json scripts 2>$null
+    git add -u 2>$null
 }
-if ($addArgs.Count -gt 0) {
-    git add @addArgs
-}
-git add deploy.json deploy.bat version.json scripts 2>$null
-git add -u
 
 if (git status --porcelain) {
-    git commit -m "Release $newVersion"
+    Invoke-Soft { git commit -m "Release $newVersion" }
 }
 
-git push -u origin main
+Invoke-Soft { git push -u origin main }
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[git] pull --rebase then push..."
-    git pull origin main --rebase
-    git push -u origin main
+    Invoke-Soft { git pull origin main --rebase }
+    Invoke-Soft { git push -u origin main }
+    if ($LASTEXITCODE -ne 0) { throw "git push failed" }
 }
 
 Write-Host "[4/4] GitHub Release..."
@@ -201,10 +209,10 @@ if (Test-GhRelease $tag) {
 Write-Host "[version.json] asset_id 갱신..."
 $assetId = Get-ReleaseAssetId $cfg $tag
 Write-VersionJson $cfg $newVersion $Notes -AssetId $assetId
-git add version.json
+Invoke-Soft { git add version.json }
 if (git status --porcelain -- version.json) {
-    git commit -m "Update version.json asset_id for $newVersion"
-    git push origin main
+    Invoke-Soft { git commit -m "Update version.json asset_id for $newVersion" }
+    Invoke-Soft { git push origin main }
 }
 
 Write-Host ""
