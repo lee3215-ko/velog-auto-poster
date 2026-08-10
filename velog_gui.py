@@ -157,6 +157,7 @@ class VelogApp(tk.Tk):
         self._tm_worker: threading.Thread | None = None
         self._tm_run_total = 0
         self._tm_run_done = 0
+        self._tm_target_tab_index = 0
 
         self._build_style()
         self._build_ui()
@@ -492,7 +493,7 @@ class VelogApp(tk.Tk):
         ttk.Label(head, text="생성된 임시 메일", style="Section.TLabel").pack(side="left")
         ttk.Label(
             head,
-            text="추가된 항목은 탭별 색으로 표시 · 더블클릭=URL · Ctrl+C=복사",
+            text="생성 즉시 포스팅 목록으로 이동 · 추가된 항목은 날짜별 접힘 · Ctrl+C=복사",
             style="Hint.TLabel",
         ).pack(side="right")
 
@@ -503,18 +504,21 @@ class VelogApp(tk.Tk):
         self.tm_tree = ttk.Treeview(
             tree_wrap,
             columns=("email", "url", "created", "added_tab"),
-            show="headings",
+            show="tree headings",
             selectmode="extended",
         )
+        self.tm_tree.heading("#0", text="그룹")
         self.tm_tree.heading("email", text="이메일 주소")
         self.tm_tree.heading("url", text="복사한 URL (메일함)")
         self.tm_tree.heading("created", text="생성 시각")
         self.tm_tree.heading("added_tab", text="추가된 탭")
-        self.tm_tree.column("email", width=200, stretch=False)
-        self.tm_tree.column("url", width=340, stretch=True)
+        self.tm_tree.column("#0", width=150, stretch=False, minwidth=110)
+        self.tm_tree.column("email", width=180, stretch=False)
+        self.tm_tree.column("url", width=300, stretch=True)
         self.tm_tree.column("created", width=120, stretch=False)
         self.tm_tree.column("added_tab", width=100, stretch=False, anchor="center")
         self.tm_tree.tag_configure("tm_pending", background="#ffffff")
+        self.tm_tree.tag_configure("tm_date_group", background="#f1f5f9", foreground="#334155")
         self.tm_tree.grid(row=0, column=0, sticky="nsew")
         self.tm_tree.bind("<Double-1>", self._on_tm_double_click)
         self.tm_tree.bind("<Control-c>", self._copy_tm_urls)
@@ -760,6 +764,7 @@ class VelogApp(tk.Tk):
         ttk.Button(
             self.manuscript_body, text="찾기", style="Pick.TButton", command=self._browse_manuscript_folder,
         ).grid(row=1, column=2, padx=(6, 0))
+        self._update_manuscript_section_label()
 
     _SECTION_LABELS = {
         "image": ("▸  이미지 · 사이트 URL", "▾  이미지 · 사이트 URL"),
@@ -767,6 +772,28 @@ class VelogApp(tk.Tk):
         "account": ("▸  계정 등록", "▾  계정 등록"),
         "manuscript": ("▸  원고 폴더", "▾  원고 폴더"),
     }
+
+    def _count_folder_manuscripts(self) -> int:
+        folder = self.manuscript_folder.get().strip()
+        root = Path(folder)
+        if not root.is_dir():
+            return 0
+        return sum(
+            1 for item in root.iterdir()
+            if item.is_file() and item.suffix.lower() in MANUSCRIPT_EXTS
+        )
+
+    def _manuscript_section_labels(self) -> tuple[str, str]:
+        n = self._count_folder_manuscripts()
+        suffix = f" · {n}개"
+        return (f"▸  원고 폴더{suffix}", f"▾  원고 폴더{suffix}")
+
+    def _update_manuscript_section_label(self) -> None:
+        if not hasattr(self, "manuscript_btn"):
+            return
+        collapsed, expanded = self._manuscript_section_labels()
+        text = expanded if self._collapse_state.get("manuscript", True) else collapsed
+        self.manuscript_btn.configure(text=text)
 
     def _toggle_section(self, key: str) -> None:
         bodies = {
@@ -776,7 +803,10 @@ class VelogApp(tk.Tk):
             "manuscript": (self.manuscript_btn, self.manuscript_body),
         }
         btn, body = bodies[key]
-        collapsed, expanded = self._SECTION_LABELS[key]
+        if key == "manuscript":
+            collapsed, expanded = self._manuscript_section_labels()
+        else:
+            collapsed, expanded = self._SECTION_LABELS[key]
         if self._collapse_state[key]:
             body.pack_forget()
             btn.configure(text=collapsed)
@@ -905,7 +935,7 @@ class VelogApp(tk.Tk):
         frame.pack(fill="both", expand=True)
         ttk.Label(
             frame,
-            text="어느 탭의 계정 목록에 추가할까요?",
+            text="어느 탭의 계정 목록에 추가할까요?\n(생성되는 메일도 이 탭으로 바로 이동합니다)",
             style="Section.TLabel",
         ).pack(anchor="w", pady=(0, 10))
 
@@ -1134,6 +1164,7 @@ class VelogApp(tk.Tk):
         path = filedialog.askdirectory(parent=self, title="원고 폴더 선택")
         if path:
             self.manuscript_folder.set(path)
+            self._update_manuscript_section_label()
             self._save_settings()
 
     def _browse_folder(self) -> None:
@@ -1445,6 +1476,7 @@ class VelogApp(tk.Tk):
         if tab is not None:
             self._fill_tree(tab)
         self._update_summary()
+        self._update_manuscript_section_label()
 
     def _fill_tree(self, tab: dict) -> None:
         tree = tab.get("tree")
@@ -1629,6 +1661,7 @@ class VelogApp(tk.Tk):
                 tree.set(iid, "status", self._status_text(acc))
                 tree.item(iid, tags=self._row_tags(acc, idx))
         self._update_summary()
+        self._update_manuscript_section_label()
         self.after(60_000, self._tick_gauges)
 
     def _clear_published(self, index: int) -> None:
@@ -1931,6 +1964,7 @@ class VelogApp(tk.Tk):
             else:
                 acc["manuscript_path"] = new_path
             self._append(f"원고 이동 → {folder}/{Path(new_path).name}", "info")
+            self._update_manuscript_section_label()
         except (PostingError, OSError) as exc:
             self._append(f"원고 이동 실패 ({Path(path).name}): {exc}", "error")
 
@@ -1966,29 +2000,74 @@ class VelogApp(tk.Tk):
         return result
 
     # -- 임시 메일 생성 ---------------------------------------------------
+    @staticmethod
+    def _tm_item_date(item: dict) -> str:
+        created = str(item.get("created_at", "")).strip()
+        if len(created) >= 10 and created[4] == "-" and created[7] == "-":
+            return created[:10]
+        return datetime.now().strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _tm_item_iid(index: int) -> str:
+        return f"item:{index}"
+
+    @staticmethod
+    def _tm_parse_item_iid(iid: str) -> int | None:
+        if not str(iid).startswith("item:"):
+            return None
+        try:
+            return int(str(iid).split(":", 1)[1])
+        except ValueError:
+            return None
+
+    def _insert_tm_item(self, parent: str, index: int, item: dict) -> None:
+        added_tab = item.get("added_tab", "").strip()
+        tab_index = item.get("added_tab_index", "")
+        tags: tuple[str, ...]
+        if added_tab and tab_index != "":
+            try:
+                tags = (self._tm_tab_tag(int(tab_index)),)
+            except (TypeError, ValueError):
+                tags = ("tm_pending",)
+        else:
+            tags = ("tm_pending",)
+        self.tm_tree.insert(
+            parent, "end", iid=self._tm_item_iid(index), text="", tags=tags,
+            values=(
+                item.get("email", ""),
+                item.get("inbox_url", ""),
+                item.get("created_at", ""),
+                added_tab or "—",
+            ),
+        )
+
     def _refresh_tm_tree(self) -> None:
         self._ensure_tm_tab_tags()
         self.tm_tree.delete(*self.tm_tree.get_children())
+        pending: list[tuple[int, dict]] = []
+        added_by_date: dict[str, list[tuple[int, dict]]] = {}
         for index, item in enumerate(self.generated_emails):
-            added_tab = item.get("added_tab", "").strip()
-            tab_index = item.get("added_tab_index", "")
-            tags: tuple[str, ...]
-            if added_tab and tab_index != "":
-                try:
-                    tags = (self._tm_tab_tag(int(tab_index)),)
-                except (TypeError, ValueError):
-                    tags = ("tm_pending",)
+            if str(item.get("added_tab", "")).strip():
+                date = self._tm_item_date(item)
+                added_by_date.setdefault(date, []).append((index, item))
             else:
-                tags = ("tm_pending",)
-            self.tm_tree.insert(
-                "", "end", iid=str(index), tags=tags,
-                values=(
-                    item.get("email", ""),
-                    item.get("inbox_url", ""),
-                    item.get("created_at", ""),
-                    added_tab or "—",
-                ),
+                pending.append((index, item))
+
+        for index, item in pending:
+            self._insert_tm_item("", index, item)
+
+        for date in sorted(added_by_date.keys(), reverse=True):
+            items = added_by_date[date]
+            parent = self.tm_tree.insert(
+                "", "end",
+                iid=f"date:{date}",
+                text=f"{date} · {len(items)}개",
+                open=False,
+                values=("", "", "", "포스팅 추가됨"),
+                tags=("tm_date_group",),
             )
+            for index, item in items:
+                self._insert_tm_item(parent, index, item)
 
     def _append_tm_log(self, message: str, tag: str = "") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -2025,18 +2104,60 @@ class VelogApp(tk.Tk):
             pass
         self.after(100, self._drain_tm_events)
 
+    def _move_generated_item_to_tab(self, item: dict, tab_index: int) -> bool:
+        """임시메일 항목을 포스팅 계정 목록으로 옮긴다. 성공 시 True."""
+        if tab_index < 0 or tab_index >= len(self.tabs):
+            return False
+        email = item.get("email", "").strip()
+        url = item.get("inbox_url", "").strip()
+        if not email or not url:
+            return False
+        target_tab = self.tabs[tab_index]
+        existing = {
+            (a.get("velog_id"), a.get("inbox_url")) for a in target_tab["accounts"]
+        }
+        if (email, url) in existing:
+            item["added_tab"] = target_tab["title"]
+            item["added_tab_index"] = tab_index
+            return False
+        target_tab["accounts"].append({
+            "velog_id": email,
+            "inbox_url": url,
+            "manuscript_path": "",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "mail_mismatch": "",
+        })
+        item["added_tab"] = target_tab["title"]
+        item["added_tab_index"] = tab_index
+        return True
+
     def _on_tempmail_created(self, email: str, inbox_url: str) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.generated_emails.append({
+        item = {
             "email": email,
             "inbox_url": inbox_url,
             "created_at": now,
-        })
+        }
+        self.generated_emails.append(item)
         self._tm_run_done += 1
         self._set_tm_progress(self._tm_run_done, self._tm_run_total)
+
+        tab_index = self._tm_target_tab_index
+        if tab_index < 0 or tab_index >= len(self.tabs):
+            tab_index = 0
+        added = self._move_generated_item_to_tab(item, tab_index)
+        if added and 0 <= tab_index < len(self.tabs):
+            self._fill_tree(self.tabs[tab_index])
+            self._update_summary()
+
         self._refresh_tm_tree()
         self._save_settings()
-        self._append_tm_log(f"저장됨: {email}", "success")
+        tab_title = self.tabs[tab_index]["title"] if self.tabs else ""
+        if added:
+            self._append_tm_log(f"저장·이동: {email} → 「{tab_title}」", "success")
+            self.tm_status.set(f"{email} → 「{tab_title}」 탭에 추가됨")
+        else:
+            self._append_tm_log(f"저장됨: {email} (이미 등록됨)", "info")
 
     def _set_tm_progress(self, done: int, total: int) -> None:
         if total <= 0:
@@ -2085,14 +2206,29 @@ class VelogApp(tk.Tk):
             messagebox.showwarning("입력 확인", "생성 개수는 1~100 사이로 입력해 주세요.", parent=self)
             return
 
+        if not self.tabs:
+            self.tabs.append({"title": "기본", "accounts": []})
+            self._rebuild_tabs()
+        tab_index = self._ask_account_tab()
+        if tab_index is None:
+            return
+        self._tm_target_tab_index = tab_index
+
         self._tm_run_total = 0 if loop else count
         self._tm_run_done = 0
         self._set_tm_progress(0, max(count, 1) if not loop else 0)
         self._set_tm_running(True)
+        tab_title = self.tabs[tab_index]["title"]
         if loop:
-            self._append_tm_log("임시 메일 연속 생성을 시작합니다. (중단 시까지)", "info")
+            self._append_tm_log(
+                f"임시 메일 연속 생성을 시작합니다. (「{tab_title}」로 자동 이동 · 중단 시까지)",
+                "info",
+            )
         else:
-            self._append_tm_log(f"{count}개 임시 메일 생성을 시작합니다.", "info")
+            self._append_tm_log(
+                f"{count}개 임시 메일 생성 → 「{tab_title}」 탭으로 자동 이동합니다.",
+                "info",
+            )
 
         def on_created(email: str, url: str) -> None:
             self._tm_events.put((f"{email}\t{url}", "created"))
@@ -2122,15 +2258,32 @@ class VelogApp(tk.Tk):
             self.tm_stop_btn.configure(state="disabled")
 
     def _tm_selected_indices(self) -> list[int]:
-        return sorted(int(iid) for iid in self.tm_tree.selection())
+        indices: list[int] = []
+        for iid in self.tm_tree.selection():
+            idx = self._tm_parse_item_iid(iid)
+            if idx is not None:
+                indices.append(idx)
+                continue
+            if str(iid).startswith("date:"):
+                for child in self.tm_tree.get_children(iid):
+                    cidx = self._tm_parse_item_iid(child)
+                    if cidx is not None:
+                        indices.append(cidx)
+        return sorted(set(indices))
 
     def _on_tm_double_click(self, event) -> None:
-        if self.tm_tree.identify("region", event.x, event.y) != "cell":
-            return
         row = self.tm_tree.identify_row(event.y)
         if not row:
             return
-        url = self.generated_emails[int(row)].get("inbox_url", "")
+        if str(row).startswith("date:"):
+            self.tm_tree.item(row, open=not self.tm_tree.item(row, "open"))
+            return
+        if self.tm_tree.identify("region", event.x, event.y) not in {"cell", "tree"}:
+            return
+        idx = self._tm_parse_item_iid(row)
+        if idx is None or idx >= len(self.generated_emails):
+            return
+        url = self.generated_emails[idx].get("inbox_url", "")
         if url:
             webbrowser.open(url)
 
@@ -2138,7 +2291,7 @@ class VelogApp(tk.Tk):
         urls = [
             self.generated_emails[i].get("inbox_url", "")
             for i in self._tm_selected_indices()
-            if self.generated_emails[i].get("inbox_url")
+            if 0 <= i < len(self.generated_emails) and self.generated_emails[i].get("inbox_url")
         ]
         if urls:
             self.clipboard_clear()
@@ -2148,12 +2301,20 @@ class VelogApp(tk.Tk):
 
     def _add_generated_to_accounts(self, all_items: bool = False) -> None:
         if all_items:
-            indices = list(range(len(self.generated_emails)))
+            indices = [
+                i for i, item in enumerate(self.generated_emails)
+                if not str(item.get("added_tab", "")).strip()
+            ]
         else:
-            indices = self._tm_selected_indices()
+            indices = [
+                i for i in self._tm_selected_indices()
+                if not str(self.generated_emails[i].get("added_tab", "")).strip()
+            ]
         if not indices:
             messagebox.showwarning(
-                "선택 확인", "계정 목록에 추가할 항목을 선택해 주세요.", parent=self,
+                "선택 확인",
+                "아직 포스팅 목록에 없는 항목을 선택해 주세요.",
+                parent=self,
             )
             return
 
@@ -2164,30 +2325,10 @@ class VelogApp(tk.Tk):
             return
 
         target_tab = self.tabs[tab_index]
-        now_iso = datetime.now().isoformat(timespec="seconds")
-        existing = {
-            (a.get("velog_id"), a.get("inbox_url")) for a in target_tab["accounts"]
-        }
         added = 0
         for i in indices:
-            item = self.generated_emails[i]
-            email = item.get("email", "").strip()
-            url = item.get("inbox_url", "").strip()
-            if not email or not url:
-                continue
-            if (email, url) in existing:
-                continue
-            target_tab["accounts"].append({
-                "velog_id": email,
-                "inbox_url": url,
-                "manuscript_path": "",
-                "created_at": now_iso,
-                "mail_mismatch": "",
-            })
-            existing.add((email, url))
-            item["added_tab"] = target_tab["title"]
-            item["added_tab_index"] = tab_index
-            added += 1
+            if self._move_generated_item_to_tab(self.generated_emails[i], tab_index):
+                added += 1
 
         if added == 0:
             messagebox.showinfo("추가 결과", "추가할 새 계정이 없습니다 (이미 등록됨).", parent=self)
@@ -2281,6 +2422,7 @@ class VelogApp(tk.Tk):
         self._rebuild_tabs()
         if hasattr(self, "tm_tree"):
             self._refresh_tm_tree()
+        self._update_manuscript_section_label()
 
     def _save_settings(self) -> None:
         try:

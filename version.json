@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.15",
+    "version":  "1.0.16",
     "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "헤드리스 모드 제거 (Cloudflare 봇 인증 방해)"
+    "notes":  "임시메일 생성 즉시 포스팅 목록 이동, 추가분 날짜별 접기, 원고 폴더 개수 표시"
 }
