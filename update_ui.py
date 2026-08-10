@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
+import time
+import urllib.error
 import webbrowser
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -13,8 +16,11 @@ from updater import (
     UpdateInfo,
     can_auto_update,
     check_for_update,
-    download_file,
+    download_file_with_fallbacks,
+    format_network_error,
+    get_update_log_path,
     schedule_apply_update,
+    validate_zip_file,
 )
 
 
@@ -182,6 +188,8 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
         root.after(0, apply)
 
     def fail(exc: BaseException) -> None:
+        detail = format_network_error(exc)
+
         def apply() -> None:
             try:
                 dialog.destroy()
@@ -189,7 +197,7 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
                 pass
             messagebox.showerror(
                 "업데이트 실패",
-                f"업데이트에 실패했습니다.\n\n{exc}\n\n"
+                f"업데이트에 실패했습니다.\n\n{detail}\n\n"
                 "브라우저에서 최신 zip을 받아 설치 폴더에 덮어써 주세요.",
                 parent=root,
             )
@@ -200,6 +208,7 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
 
     def worker() -> None:
         zip_path = Path(tempfile.gettempdir()) / f"{app_name}-{info.version}.zip"
+        log_path = get_update_log_path()
         try:
             set_status("다운로드 중...")
 
@@ -211,30 +220,50 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
                     mb = done / (1024 * 1024)
                     set_status(f"다운로드 중... {mb:.1f} MB")
 
-            download_file(
-                info.url,
+            urls = list(info.download_urls) if info.download_urls else [info.url]
+            download_file_with_fallbacks(
+                urls,
                 zip_path,
                 user_agent=f"{app_name}/{info.version}",
                 on_progress=on_progress,
             )
+            # onedir 빌드는 수 MB 이상이어야 정상
+            validate_zip_file(zip_path, min_bytes=1024 * 1024)
             set_status("설치 준비 중...", determinate=True, value=100)
-            schedule_apply_update(
-                zip_path,
-                exe_name=exe_name,
-                zip_inner_folder=zip_inner_folder,
-                app_slug=app_name,
-            )
         except Exception as exc:  # noqa: BLE001
             fail(exc)
             return
 
         def finish() -> None:
             try:
+                status.configure(text="설치 중... 잠시 후 다시 실행됩니다.")
+                dialog.update_idletasks()
+                schedule_apply_update(
+                    zip_path,
+                    exe_name=exe_name,
+                    zip_inner_folder=zip_inner_folder,
+                    app_slug=app_name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror(
+                    "업데이트 실패",
+                    f"{exc}\n\n로그: {log_path}",
+                    parent=root,
+                )
+                try:
+                    dialog.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+            try:
                 dialog.destroy()
             except Exception:  # noqa: BLE001
                 pass
-            root.quit()
+            # root.quit() 만으로는 프로세스가 남을 수 있어 설치 스크립트가 대기에서 멈춤
+            time.sleep(1.2)
+            os._exit(0)
 
-        root.after(300, finish)
+        root.after(0, finish)
 
     threading.Thread(target=worker, daemon=True).start()

@@ -47,16 +47,59 @@ function Bump-Version([string]$Version, [string]$Part) {
     return "$major.$minor.$patch"
 }
 
-function Write-VersionJson($cfg, [string]$Version, [string]$ReleaseNotes) {
-    $downloadUrl = "https://github.com/$($cfg.github_owner)/$($cfg.github_repo)/releases/latest/download/$($cfg.release_asset)"
-    $payload = [ordered]@{
-        version = $Version
-        url     = $downloadUrl
-        notes   = $ReleaseNotes
-    } | ConvertTo-Json -Depth 3
+function Write-VersionJson(
+    $cfg,
+    [string]$Version,
+    [string]$ReleaseNotes,
+    $AssetId = $null
+) {
+    $owner = $cfg.github_owner
+    $repo = $cfg.github_repo
+    $asset = $cfg.release_asset
+    $versionedUrl = "https://github.com/$owner/$repo/releases/download/v$Version/$asset"
+    $latestUrl = "https://github.com/$owner/$repo/releases/latest/download/$asset"
+    $urls = New-Object System.Collections.Generic.List[string]
+    $primary = $latestUrl
+    if ($null -ne $AssetId -and "$AssetId" -ne "") {
+        $apiUrl = "https://api.github.com/repos/$owner/$repo/releases/assets/$AssetId"
+        $urls.Add($apiUrl) | Out-Null
+        $primary = $apiUrl
+    }
+    $urls.Add($versionedUrl) | Out-Null
+    $urls.Add($latestUrl) | Out-Null
+    $payloadObj = [ordered]@{
+        version           = $Version
+        url               = $primary
+        download_url      = $versionedUrl
+        notes             = $ReleaseNotes
+        download_urls     = @($urls)
+    }
+    if ($null -ne $AssetId -and "$AssetId" -ne "") {
+        $payloadObj["asset_id"] = [int]$AssetId
+        $payloadObj["api_download_url"] = "https://api.github.com/repos/$owner/$repo/releases/assets/$AssetId"
+    }
+    $payload = $payloadObj | ConvertTo-Json -Depth 5
     $path = Join-Path $Root "version.json"
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($path, $payload, $utf8NoBom)
+}
+
+function Get-ReleaseAssetId($cfg, [string]$Tag) {
+    $gh = Get-GhExe
+    if (-not $gh) { return $null }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    $json = & $gh api "repos/$($cfg.github_owner)/$($cfg.github_repo)/releases/tags/$Tag" 2>$null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    if ($code -ne 0 -or -not $json) { return $null }
+    $release = $json | ConvertFrom-Json
+    foreach ($asset in @($release.assets)) {
+        if ($asset.name -eq $cfg.release_asset) {
+            return [int]$asset.id
+        }
+    }
+    return $null
 }
 
 function Ensure-GitRemote($cfg) {
@@ -153,7 +196,17 @@ if (Test-GhRelease $tag) {
     Invoke-Gh release create $tag $zipPath --title $newVersion --notes $Notes --latest
 }
 
+Write-Host "[version.json] asset_id 갱신..."
+$assetId = Get-ReleaseAssetId $cfg $tag
+Write-VersionJson $cfg $newVersion $Notes -AssetId $assetId
+git add version.json
+if (git status --porcelain -- version.json) {
+    git commit -m "Update version.json asset_id for $newVersion"
+    git push origin main
+}
+
 Write-Host ""
 Write-Host "Done!"
 Write-Host "  version: $newVersion"
+if ($assetId) { Write-Host "  asset_id: $assetId" }
 Write-Host "  https://github.com/$($cfg.github_owner)/$($cfg.github_repo)/releases/tag/$tag"

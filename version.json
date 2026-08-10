@@ -1,5 +1,10 @@
 {
-    "version":  "1.0.16",
+    "version":  "1.0.17",
     "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "임시메일 생성 즉시 포스팅 목록 이동, 추가분 날짜별 접기, 원고 폴더 개수 표시"
+    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.17/VelogPoster.zip",
+    "notes":  "자동 업데이트 설치/재실행 수정 (다운로드 후 파일 교체·재시작 안정화)",
+    "download_urls":  [
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.17/VelogPoster.zip",
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
+                      ]
 }
