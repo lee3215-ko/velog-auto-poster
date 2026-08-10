@@ -1,4 +1,4 @@
-﻿"""앱 버전·업데이트 URL (배포 시 publish.ps1 이 자동 갱신)."""
+""앱 버전·업데이트 URL (배포 시 publish.ps1 이 자동 갱신)."""
 
 APP_VERSION = "1.0.17"
 APP_NAME = "VelogPoster"

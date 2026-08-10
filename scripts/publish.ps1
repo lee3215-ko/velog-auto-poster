@@ -6,6 +6,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# git/pyinstaller write progress to stderr; treat as non-terminating for native commands
+$PSNativeCommandUseErrorActionPreference = $false
 $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
 . (Join-Path $PSScriptRoot "gh-env.ps1")
