@@ -292,13 +292,14 @@ def make_bio(name: str) -> str:
 # 메인 엔진
 # ---------------------------------------------------------------------------
 class VelogPoster:
-    def __init__(self, log: LogCallback, on_result=None, on_failed=None) -> None:
+    def __init__(self, log: LogCallback, on_result=None, on_failed=None, *, headless: bool = False) -> None:
         self._emit = log
         self._prefix = ""  # 진행 중 계정 번호 표시 (예: "[2/5] ")
         # on_result(velog_id, url): 한 계정 발행이 끝나면 결과 URL 을 알린다.
         # on_failed(velog_id, manuscript_path): 발행 실패 시 원고 정리용.
         self.on_result = on_result
         self.on_failed = on_failed
+        self._headless = headless
         self._stop = threading.Event()
         self._process: subprocess.Popen | None = None
         self._browser = None
@@ -442,13 +443,17 @@ class VelogPoster:
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
             "--remote-allow-origins=*",
-            "--start-maximized",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
-            "about:blank",
         ]
-        self.log("Chrome 시크릿 창을 여는 중...", "info")
+        if self._headless:
+            command.extend(["--headless=new", "--window-size=1920,1080", "--disable-gpu"])
+            self.log("Chrome 헤드리스 모드로 여는 중...", "info")
+        else:
+            command.append("--start-maximized")
+            self.log("Chrome 시크릿 창을 여는 중...", "info")
+        command.append("about:blank")
         try:
             self._process = subprocess.Popen(command, close_fds=True)
         except OSError as exc:

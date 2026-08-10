@@ -66,11 +66,13 @@ ACCOUNT_KEYS = (
     "published_url", "published_at", "created_at", "mail_mismatch",
 )
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+MANUSCRIPT_EXTS = {".txt", ".html", ".htm", ".md"}
 NONE_MARK = "더블클릭하여 지정"
 DONE_BG = "#dcfce7"
 DONE_FG = "#166534"
 GAUGE_DAYS = 6.0
 GAUGE_SEGMENTS = 6
+PUBLISH_COOLDOWN_HOURS = 12.0
 TM_TAB_COLORS = (
     ("#dcfce7", "#166534"),
     ("#dbeafe", "#1d4ed8"),
@@ -122,11 +124,15 @@ class VelogApp(tk.Tk):
         self.velog_id = tk.StringVar()
         self.inbox_url = tk.StringVar()
         self.manuscript = tk.StringVar()
+        self.manuscript_folder = tk.StringVar()
         self.image_folder = tk.StringVar()
         self.anchor_text = tk.StringVar()
         self.anchor_url = tk.StringVar()
         self.homepage_search = tk.StringVar()
-        self._collapse_state = {"image": False, "advanced": False, "account": False}
+        self.headless_posting = tk.BooleanVar(value=False)
+        self.headless_tempmail = tk.BooleanVar(value=False)
+        self.tm_loop_until_stop = tk.BooleanVar(value=True)
+        self._collapse_state = {"image": False, "advanced": False, "account": False, "manuscript": True}
         self.status = tk.StringVar(value="대기 중 — 계정을 등록한 뒤 [전체 출간 시작]을 누르세요.")
         self.tab_summary = tk.StringVar(value="계정 0개")
         self.log_summary = tk.StringVar(value="로그 0줄")
@@ -374,7 +380,7 @@ class VelogApp(tk.Tk):
         ttk.Label(header, text="벨로그 자동 포스팅", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="① 계정 등록  →  ② 원고 지정  →  ③ 전체 출간 시작",
+            text="① 계정 등록  →  ② 원고 폴더/지정  →  ③ 전체 출간 시작",
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -417,6 +423,12 @@ class VelogApp(tk.Tk):
             command=self._stop, state="disabled",
         )
         self.stop_btn.grid(row=0, column=1, sticky="ew")
+        opts = ttk.Frame(bottom, style="Bg.TFrame")
+        opts.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(
+            opts, text="헤드리스 모드 (브라우저 창 숨김)",
+            variable=self.headless_posting, command=self._save_settings,
+        ).pack(side="left")
         ttk.Label(bottom, textvariable=self.status, style="Status.TLabel").pack(
             fill="x", pady=(10, 0),
         )
@@ -443,11 +455,22 @@ class VelogApp(tk.Tk):
         ctrl = self._section(left, "생성 설정", "Chrome 시크릿 창에서 tempmail.co 를 자동 조작합니다.")
         ctrl.columnconfigure(1, weight=1)
         ttk.Label(ctrl, text="생성 개수", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        spin = ttk.Spinbox(ctrl, from_=1, to=50, textvariable=self.tm_count, width=8, font=(FONT, 10))
+        spin = ttk.Spinbox(ctrl, from_=1, to=100, textvariable=self.tm_count, width=8, font=(FONT, 10))
         spin.grid(row=0, column=1, sticky="w")
-        ttk.Label(ctrl, text="1~50개 · 각각 New Email 로 새 주소를 만듭니다.", style="Hint.TLabel").grid(
+        ttk.Label(ctrl, text="1~100개 · New Email 로 새 주소를 만듭니다.", style="Hint.TLabel").grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(6, 0),
         )
+        ttk.Checkbutton(
+            ctrl, text="중단할 때까지 계속 생성 (개수 무시)",
+            variable=self.tm_loop_until_stop, command=self._save_settings,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            ctrl, text="헤드리스 모드 (브라우저 창 숨김)",
+            variable=self.headless_tempmail, command=self._save_settings,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(
+            ctrl, text="생성 간격은 매번 랜덤하게 달라집니다.", style="Hint.TLabel",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         btns = ttk.Frame(left, style="Bg.TFrame")
         btns.pack(fill="x", pady=(0, 10))
@@ -720,10 +743,41 @@ class VelogApp(tk.Tk):
         btn_bulk.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ToolTip(btn_bulk, "아이디와 메일함 URL을 번갈아 붙여넣어 한 번에 등록합니다.")
 
+        # 원고 폴더 (접기/펴기)
+        ms_outer = ttk.Frame(parent, style="CardBorder.TFrame")
+        ms_outer.pack(fill="x", pady=(0, 10))
+        ms_card = ttk.Frame(ms_outer, style="Card.TFrame", padding=(12, 10))
+        ms_card.pack(fill="x", padx=1, pady=1)
+        self.manuscript_btn = ttk.Button(
+            ms_card,
+            text="▾  원고 폴더",
+            style="Ghost.TButton",
+            command=lambda: self._toggle_section("manuscript"),
+        )
+        self.manuscript_btn.pack(fill="x")
+        self.manuscript_body = ttk.Frame(ms_card, style="Card.TFrame")
+        self.manuscript_body.pack(fill="x", pady=(8, 0))
+        self.manuscript_body.columnconfigure(1, weight=1)
+        ttk.Label(
+            self.manuscript_body,
+            text="출간 시작 시 폴더의 원고를 대기 계정에 자동 배정합니다. 원고가 없으면 중지합니다.",
+            style="Hint.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Label(self.manuscript_body, text="원고 폴더", style="Field.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 8),
+        )
+        ttk.Entry(self.manuscript_body, textvariable=self.manuscript_folder, font=(FONT, 9)).grid(
+            row=1, column=1, sticky="ew", ipady=5,
+        )
+        ttk.Button(
+            self.manuscript_body, text="찾기", style="Pick.TButton", command=self._browse_manuscript_folder,
+        ).grid(row=1, column=2, padx=(6, 0))
+
     _SECTION_LABELS = {
         "image": ("▸  이미지 · 사이트 URL", "▾  이미지 · 사이트 URL"),
         "advanced": ("▸  고급 설정 (프로필 · 앵커)", "▾  고급 설정 (프로필 · 앵커)"),
         "account": ("▸  계정 등록", "▾  계정 등록"),
+        "manuscript": ("▸  원고 폴더", "▾  원고 폴더"),
     }
 
     def _toggle_section(self, key: str) -> None:
@@ -731,6 +785,7 @@ class VelogApp(tk.Tk):
             "image": (self.image_btn, self.image_body),
             "advanced": (self.adv_btn, self.adv_body),
             "account": (self.account_btn, self.account_body),
+            "manuscript": (self.manuscript_btn, self.manuscript_body),
         }
         btn, body = bodies[key]
         collapsed, expanded = self._SECTION_LABELS[key]
@@ -784,7 +839,7 @@ class VelogApp(tk.Tk):
         legend = ttk.Frame(parent, style="Bg.TFrame")
         legend.pack(fill="x", pady=(10, 0))
         for color, fg, label in (
-            (DONE_BG, DONE_FG, "발행 완료"),
+            (DONE_BG, DONE_FG, "발행 쿨다운(12h)"),
             ("#fff3bf", "#5c3c00", "메일 불일치"),
             ("#ffe3e3", "#c92a2a", "6일 만료"),
         ):
@@ -1086,6 +1141,12 @@ class VelogApp(tk.Tk):
         )
         if path:
             self.manuscript.set(path)
+
+    def _browse_manuscript_folder(self) -> None:
+        path = filedialog.askdirectory(parent=self, title="원고 폴더 선택")
+        if path:
+            self.manuscript_folder.set(path)
+            self._save_settings()
 
     def _browse_folder(self) -> None:
         path = filedialog.askdirectory(parent=self, title="공통 이미지 폴더 선택")
@@ -1406,7 +1467,11 @@ class VelogApp(tk.Tk):
             man = Path(acc.get("manuscript_path", "")).name if acc.get("manuscript_path") else NONE_MARK
             url = acc.get("published_url", "")
             at = acc.get("published_at", "")
-            result = f"{at}  {url}" if url else "—"
+            at_disp = at
+            parsed = self._parse_time(at)
+            if parsed is not None:
+                at_disp = parsed.strftime("%Y-%m-%d %H:%M")
+            result = f"{at_disp}  {url}" if url else "—"
             status = self._status_text(acc)
             vid = acc.get("velog_id", "")
             if acc.get("mail_mismatch"):
@@ -1415,6 +1480,9 @@ class VelogApp(tk.Tk):
                         values=(index + 1, vid, status, acc.get("inbox_url", ""), man, result))
 
     def _status_text(self, acc: dict) -> str:
+        if acc.get("published_url") and self._is_on_cooldown(acc):
+            rem_h = self._cooldown_hours_left(acc)
+            return f"쿨다운 {rem_h:.1f}h"
         if acc.get("published_url"):
             return "완료"
         rem = self._remaining_days(acc.get("created_at", ""))
@@ -1424,13 +1492,50 @@ class VelogApp(tk.Tk):
 
     def _row_tags(self, acc: dict, index: int = 0) -> tuple:
         tags = ["even" if index % 2 == 0 else "odd"]
-        if acc.get("published_url"):
+        if acc.get("published_url") and self._is_on_cooldown(acc):
             tags.append("done")
         if self._remaining_days(acc.get("created_at", "")) <= 0:
             tags.append("expired")
         if acc.get("mail_mismatch"):
             tags.append("mismatch")
         return tuple(tags)
+
+    @staticmethod
+    def _parse_time(value: str) -> datetime | None:
+        raw = (value or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _cooldown_hours_left(self, acc: dict) -> float:
+        posted = self._parse_time(str(acc.get("published_at", "")))
+        if posted is None:
+            return PUBLISH_COOLDOWN_HOURS
+        elapsed_h = (datetime.now() - posted).total_seconds() / 3600.0
+        return max(0.0, PUBLISH_COOLDOWN_HOURS - elapsed_h)
+
+    def _is_on_cooldown(self, acc: dict) -> bool:
+        if not acc.get("published_url"):
+            return False
+        return self._cooldown_hours_left(acc) > 0
+
+    def _is_eligible_for_assign(self, acc: dict) -> bool:
+        if not str(acc.get("velog_id", "")).strip():
+            return False
+        if self._remaining_days(acc.get("created_at", "")) <= 0:
+            return False
+        if self._is_on_cooldown(acc):
+            return False
+        return True
 
     @staticmethod
     def _remaining_days(created_at: str) -> float:
@@ -1443,7 +1548,87 @@ class VelogApp(tk.Tk):
         elapsed = (datetime.now() - t).total_seconds() / 86400.0
         return max(0.0, GAUGE_DAYS - elapsed)
 
+    def _refresh_cooldowns(self) -> int:
+        """12시간 지난 발행 계정을 다시 배정 가능 상태로 되돌린다."""
+        cleared = 0
+        for tab in self.tabs:
+            for acc in tab["accounts"]:
+                if not acc.get("published_url"):
+                    continue
+                if self._is_on_cooldown(acc):
+                    continue
+                acc.pop("published_url", None)
+                acc.pop("published_at", None)
+                acc["manuscript_path"] = ""
+                cleared += 1
+        return cleared
+
+    def _purge_expired_accounts(self) -> int:
+        """6일 만료 계정을 목록에서 삭제한다."""
+        removed = 0
+        for tab in self.tabs:
+            before = len(tab["accounts"])
+            tab["accounts"] = [
+                a for a in tab["accounts"]
+                if self._remaining_days(a.get("created_at", "")) > 0
+            ]
+            removed += before - len(tab["accounts"])
+        return removed
+
+    def _list_available_manuscripts(self, folder: str) -> list[Path]:
+        root = Path(folder)
+        if not root.is_dir():
+            return []
+        used: set[str] = set()
+        for tab in self.tabs:
+            for acc in tab["accounts"]:
+                path = str(acc.get("manuscript_path", "")).strip()
+                if not path:
+                    continue
+                try:
+                    used.add(str(Path(path).resolve()))
+                except OSError:
+                    used.add(path)
+        files: list[Path] = []
+        for item in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if not item.is_file():
+                continue
+            if item.suffix.lower() not in MANUSCRIPT_EXTS:
+                continue
+            try:
+                key = str(item.resolve())
+            except OSError:
+                key = str(item)
+            if key in used:
+                continue
+            files.append(item)
+        return files
+
+    def _auto_assign_manuscripts(self, tab: dict, folder: str) -> int:
+        files = self._list_available_manuscripts(folder)
+        if not files:
+            return 0
+        targets = [
+            acc for acc in tab["accounts"]
+            if self._is_eligible_for_assign(acc) and not str(acc.get("manuscript_path", "")).strip()
+        ]
+        assigned = 0
+        for acc, path in zip(targets, files):
+            acc["manuscript_path"] = str(path)
+            assigned += 1
+        return assigned
+
     def _tick_gauges(self) -> None:
+        removed = self._purge_expired_accounts()
+        cleared = self._refresh_cooldowns()
+        if removed or cleared:
+            for tab in self.tabs:
+                self._fill_tree(tab)
+            self._save_settings()
+            if removed:
+                self.status.set(f"만료 계정 {removed}개를 목록에서 삭제했습니다.")
+            elif cleared:
+                self.status.set(f"쿨다운 종료 {cleared}개 — 다시 원고 배정 가능합니다.")
         for tab in self.tabs:
             tree = tab.get("tree")
             if tree is None:
@@ -1477,13 +1662,46 @@ class VelogApp(tk.Tk):
             messagebox.showwarning("계정 확인", "현재 탭에 계정을 하나 이상 등록해 주세요.", parent=self)
             return
         self._active_tab = tab
-        pending = [a for a in tab["accounts"] if not a.get("published_url")]
+
+        removed = self._purge_expired_accounts()
+        cleared = self._refresh_cooldowns()
+        if removed or cleared:
+            self._fill_tree(tab)
+            self._update_summary()
+
+        folder = self.manuscript_folder.get().strip()
+        assigned = 0
+        if folder:
+            if not Path(folder).is_dir():
+                messagebox.showwarning("원고 폴더", "원고 폴더 경로가 올바르지 않습니다.", parent=self)
+                return
+            assigned = self._auto_assign_manuscripts(tab, folder)
+            if assigned:
+                self._fill_tree(tab)
+                self._append(f"원고 폴더에서 {assigned}개 파일을 계정에 배정했습니다.", "info")
+
+        pending = [
+            a for a in tab["accounts"]
+            if str(a.get("manuscript_path", "")).strip() and self._is_eligible_for_assign(a)
+        ]
         if not pending:
-            messagebox.showinfo(
-                "발행 확인",
-                "모든 계정이 이미 발행되었습니다.\n원고를 바꾸면 다시 발행 대상이 됩니다.",
-                parent=self,
-            )
+            if folder and not self._list_available_manuscripts(folder):
+                messagebox.showinfo(
+                    "원고 없음",
+                    "원고 폴더에 배정할 원고가 없습니다.\n"
+                    "(이미 배정됐거나 발행완료/실패로 이동한 파일은 제외됩니다)",
+                    parent=self,
+                )
+            else:
+                messagebox.showinfo(
+                    "발행 확인",
+                    "지금 출간할 계정이 없습니다.\n"
+                    "· 원고가 배정된 대기 계정\n"
+                    "· 또는 12시간 쿨다운이 끝난 계정\n"
+                    "이 필요합니다.",
+                    parent=self,
+                )
+            self._save_settings()
             return
 
         image_folder = self.image_folder.get().strip()
@@ -1493,8 +1711,6 @@ class VelogApp(tk.Tk):
             for acc in pending:
                 normalize_url(acc["inbox_url"])
                 parse_tempmail_address(acc["inbox_url"])
-                if not acc.get("manuscript_path"):
-                    raise PostingError(f"{acc['velog_id']} 계정의 원고가 지정되지 않았습니다.")
                 read_manuscript(acc["manuscript_path"])
         except PostingError as exc:
             messagebox.showwarning("등록 정보 확인", str(exc), parent=self)
@@ -1506,8 +1722,15 @@ class VelogApp(tk.Tk):
         self._save_settings()
         self._set_running(True)
         self._switch_main_view("log")
-        self._append(f"[{tab['title']}] 미발행 {len(pending)}개 계정 자동 출간을 시작합니다.", "info")
-        self._poster = VelogPoster(self._post_event, self._on_result, self._on_failed)
+        headless = bool(self.headless_posting.get())
+        mode = "헤드리스" if headless else "일반"
+        self._append(
+            f"[{tab['title']}] {len(pending)}개 계정 자동 출간을 시작합니다. ({mode})",
+            "info",
+        )
+        self._poster = VelogPoster(
+            self._post_event, self._on_result, self._on_failed, headless=headless,
+        )
         profile_names = self._parse_profile_names()
         anchors = [dict(a) for a in self.anchors]
         homepages = list(self.homepages)
@@ -1676,7 +1899,6 @@ class VelogApp(tk.Tk):
         tab = self._active_tab or self._current_tab()
         if tab is None:
             return
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
         accounts = tab["accounts"]
         target: dict | None = None
         for acc in accounts:
@@ -1691,7 +1913,7 @@ class VelogApp(tk.Tk):
         if target is None:
             return
         target["published_url"] = url
-        target["published_at"] = now
+        target["published_at"] = datetime.now().isoformat(timespec="seconds")
         self._relocate_manuscript(target, success=True)
         self._fill_tree(tab)
         self._update_summary()
@@ -1834,10 +2056,18 @@ class VelogApp(tk.Tk):
 
     def _set_tm_progress(self, done: int, total: int) -> None:
         if total <= 0:
-            self.tm_progress.configure(value=0, maximum=100)
-            self.tm_progress_text.set("")
+            self.tm_progress.configure(mode="indeterminate")
+            try:
+                self.tm_progress.start(12)
+            except Exception:  # noqa: BLE001
+                pass
+            self.tm_progress_text.set(f"{done}개 생성됨" if done else "연속 생성 중...")
             return
-        self.tm_progress.configure(maximum=total, value=done)
+        try:
+            self.tm_progress.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self.tm_progress.configure(mode="determinate", maximum=total, value=done)
         self.tm_progress_text.set(f"{done} / {total}")
 
     def _set_tm_running(self, running: bool) -> None:
@@ -1845,42 +2075,63 @@ class VelogApp(tk.Tk):
         self.tm_stop_btn.configure(state="normal" if running else "disabled")
         if running:
             self.tm_status.set("임시 메일 생성 중...")
-        elif not running and self.tm_status.get().endswith("중단하는 중..."):
-            self.tm_status.set("중단됨")
-        elif not running:
-            self.tm_status.set("작업이 완료되었습니다.")
+        else:
+            try:
+                self.tm_progress.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            if self.tm_status.get().endswith("중단하는 중..."):
+                self.tm_status.set("중단됨")
+            else:
+                self.tm_status.set("작업이 완료되었습니다.")
+            if self._tm_run_total <= 0:
+                self.tm_progress.configure(mode="determinate", value=0, maximum=100)
+                self.tm_progress_text.set(f"{self._tm_run_done}개 완료")
 
     def _start_tempmail(self) -> None:
         if self._tm_worker is not None:
             return
+        loop = bool(self.tm_loop_until_stop.get())
         try:
             count = int(self.tm_count.get())
         except (tk.TclError, ValueError):
             messagebox.showwarning("입력 확인", "생성 개수를 확인해 주세요.", parent=self)
             return
-        if count < 1 or count > 50:
-            messagebox.showwarning("입력 확인", "생성 개수는 1~50 사이로 입력해 주세요.", parent=self)
+        if not loop and (count < 1 or count > 100):
+            messagebox.showwarning("입력 확인", "생성 개수는 1~100 사이로 입력해 주세요.", parent=self)
             return
 
-        self._tm_run_total = count
+        self._tm_run_total = 0 if loop else count
         self._tm_run_done = 0
-        self._set_tm_progress(0, count)
+        self._set_tm_progress(0, max(count, 1) if not loop else 0)
         self._set_tm_running(True)
-        self._append_tm_log(f"{count}개 임시 메일 생성을 시작합니다.", "info")
+        headless = bool(self.headless_tempmail.get())
+        if loop:
+            self._append_tm_log(
+                f"임시 메일 연속 생성을 시작합니다. (중단 시까지 · {'헤드리스' if headless else '일반'})",
+                "info",
+            )
+        else:
+            self._append_tm_log(
+                f"{count}개 임시 메일 생성을 시작합니다. ({'헤드리스' if headless else '일반'})",
+                "info",
+            )
 
         def on_created(email: str, url: str) -> None:
             self._tm_events.put((f"{email}\t{url}", "created"))
 
-        self._tm_generator = TempMailGenerator(self._post_tm_event, on_created)
+        self._tm_generator = TempMailGenerator(
+            self._post_tm_event, on_created, headless=headless,
+        )
         self._tm_worker = threading.Thread(
-            target=self._run_tempmail, args=(count,), daemon=True,
+            target=self._run_tempmail, args=(count, loop), daemon=True,
         )
         self._tm_worker.start()
 
-    def _run_tempmail(self, count: int) -> None:
+    def _run_tempmail(self, count: int, loop: bool = False) -> None:
         try:
             assert self._tm_generator is not None
-            self._tm_generator.run_batch(count)
+            self._tm_generator.run_batch(count, loop_until_stop=loop)
         except PostingError as exc:
             self._post_tm_event(str(exc), "error")
         except Exception as exc:  # noqa: BLE001
@@ -1989,6 +2240,10 @@ class VelogApp(tk.Tk):
         try:
             data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             self.image_folder.set(str(data.get("image_folder", "")))
+            self.manuscript_folder.set(str(data.get("manuscript_folder", "")))
+            self.headless_posting.set(bool(data.get("headless_posting", False)))
+            self.headless_tempmail.set(bool(data.get("headless_tempmail", False)))
+            self.tm_loop_until_stop.set(bool(data.get("tm_loop_until_stop", True)))
             now_iso = datetime.now().isoformat(timespec="seconds")
 
             tabs = data.get("tabs")
@@ -2044,6 +2299,8 @@ class VelogApp(tk.Tk):
             pass
         if not self.tabs:
             self.tabs.append({"title": "기본", "accounts": []})
+        self._purge_expired_accounts()
+        self._refresh_cooldowns()
         self.profile_text.delete("1.0", "end")
         self.profile_text.insert("1.0", ", ".join(names))
         self._refresh_anchor_list()
@@ -2059,6 +2316,10 @@ class VelogApp(tk.Tk):
                 json.dumps(
                     {
                         "image_folder": self.image_folder.get().strip(),
+                        "manuscript_folder": self.manuscript_folder.get().strip(),
+                        "headless_posting": bool(self.headless_posting.get()),
+                        "headless_tempmail": bool(self.headless_tempmail.get()),
+                        "tm_loop_until_stop": bool(self.tm_loop_until_stop.get()),
                         "profile_names": self._parse_profile_names(),
                         "anchors": self.anchors,
                         "homepages": self.homepages,

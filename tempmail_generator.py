@@ -40,7 +40,7 @@ CreatedCallback = Callable[[str, str], None]  # (email, inbox_url)
 
 TEMPMAIL_HOME = "https://www.tempmail.co/"
 
-# 단계별 최소 대기(초) — 너무 빠르면 생성이 실패할 수 있음
+# 단계별 기본 대기(초) — 실제 대기는 _random_delay 로 흔들린다
 DELAY_BEFORE_NEW = (1.2, 0.8)
 DELAY_AFTER_NEW = (4.0, 2.0)
 DELAY_INBOX_POLL = (3.0, 1.5)
@@ -51,12 +51,25 @@ DELAY_AFTER_CLOSE = (3.0, 1.5)
 DELAY_BETWEEN_BATCH = (6.0, 2.0)
 
 
+def _random_delay(base: float, spread: float, *, lo_scale: float = 0.6, hi_scale: float = 2.4) -> float:
+    """같은 패턴이 반복되지 않도록 넓게 흔든 대기 시간."""
+    value = _jitter(base, spread) * random.uniform(lo_scale, hi_scale)
+    return max(0.4, value)
+
+
 class TempMailGenerator:
     """TempMail.co 에서 임시 메일함을 자동으로 만든다."""
 
-    def __init__(self, log: LogCallback, on_created: CreatedCallback | None = None) -> None:
+    def __init__(
+        self,
+        log: LogCallback,
+        on_created: CreatedCallback | None = None,
+        *,
+        headless: bool = False,
+    ) -> None:
         self._emit = log
         self.on_created = on_created
+        self._headless = headless
         self._stop = threading.Event()
         self._process: subprocess.Popen | None = None
         self._browser = None
@@ -72,9 +85,9 @@ class TempMailGenerator:
     def stop(self) -> None:
         self._stop.set()
 
-    def run_batch(self, count: int) -> list[tuple[str, str]]:
-        """count 개의 임시 메일을 순서대로 생성한다."""
-        if count < 1:
+    def run_batch(self, count: int, *, loop_until_stop: bool = False) -> list[tuple[str, str]]:
+        """임시 메일을 생성한다. loop_until_stop=True 이면 중단할 때까지 반복."""
+        if not loop_until_stop and count < 1:
             raise PostingError("생성할 개수는 1 이상이어야 합니다.")
 
         chrome = find_chrome()
@@ -86,28 +99,39 @@ class TempMailGenerator:
             page = self._first_page()
             self._inject_stealth(page)
             self._goto(page, TEMPMAIL_HOME)
-            self._human_pause(page, "TempMail 접속 중...", _jitter(3, 1))
+            self._human_pause(page, "TempMail 접속 중...", _random_delay(3, 1))
             self._wait_if_cloudflare(pw, page)
             page = self._first_page()
 
-            for index in range(1, count + 1):
+            index = 0
+            while True:
                 if self._stop.is_set():
                     break
-                self.log(f"[{index}/{count}] 새 임시 메일 생성 중...", "info")
+                index += 1
+                if not loop_until_stop and index > count:
+                    break
+                label = f"#{index}" if loop_until_stop else f"[{index}/{count}]"
+                self.log(f"{label} 새 임시 메일 생성 중...", "info")
                 try:
                     email, url = self._generate_one(pw)
                     results.append((email, url))
-                    self.log(f"[{index}/{count}] 생성 완료: {email}", "success")
+                    self.log(f"{label} 생성 완료: {email}", "success")
                     if self.on_created is not None:
                         self.on_created(email, url)
                 except PostingError as exc:
-                    self.log(f"[{index}/{count}] {exc}", "error")
+                    self.log(f"{label} {exc}", "error")
                 except (Error, PWTimeoutError) as exc:
                     if self._stop.is_set():
                         break
-                    self.log(f"[{index}/{count}] 브라우저 오류: {exc}", "error")
-                if index < count:
-                    self._sleep(_jitter(*DELAY_BETWEEN_BATCH))
+                    self.log(f"{label} 브라우저 오류: {exc}", "error")
+
+                if self._stop.is_set():
+                    break
+                if not loop_until_stop and index >= count:
+                    break
+                wait_s = random.uniform(4.0, 28.0)
+                self.log(f"다음 생성까지 {wait_s:.1f}초 대기...", "info")
+                self._sleep(wait_s)
 
             self._teardown()
 
@@ -128,13 +152,17 @@ class TempMailGenerator:
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
             "--remote-allow-origins=*",
-            "--start-maximized",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
-            TEMPMAIL_HOME,
         ]
-        self.log("Chrome 시크릿 창을 여는 중...", "info")
+        if self._headless:
+            command.extend(["--headless=new", "--window-size=1920,1080", "--disable-gpu"])
+            self.log("Chrome 헤드리스 모드로 여는 중...", "info")
+        else:
+            command.append("--start-maximized")
+            self.log("Chrome 시크릿 창을 여는 중...", "info")
+        command.append(TEMPMAIL_HOME)
         try:
             self._process = subprocess.Popen(command, close_fds=True)
         except OSError as exc:
@@ -719,13 +747,13 @@ class TempMailGenerator:
         for attempt in range(40):
             if self._stop.is_set():
                 raise PostingError("사용자가 작업을 중단했습니다.")
-            self._sleep(_jitter(*DELAY_INBOX_POLL))
+            self._sleep(_random_delay(*DELAY_INBOX_POLL))
             self._human_wiggle(page)
 
             if self._is_welcome_verified(page, require_new=require_new):
                 email = self._read_displayed_email(page)
                 self.log(f"이메일 일치 확인: {email} → Save address 진행.", "success")
-                self._sleep(_jitter(*DELAY_BEFORE_SAVE))
+                self._sleep(_random_delay(*DELAY_BEFORE_SAVE))
                 return
 
             displayed = self._read_displayed_email(page)
@@ -760,7 +788,7 @@ class TempMailGenerator:
         save_btn.first.wait_for(state="visible", timeout=15_000)
         self._sleep(_jitter(1.0, 0.5))
         save_btn.first.click(timeout=15_000)
-        self._sleep(_jitter(*DELAY_AFTER_SAVE))
+        self._sleep(_random_delay(*DELAY_AFTER_SAVE))
 
         inbox_url = self._read_saved_link(page)
         if not inbox_url:
@@ -778,10 +806,10 @@ class TempMailGenerator:
         if copy_btn.count() > 0 and copy_btn.first.is_visible():
             self._sleep(_jitter(0.8, 0.4))
             copy_btn.first.click(timeout=10_000)
-            self._sleep(_jitter(*DELAY_AFTER_COPY))
+            self._sleep(_random_delay(*DELAY_AFTER_COPY))
 
         self._close_modal(page)
-        self._sleep(_jitter(*DELAY_AFTER_CLOSE))
+        self._sleep(_random_delay(*DELAY_AFTER_CLOSE))
         return email, inbox_url
 
     # -- 이메일 생성 1회 ---------------------------------------------------
@@ -817,7 +845,7 @@ class TempMailGenerator:
 
         previous = displayed
         self._human_wiggle(page)
-        self._sleep(_jitter(*DELAY_BEFORE_NEW))
+        self._sleep(_random_delay(*DELAY_BEFORE_NEW))
 
         new_btn = page.get_by_role("button", name="New Email")
         if new_btn.count() == 0 or not new_btn.first.is_visible():
@@ -828,7 +856,7 @@ class TempMailGenerator:
 
         self._wait_after_new_email(pw, previous)
         page = self._active_page(pw)
-        self._human_pause(page, "새 이메일 주소 확인 중...", _jitter(*DELAY_AFTER_NEW))
+        self._human_pause(page, "새 이메일 주소 확인 중...", _random_delay(*DELAY_AFTER_NEW))
 
         if self._is_welcome_verified(page, require_new=previous):
             current = self._read_displayed_email(page)

@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.13",
+    "version":  "1.0.14",
     "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "업데이트 확인 후 무반응 수정: 다운로드/설치 오류 표시, JSON 인자, requests 다운로드"
+    "notes":  "원고폴더 자동배정, 12시간 쿨다운, 6일 만료삭제, 임시메일100/연속/랜덤간격, 헤드리스 모드"
 }
