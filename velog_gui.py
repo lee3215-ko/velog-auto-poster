@@ -129,8 +129,6 @@ class VelogApp(tk.Tk):
         self.anchor_text = tk.StringVar()
         self.anchor_url = tk.StringVar()
         self.homepage_search = tk.StringVar()
-        self.headless_posting = tk.BooleanVar(value=False)
-        self.headless_tempmail = tk.BooleanVar(value=False)
         self.tm_loop_until_stop = tk.BooleanVar(value=True)
         self._collapse_state = {"image": False, "advanced": False, "account": False, "manuscript": True}
         self.status = tk.StringVar(value="대기 중 — 계정을 등록한 뒤 [전체 출간 시작]을 누르세요.")
@@ -423,12 +421,6 @@ class VelogApp(tk.Tk):
             command=self._stop, state="disabled",
         )
         self.stop_btn.grid(row=0, column=1, sticky="ew")
-        opts = ttk.Frame(bottom, style="Bg.TFrame")
-        opts.pack(fill="x", pady=(8, 0))
-        ttk.Checkbutton(
-            opts, text="헤드리스 모드 (브라우저 창 숨김)",
-            variable=self.headless_posting, command=self._save_settings,
-        ).pack(side="left")
         ttk.Label(bottom, textvariable=self.status, style="Status.TLabel").pack(
             fill="x", pady=(10, 0),
         )
@@ -464,13 +456,9 @@ class VelogApp(tk.Tk):
             ctrl, text="중단할 때까지 계속 생성 (개수 무시)",
             variable=self.tm_loop_until_stop, command=self._save_settings,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(
-            ctrl, text="헤드리스 모드 (브라우저 창 숨김)",
-            variable=self.headless_tempmail, command=self._save_settings,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Label(
             ctrl, text="생성 간격은 매번 랜덤하게 달라집니다.", style="Hint.TLabel",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         btns = ttk.Frame(left, style="Bg.TFrame")
         btns.pack(fill="x", pady=(0, 10))
@@ -1722,15 +1710,11 @@ class VelogApp(tk.Tk):
         self._save_settings()
         self._set_running(True)
         self._switch_main_view("log")
-        headless = bool(self.headless_posting.get())
-        mode = "헤드리스" if headless else "일반"
         self._append(
-            f"[{tab['title']}] {len(pending)}개 계정 자동 출간을 시작합니다. ({mode})",
+            f"[{tab['title']}] {len(pending)}개 계정 자동 출간을 시작합니다.",
             "info",
         )
-        self._poster = VelogPoster(
-            self._post_event, self._on_result, self._on_failed, headless=headless,
-        )
+        self._poster = VelogPoster(self._post_event, self._on_result, self._on_failed)
         profile_names = self._parse_profile_names()
         anchors = [dict(a) for a in self.anchors]
         homepages = list(self.homepages)
@@ -2105,24 +2089,15 @@ class VelogApp(tk.Tk):
         self._tm_run_done = 0
         self._set_tm_progress(0, max(count, 1) if not loop else 0)
         self._set_tm_running(True)
-        headless = bool(self.headless_tempmail.get())
         if loop:
-            self._append_tm_log(
-                f"임시 메일 연속 생성을 시작합니다. (중단 시까지 · {'헤드리스' if headless else '일반'})",
-                "info",
-            )
+            self._append_tm_log("임시 메일 연속 생성을 시작합니다. (중단 시까지)", "info")
         else:
-            self._append_tm_log(
-                f"{count}개 임시 메일 생성을 시작합니다. ({'헤드리스' if headless else '일반'})",
-                "info",
-            )
+            self._append_tm_log(f"{count}개 임시 메일 생성을 시작합니다.", "info")
 
         def on_created(email: str, url: str) -> None:
             self._tm_events.put((f"{email}\t{url}", "created"))
 
-        self._tm_generator = TempMailGenerator(
-            self._post_tm_event, on_created, headless=headless,
-        )
+        self._tm_generator = TempMailGenerator(self._post_tm_event, on_created)
         self._tm_worker = threading.Thread(
             target=self._run_tempmail, args=(count, loop), daemon=True,
         )
@@ -2241,8 +2216,6 @@ class VelogApp(tk.Tk):
             data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             self.image_folder.set(str(data.get("image_folder", "")))
             self.manuscript_folder.set(str(data.get("manuscript_folder", "")))
-            self.headless_posting.set(bool(data.get("headless_posting", False)))
-            self.headless_tempmail.set(bool(data.get("headless_tempmail", False)))
             self.tm_loop_until_stop.set(bool(data.get("tm_loop_until_stop", True)))
             now_iso = datetime.now().isoformat(timespec="seconds")
 
@@ -2317,8 +2290,6 @@ class VelogApp(tk.Tk):
                     {
                         "image_folder": self.image_folder.get().strip(),
                         "manuscript_folder": self.manuscript_folder.get().strip(),
-                        "headless_posting": bool(self.headless_posting.get()),
-                        "headless_tempmail": bool(self.headless_tempmail.get()),
                         "tm_loop_until_stop": bool(self.tm_loop_until_stop.get()),
                         "profile_names": self._parse_profile_names(),
                         "anchors": self.anchors,

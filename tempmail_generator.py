@@ -60,16 +60,9 @@ def _random_delay(base: float, spread: float, *, lo_scale: float = 0.6, hi_scale
 class TempMailGenerator:
     """TempMail.co 에서 임시 메일함을 자동으로 만든다."""
 
-    def __init__(
-        self,
-        log: LogCallback,
-        on_created: CreatedCallback | None = None,
-        *,
-        headless: bool = False,
-    ) -> None:
+    def __init__(self, log: LogCallback, on_created: CreatedCallback | None = None) -> None:
         self._emit = log
         self.on_created = on_created
-        self._headless = headless
         self._stop = threading.Event()
         self._process: subprocess.Popen | None = None
         self._browser = None
@@ -152,17 +145,13 @@ class TempMailGenerator:
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
             "--remote-allow-origins=*",
+            "--start-maximized",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
+            TEMPMAIL_HOME,
         ]
-        if self._headless:
-            command.extend(["--headless=new", "--window-size=1920,1080", "--disable-gpu"])
-            self.log("Chrome 헤드리스 모드로 여는 중...", "info")
-        else:
-            command.append("--start-maximized")
-            self.log("Chrome 시크릿 창을 여는 중...", "info")
-        command.append(TEMPMAIL_HOME)
+        self.log("Chrome 시크릿 창을 여는 중...", "info")
         try:
             self._process = subprocess.Popen(command, close_fds=True)
         except OSError as exc:

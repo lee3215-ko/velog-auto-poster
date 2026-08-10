@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.14",
+    "version":  "1.0.15",
     "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "notes":  "원고폴더 자동배정, 12시간 쿨다운, 6일 만료삭제, 임시메일100/연속/랜덤간격, 헤드리스 모드"
+    "notes":  "헤드리스 모드 제거 (Cloudflare 봇 인증 방해)"
 }
