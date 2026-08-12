@@ -1,10 +1,13 @@
 {
     "version":  "1.0.30",
-    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511634356",
     "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.30/VelogPoster.zip",
     "notes":  "TempMail: 누락된 _scroll_into_view 호출 AttributeError 수정",
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511634356",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.30/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ]
+                      ],
+    "asset_id":  511634356,
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511634356"
 }
