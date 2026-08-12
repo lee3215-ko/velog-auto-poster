@@ -29,6 +29,7 @@ from playwright.sync_api import (
 from velog_poster import (
     PostingError,
     STEALTH_SCRIPT,
+    _human_delay,
     _jitter,
     find_chrome,
     parse_tempmail_address,
@@ -41,20 +42,20 @@ CreatedCallback = Callable[[str, str], None]  # (email, inbox_url)
 TEMPMAIL_HOME = "https://www.tempmail.co/"
 
 # 단계별 기본 대기(초) — 실제 대기는 _random_delay 로 흔들린다
-DELAY_BEFORE_NEW = (1.2, 0.8)
-DELAY_AFTER_NEW = (4.0, 2.0)
-DELAY_INBOX_POLL = (3.0, 1.5)
-DELAY_BEFORE_SAVE = (2.5, 1.0)
-DELAY_AFTER_SAVE = (2.5, 1.0)
-DELAY_AFTER_COPY = (1.5, 0.8)
-DELAY_AFTER_CLOSE = (3.0, 1.5)
-DELAY_BETWEEN_BATCH = (6.0, 2.0)
+DELAY_BEFORE_NEW = (2.0, 1.5)
+DELAY_AFTER_NEW = (5.5, 2.5)
+DELAY_INBOX_POLL = (3.5, 2.0)
+DELAY_BEFORE_SAVE = (3.5, 1.8)
+DELAY_AFTER_SAVE = (3.0, 1.5)
+DELAY_AFTER_COPY = (2.0, 1.0)
+DELAY_AFTER_CLOSE = (4.0, 2.0)
+DELAY_BETWEEN_BATCH = (14.0, 8.0)
 
 
-def _random_delay(base: float, spread: float, *, lo_scale: float = 0.6, hi_scale: float = 2.4) -> float:
+def _random_delay(base: float, spread: float, *, lo_scale: float = 0.7, hi_scale: float = 2.6) -> float:
     """같은 패턴이 반복되지 않도록 넓게 흔든 대기 시간."""
     value = _jitter(base, spread) * random.uniform(lo_scale, hi_scale)
-    return max(0.4, value)
+    return max(0.6, value)
 
 
 class TempMailGenerator:
@@ -122,7 +123,7 @@ class TempMailGenerator:
                     break
                 if not loop_until_stop and index >= count:
                     break
-                wait_s = random.uniform(4.0, 28.0)
+                wait_s = _human_delay(12.0, 48.0)
                 self.log(f"다음 생성까지 {wait_s:.1f}초 대기...", "info")
                 self._sleep(wait_s)
 
@@ -145,8 +146,8 @@ class TempMailGenerator:
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
             "--remote-allow-origins=*",
-            "--window-size=1280,800",
-            "--window-position=80,60",
+            f"--window-size={random.randint(1180, 1360)},{random.randint(760, 900)}",
+            f"--window-position={random.randint(40, 160)},{random.randint(40, 120)}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
@@ -289,11 +290,39 @@ class TempMailGenerator:
             vp = page.viewport_size or {"width": 1280, "height": 800}
             x = random.randint(80, max(100, vp["width"] - 80))
             y = random.randint(80, max(100, vp["height"] - 80))
-            page.mouse.move(x, y, steps=random.randint(8, 18))
-            if random.random() < 0.4:
-                page.mouse.wheel(0, random.randint(-120, 120))
+            page.mouse.move(x, y, steps=random.randint(10, 28))
+            if random.random() < 0.55:
+                page.mouse.wheel(0, random.randint(-180, 220))
+            if random.random() < 0.25:
+                page.mouse.move(
+                    random.randint(100, max(120, vp["width"] - 100)),
+                    random.randint(100, max(120, vp["height"] - 100)),
+                    steps=random.randint(8, 16),
+                )
         except Error:
             pass
+
+    def _click_like_human(self, page: Page, locator, *, timeout: int = 15_000) -> None:
+        target = locator.first if hasattr(locator, "first") else locator
+        try:
+            target.wait_for(state="visible", timeout=timeout)
+        except Error:
+            pass
+        try:
+            box = target.bounding_box()
+        except Error:
+            box = None
+        if box and box.get("width", 0) > 1 and box.get("height", 0) > 1:
+            try:
+                x = box["x"] + box["width"] * random.uniform(0.25, 0.75)
+                y = box["y"] + box["height"] * random.uniform(0.25, 0.75)
+                page.mouse.move(x, y, steps=random.randint(14, 32))
+                self._sleep(random.uniform(0.18, 0.7))
+                page.mouse.click(x, y, delay=random.randint(40, 140))
+                return
+            except Error:
+                pass
+        target.click(timeout=timeout)
 
     def _goto(self, page: Page, url: str) -> None:
         last: Error | None = None
@@ -581,8 +610,8 @@ class TempMailGenerator:
                     item = loc.nth(i)
                     try:
                         if item.is_visible():
-                            item.click(timeout=5_000)
-                            self._sleep(_jitter(1.2, 0.6))
+                            self._click_like_human(page, item, timeout=5_000)
+                            self._sleep(_human_delay(1.0, 2.2))
                             return
                     except Error:
                         continue
@@ -776,8 +805,9 @@ class TempMailGenerator:
         if save_btn.count() == 0:
             save_btn = page.locator("button:has-text('Save address')")
         save_btn.first.wait_for(state="visible", timeout=15_000)
-        self._sleep(_jitter(1.0, 0.5))
-        save_btn.first.click(timeout=15_000)
+        self._human_wiggle(page)
+        self._sleep(_human_delay(0.8, 2.2))
+        self._click_like_human(page, save_btn.first)
         self._sleep(_random_delay(*DELAY_AFTER_SAVE))
 
         inbox_url = self._read_saved_link(page)
@@ -794,8 +824,8 @@ class TempMailGenerator:
         if copy_btn.count() == 0:
             copy_btn = page.locator("button:has-text('Copy Link')")
         if copy_btn.count() > 0 and copy_btn.first.is_visible():
-            self._sleep(_jitter(0.8, 0.4))
-            copy_btn.first.click(timeout=10_000)
+            self._sleep(_human_delay(0.6, 1.6))
+            self._click_like_human(page, copy_btn.first, timeout=10_000)
             self._sleep(_random_delay(*DELAY_AFTER_COPY))
 
         self._close_modal(page)
@@ -841,8 +871,8 @@ class TempMailGenerator:
         if new_btn.count() == 0 or not new_btn.first.is_visible():
             new_btn = page.locator("button:has-text('New Email')")
         new_btn.first.wait_for(state="visible", timeout=15_000)
-        self._sleep(_jitter(0.8, 0.5))
-        new_btn.first.click(timeout=15_000)
+        self._sleep(_human_delay(0.6, 1.8))
+        self._click_like_human(page, new_btn.first)
 
         self._wait_after_new_email(pw, previous)
         page = self._active_page(pw)

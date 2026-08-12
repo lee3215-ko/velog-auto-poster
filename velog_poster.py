@@ -49,6 +49,9 @@ LogCallback = Callable[[str, str], None]
 # (일반 Chrome 에서 navigator.webdriver 는 false 다.)
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => false });
+// CDP 연결 시 비는 chrome 런타임 흔적을 줄인다 (과도한 위조는 하지 않음).
+if (!window.chrome) { window.chrome = {}; }
+if (!window.chrome.runtime) { window.chrome.runtime = {}; }
 """
 
 
@@ -285,6 +288,16 @@ def _jitter(base: float, spread: float = 0.5) -> float:
     return base + random.uniform(0, spread)
 
 
+def _human_delay(lo: float, hi: float) -> float:
+    """사람이 멈추는 듯한 불규칙 대기(초)."""
+    if hi < lo:
+        lo, hi = hi, lo
+    # 가끔 더 길게 멈추는 꼬리 분포
+    if random.random() < 0.12:
+        return random.uniform(hi, hi * random.uniform(1.3, 2.2))
+    return random.uniform(lo, hi)
+
+
 # 신규 계정 회원가입에 쓰이는 기본값
 DEFAULT_PROFILE_NAMES = [
     "카드깡", "카드깡업체", "카드깡수수료", "신용카드현금화",
@@ -295,17 +308,36 @@ BIO_SUFFIXES = [
     "친절 상담 진행", "빠른 한도 안내", "당일 진행 가능",
 ]
 
+# 사람처럼 보이는 사용자 ID 조각 (완전 난수 6+4 패턴 회피)
+_USER_ID_STEMS = (
+    "sky", "blue", "mint", "nova", "luna", "haze", "wave", "pine", "coral", "amber",
+    "jun", "min", "seo", "han", "yoon", "park", "kim", "lee", "choi", "jung",
+    "note", "blog", "page", "daily", "soft", "calm", "bright", "quiet", "fresh",
+)
+
 
 def make_user_id() -> str:
-    """영어 소문자 6개 + 숫자 4개를 무작위로 섞은 ID. (첫 글자는 알파벳 보장)"""
-    chars = random.choices(string.ascii_lowercase, k=6) + random.choices(string.digits, k=4)
-    random.shuffle(chars)
-    if chars[0].isdigit():
-        for i, c in enumerate(chars):
-            if c.isalpha():
-                chars[0], chars[i] = chars[i], chars[0]
-                break
-    return "".join(chars)
+    """읽기 쉬운 형태의 사용자 ID (소문자·숫자, 8~14자)."""
+    a = random.choice(_USER_ID_STEMS)
+    b = random.choice(_USER_ID_STEMS)
+    while b == a:
+        b = random.choice(_USER_ID_STEMS)
+    style = random.randint(0, 4)
+    if style == 0:
+        raw = f"{a}{b}{random.randint(10, 99)}"
+    elif style == 1:
+        raw = f"{a}{random.randint(1988, 2006)}"
+    elif style == 2:
+        raw = f"{a}_{b}{random.randint(1, 9)}"
+    elif style == 3:
+        raw = f"{a}{random.randint(100, 999)}{b[:2]}"
+    else:
+        raw = f"{a}{b}{random.choice(string.digits)}{random.choice(string.digits)}"
+    # velog 사용자 ID 제약: 보통 영문/숫자/_ , 소문자 유지
+    cleaned = re.sub(r"[^a-z0-9_]", "", raw.lower())
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = random.choice(string.ascii_lowercase) + cleaned
+    return cleaned[:14]
 
 
 def make_bio(name: str) -> str:
@@ -418,11 +450,13 @@ class VelogPoster:
                     self._emit("", "working")
 
                 if index < total and not self._stop.is_set():
-                    # 대량 업로드 시 레이트리밋 완화용 계정 간 대기
+                    # 계정 간 간격을 사람처럼 불규칙하게 (봇 패턴 완화)
                     if self._image_skip_remaining > 0 or self._image_fail_streak > 0:
-                        self._wait("다음 계정 전 대기(이미지 제한 완화)...", _jitter(14, 5))
+                        wait_s = _human_delay(18, 42)
+                        self._wait(f"다음 계정 전 대기(이미지 제한 완화) {wait_s:.0f}초...", wait_s)
                     else:
-                        self._wait("다음 계정 전 대기...", _jitter(8, 3))
+                        wait_s = _human_delay(12, 35)
+                        self._wait(f"다음 계정 전 대기 {wait_s:.0f}초...", wait_s)
 
         self._prefix = ""
         self._emit("", "working")
@@ -518,8 +552,8 @@ class VelogPoster:
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
             "--remote-allow-origins=*",
-            "--window-size=1280,800",
-            "--window-position=80,60",
+            f"--window-size={random.randint(1180, 1360)},{random.randint(760, 900)}",
+            f"--window-position={random.randint(40, 160)},{random.randint(40, 120)}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
@@ -612,9 +646,79 @@ class VelogPoster:
         except Exception:  # noqa: BLE001
             pass
 
-    def _type_like_human(self, page: Page, text: str) -> None:
-        """실제 keydown/keyup 이벤트로 한 글자씩 입력한다. (시스템 클립보드 미사용)"""
-        page.keyboard.type(text, delay=random.randint(45, 110))
+    def _type_like_human(self, page: Page, text: str, *, slow: bool = False) -> None:
+        """한 글자씩 입력. 속도 변화·짧은 멈춤·가끔 오타 후 수정으로 사람처럼 보이게 한다."""
+        if not text:
+            return
+        for index, ch in enumerate(text):
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            # 중간중간 생각하는 듯한 멈춤
+            if index > 0 and random.random() < (0.10 if slow else 0.06):
+                self._sleep(random.uniform(0.25, 0.95 if slow else 0.7))
+            # 드물게 오타 → 백스페이스
+            if (
+                ch.isalnum()
+                and index > 1
+                and index < len(text) - 1
+                and random.random() < 0.035
+            ):
+                wrong = random.choice(string.ascii_lowercase + string.digits)
+                page.keyboard.type(wrong, delay=random.randint(40, 90))
+                self._sleep(random.uniform(0.12, 0.4))
+                page.keyboard.press("Backspace")
+                self._sleep(random.uniform(0.08, 0.25))
+            if slow:
+                delay = random.randint(85, 210)
+            elif random.random() < 0.25:
+                delay = random.randint(30, 65)  # 빠른 연타 구간
+            else:
+                delay = random.randint(55, 150)
+            page.keyboard.type(ch, delay=delay)
+
+    def _move_to_box(self, page: Page, box: dict, *, steps: int | None = None) -> tuple[float, float]:
+        """요소 박스 안 임의 지점으로 마우스를 천천히 이동."""
+        x = box["x"] + box["width"] * random.uniform(0.25, 0.75)
+        y = box["y"] + box["height"] * random.uniform(0.25, 0.75)
+        page.mouse.move(x, y, steps=steps or random.randint(14, 32))
+        return x, y
+
+    def _click_like_human(self, page: Page, locator, *, timeout: int = 15_000) -> None:
+        """마우스를 옮긴 뒤 짧게 머물렀다가 클릭 (즉시 locator.click 회피)."""
+        target = locator.first if hasattr(locator, "first") else locator
+        try:
+            target.wait_for(state="visible", timeout=timeout)
+        except Error:
+            pass
+        try:
+            box = target.bounding_box()
+        except Error:
+            box = None
+        if box and box.get("width", 0) > 1 and box.get("height", 0) > 1:
+            try:
+                x, y = self._move_to_box(page, box)
+                self._sleep(random.uniform(0.12, 0.55))
+                page.mouse.click(x, y, delay=random.randint(40, 120))
+                return
+            except Error:
+                pass
+        target.click(timeout=timeout)
+
+    def _human_idle(self, page: Page | None = None, *, lo: float = 0.6, hi: float = 2.0) -> None:
+        """필드를 채우기 전/후 짧게 멈추고, 가능하면 마우스를 조금 움직인다."""
+        if page is not None:
+            try:
+                vp = page.viewport_size or {"width": 1280, "height": 800}
+                page.mouse.move(
+                    random.randint(60, max(80, vp["width"] - 60)),
+                    random.randint(60, max(80, vp["height"] - 60)),
+                    steps=random.randint(6, 16),
+                )
+                if random.random() < 0.35:
+                    page.mouse.wheel(0, random.randint(-160, 160))
+            except Error:
+                pass
+        self._sleep(_human_delay(lo, hi))
 
     def _set_codemirror_value(self, editor, text: str) -> None:
         """CodeMirror 본문을 클립보드 없이 직접 넣는다."""
@@ -707,7 +811,7 @@ class VelogPoster:
     def _request_login(self, pw, page: Page, velog_id: str) -> None:
         self.log("벨로그에 접속하는 중...", "info")
         self._goto(page, "https://velog.io/")
-        self._wait("화면이 준비되기를 기다리는 중...", _jitter(3))
+        self._human_idle(page, lo=2.0, hi=4.5)
         self._wait_if_cloudflare(pw, page)
         page = self._first_page()  # 우회로 재연결됐을 수 있어 페이지를 다시 잡는다
 
@@ -717,23 +821,23 @@ class VelogPoster:
             login_btn = self._visible_last(page.get_by_role("button", name="로그인", exact=True))
             if login_btn is None:
                 raise PostingError("로그인 버튼을 찾지 못했습니다.")
-            login_btn.click(timeout=15_000)
-            self._wait("로그인 창이 열리기를 기다리는 중...", _jitter(2))
+            self._click_like_human(page, login_btn)
+            self._human_idle(page, lo=1.2, hi=2.8)
 
         self.log("아이디(이메일)를 입력하는 중...", "info")
         email_input.wait_for(state="visible", timeout=15_000)
-        email_input.click()
-        self._sleep(_jitter(0.3, 0.2))
-        self._type_like_human(page, velog_id)
-        self._sleep(_jitter(0.8, 0.4))
+        self._click_like_human(page, email_input)
+        self._sleep(_human_delay(0.35, 0.9))
+        # 이메일 주소는 조금 더 천천히
+        self._type_like_human(page, velog_id, slow=True)
+        self._human_idle(page, lo=0.8, hi=2.2)
 
         self.log("인증 메일을 요청하는 중...", "info")
         submit = self._visible_last(page.get_by_role("button", name="로그인", exact=True))
         if submit is None:
             raise PostingError("이메일 입력 후 로그인 버튼을 찾지 못했습니다.")
-        self._sleep(_jitter(0.4, 0.3))
-        submit.click()
-        self._wait("인증 메일 발송을 기다리는 중...", _jitter(5))
+        self._click_like_human(page, submit)
+        self._wait("인증 메일 발송을 기다리는 중...", _human_delay(4.5, 8.0))
 
     @staticmethod
     def _visible_last(locator):
@@ -822,8 +926,10 @@ class VelogPoster:
 
     def _open_link(self, pw, page: Page, link: str) -> None:
         self.log("인증 링크를 여는 중...", "info")
+        # 메일을 읽고 링크를 누르는 듯한 짧은 간격
+        self._sleep(_human_delay(1.0, 2.8))
         self._goto(page, link)
-        self._wait("로그인 처리가 끝나기를 기다리는 중...", _jitter(8, 2))
+        self._wait("로그인 처리가 끝나기를 기다리는 중...", _human_delay(6.0, 11.0))
         self._wait_if_cloudflare(pw, page)
 
     # -- 신규 계정 회원가입 ----------------------------------------------
@@ -865,31 +971,35 @@ class VelogPoster:
         bio = make_bio(name)
         self.log(f"프로필 이름: {name} / 사용자 ID: {user_id}", "info")
 
-        # 프로필 이름 (사람처럼 천천히 입력)
-        profile_input.first.click()
-        self._sleep(_jitter(0.5, 0.4))
-        self._type_like_human(page, name)
-        self._sleep(_jitter(0.8, 0.5))
+        # 폼을 잠깐 읽는 듯한 대기
+        self._human_idle(page, lo=1.5, hi=3.5)
+
+        # 프로필 이름
+        self._click_like_human(page, profile_input.first)
+        self._sleep(_human_delay(0.4, 1.0))
+        self._type_like_human(page, name, slow=True)
+        self._human_idle(page, lo=1.0, hi=2.8)
 
         # 사용자 ID
         uid = page.get_by_placeholder("사용자 ID를 입력하세요.")
         uid.first.wait_for(state="visible", timeout=10_000)
-        uid.first.click()
-        self._sleep(_jitter(0.5, 0.4))
-        self._type_like_human(page, user_id)
-        self._sleep(_jitter(0.8, 0.5))
+        self._click_like_human(page, uid.first)
+        self._sleep(_human_delay(0.4, 1.0))
+        self._type_like_human(page, user_id, slow=True)
+        self._human_idle(page, lo=1.2, hi=3.0)
 
         # 한 줄 소개
         bio_box = page.get_by_placeholder("당신을 한 줄로 소개해보세요")
         if bio_box.count() > 0 and bio_box.first.is_visible():
-            bio_box.first.click()
-            self._sleep(_jitter(0.5, 0.4))
+            self._click_like_human(page, bio_box.first)
+            self._sleep(_human_delay(0.35, 0.9))
             self._type_like_human(page, bio)
-            self._sleep(_jitter(0.8, 0.5))
+            self._human_idle(page, lo=0.9, hi=2.4)
 
-        # 약관 동의
+        # 약관 동의 — 읽고 체크하는 간격
+        self._human_idle(page, lo=0.8, hi=2.0)
         self._check_agreement(page)
-        self._sleep(_jitter(1.0, 0.6))
+        self._human_idle(page, lo=1.2, hi=3.2)
 
         # 가입 (Cloudflare 인증 대비 → 출간과 동일하게 연결 해제·재연결로 클릭)
         self._submit_signup(pw, page, profile_input)
@@ -901,7 +1011,7 @@ class VelogPoster:
                     self.on_signup(email)
                 except Exception:  # noqa: BLE001
                     pass
-        self._sleep(_jitter(2))
+        self._sleep(_human_delay(1.5, 3.5))
         return True, name
 
     def _submit_signup(self, pw, page: Page, profile_input) -> None:
@@ -911,9 +1021,9 @@ class VelogPoster:
         join = self._visible_last(page.get_by_role("button", name="가입", exact=True))
         # 1) 빠르게 활성화돼 있으면 바로 클릭
         if join is not None and self._enabled_within(join, 6):
-            self._sleep(_jitter(0.4, 0.3))
+            self._sleep(_human_delay(0.5, 1.4))
             try:
-                join.click(timeout=15_000)
+                self._click_like_human(page, join)
                 if self._signup_form_gone(page, profile_input):
                     return
             except Error:
@@ -938,8 +1048,19 @@ class VelogPoster:
                     jb = self._visible_last(p.get_by_role("button", name="가입", exact=True))
                     if jb is not None and not self._is_disabled(jb):
                         self.log("가입 인증 통과 → 가입을 진행합니다.", "info")
-                        self._sleep(_jitter(0.4, 0.3))
-                        jb.click(timeout=15_000)
+                        self._sleep(_human_delay(0.5, 1.5))
+                        try:
+                            box = jb.bounding_box()
+                        except Error:
+                            box = None
+                        if box:
+                            x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+                            y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+                            p.mouse.move(x, y, steps=random.randint(12, 24))
+                            self._sleep(random.uniform(0.15, 0.5))
+                            p.mouse.click(x, y, delay=random.randint(40, 120))
+                        else:
+                            jb.click(timeout=15_000)
                         self._sleep(2)
             except (Error, PWTimeoutError):
                 pass
@@ -1067,7 +1188,7 @@ class VelogPoster:
         try:
             box_div = page.locator("div:has(> svg path[d^='M20.285 2'])").first
             if box_div.count() > 0:
-                box_div.click(timeout=5_000)
+                self._click_like_human(page, box_div, timeout=5_000)
                 return
         except Error:
             pass
@@ -1075,7 +1196,7 @@ class VelogPoster:
         try:
             cb = page.locator("input[type='checkbox']")
             if cb.count() > 0:
-                cb.first.check(timeout=3_000)
+                self._click_like_human(page, cb.first, timeout=3_000)
                 return
         except Error:
             pass
@@ -1084,7 +1205,11 @@ class VelogPoster:
             link = page.get_by_text("이용약관", exact=False).first
             box = link.bounding_box()
             if box:
-                page.mouse.click(box["x"] - 16, box["y"] + box["height"] / 2)
+                x = box["x"] - 16
+                y = box["y"] + box["height"] / 2
+                page.mouse.move(x, y, steps=random.randint(10, 20))
+                self._sleep(random.uniform(0.15, 0.4))
+                page.mouse.click(x, y)
                 return
         except Error:
             pass
