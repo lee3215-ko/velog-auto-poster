@@ -260,8 +260,8 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
                 dialog.destroy()
             except Exception:  # noqa: BLE001
                 pass
-            # root.quit() 만으로는 프로세스가 남을 수 있어 설치 스크립트가 대기에서 멈춤
-            time.sleep(1.2)
+            # 설치 스크립트가 먼저 뜨도록 잠시 기다린 뒤 강제 종료한다.
+            time.sleep(2.0)
             os._exit(0)
 
         root.after(0, finish)

@@ -460,7 +460,9 @@ $Log = Join-Path $env:TEMP "VelogPoster_update.log"
 $Preserve = @(__PRESERVE__)
 
 function Write-Log([string]$Message) {
-    Add-Content -Path $Log -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
+    try {
+        Add-Content -LiteralPath $Log -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message) -Encoding UTF8
+    } catch {}
 }
 
 Write-Log "update start (powershell)"
@@ -469,21 +471,36 @@ Write-Log ("Install=" + $Install)
 Write-Log ("Exe=" + $Exe)
 Write-Log ("WaitPid=" + $WaitPid)
 
-$deadline = (Get-Date).AddSeconds(90)
-while ((Get-Date) -lt $deadline) {
-    if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) { break }
-    Start-Sleep -Seconds 1
+if ($WaitPid -gt 0) {
+    $deadline = (Get-Date).AddSeconds(120)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Seconds 1
+    }
+    $leftover = Get-Process -Id $WaitPid -ErrorAction SilentlyContinue
+    if ($leftover) {
+        Write-Log ("force stop pid " + $WaitPid)
+        Stop-Process -Id $WaitPid -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
 }
-if (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue) {
-    Write-Log ("force stop pid " + $WaitPid)
-    Stop-Process -Id $WaitPid -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+# 설치 폴더의 exe가 아직 잠겨 있으면 조금 더 기다린다.
+$exeName = [System.IO.Path]::GetFileNameWithoutExtension($Exe)
+$deadline2 = (Get-Date).AddSeconds(30)
+while ((Get-Date) -lt $deadline2) {
+    $running = Get-Process -Name $exeName -ErrorAction SilentlyContinue
+    if (-not $running) { break }
+    Start-Sleep -Seconds 1
 }
 Write-Log "process wait done"
 Start-Sleep -Seconds 2
 
 $src = Join-Path $Staging $Inner
 if (-not (Test-Path -LiteralPath $src)) { $src = $Staging }
+if (-not (Test-Path -LiteralPath $src)) {
+    Write-Log ("staging missing: " + $Staging)
+    exit 1
+}
 Write-Log ("robocopy " + $src + " -> " + $Install)
 
 $xfArgs = @()
@@ -495,6 +512,7 @@ if ($xfArgs.Count -gt 0) {
 } else {
     & robocopy $src $Install /E /IS /IT /R:8 /W:3 /NFL /NDL /NJH /NJS | Out-Null
 }
+Write-Log ("robocopy code " + $LASTEXITCODE)
 if ($LASTEXITCODE -ge 8) {
     Write-Log ("robocopy failed code " + $LASTEXITCODE)
     try {
@@ -511,7 +529,11 @@ if ($LASTEXITCODE -ge 8) {
 
 Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
 Write-Log ("starting " + $Exe)
-Start-Process -FilePath $Exe
+if (Test-Path -LiteralPath $Exe) {
+    Start-Process -FilePath $Exe -WorkingDirectory $Install
+} else {
+    Write-Log ("exe missing: " + $Exe)
+}
 Write-Log "update success"
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 exit 0
@@ -559,7 +581,12 @@ def schedule_apply_update(
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = 0
-    subprocess.Popen(
+    # 앱이 종료돼도 설치 스크립트가 같이 죽지 않도록 새 프로세스 그룹으로 분리한다.
+    creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    detached = getattr(subprocess, "DETACHED_PROCESS", 0)
+    if detached:
+        creationflags |= detached
+    proc = subprocess.Popen(
         [
             "powershell.exe",
             "-NoProfile",
@@ -576,9 +603,18 @@ def schedule_apply_update(
             str(os.getpid()),
         ],
         startupinfo=startupinfo,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=creationflags,
         close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
+    try:
+        log_path = get_update_log_path()
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] spawned updater pid={proc.pid}\n")
+    except OSError:
+        pass
 
     try:
         zip_path.unlink(missing_ok=True)
