@@ -134,6 +134,7 @@ class VelogApp(tk.Tk):
         self._collapse_state = {"image": False, "advanced": False, "account": False, "manuscript": True}
         self.status = tk.StringVar(value="대기 중 — 계정을 등록한 뒤 [전체 출간 시작]을 누르세요.")
         self.tab_summary = tk.StringVar(value="계정 0개")
+        self.working_id = tk.StringVar(value="")
         self.log_summary = tk.StringVar(value="로그 0줄")
         self.progress_text = tk.StringVar(value="")
 
@@ -819,7 +820,20 @@ class VelogApp(tk.Tk):
     def _build_list(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent, style="Bg.TFrame")
         top.pack(fill="x", pady=(0, 10))
-        ttk.Label(top, text="계정 목록", style="Title.TLabel").pack(side="left")
+        title_row = ttk.Frame(top, style="Bg.TFrame")
+        title_row.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_row, text="계정 목록", style="Title.TLabel").pack(side="left")
+        self.working_label = tk.Label(
+            title_row,
+            textvariable=self.working_id,
+            bg=BG,
+            fg=ACCENT_DARK,
+            font=(FONT, 10, "underline"),
+            cursor="hand2",
+            padx=10,
+        )
+        self.working_label.pack(side="left", padx=(8, 0))
+        self.working_label.bind("<Button-1>", self._scroll_to_working_account)
         summary_wrap = ttk.Frame(top, style="CardBorder.TFrame")
         summary_wrap.pack(side="right")
         ttk.Label(
@@ -2023,6 +2037,10 @@ class VelogApp(tk.Tk):
                     self._poster = None
                     self._worker = None
                     self._set_progress(self._run_done, self._run_total)
+                    self.working_id.set("")
+                    continue
+                if level == "working":
+                    self._set_working_id(message)
                     continue
                 if level == "result":
                     velog_id, _, url = message.partition("\t")
@@ -2041,6 +2059,47 @@ class VelogApp(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._drain_events)
+
+    def _set_working_id(self, velog_id: str) -> None:
+        text = (velog_id or "").strip()
+        self.working_id.set(f"작성 중 · {text}" if text else "")
+
+    def _scroll_to_working_account(self, _event=None) -> None:
+        raw = self.working_id.get().strip()
+        if raw.startswith("작성 중 · "):
+            velog_id = raw[len("작성 중 · "):].strip()
+        else:
+            velog_id = raw
+        if not velog_id:
+            return
+        tab = self._active_tab or self._current_tab()
+        if tab is None:
+            return
+        tree = tab.get("tree")
+        accounts = tab.get("accounts") or []
+        if tree is None:
+            return
+        target_iid = ""
+        for iid in tree.get_children():
+            try:
+                idx = int(iid)
+            except ValueError:
+                continue
+            if idx >= len(accounts):
+                continue
+            if accounts[idx].get("velog_id") == velog_id:
+                target_iid = iid
+                break
+        if not target_iid:
+            self.status.set(f"목록에서 '{velog_id}' 계정을 찾지 못했습니다.")
+            return
+        tree.selection_set(target_iid)
+        tree.focus(target_iid)
+        tree.see(target_iid)
+        try:
+            self.notebook.select(tab["frame"])
+        except Exception:  # noqa: BLE001
+            pass
 
     def _mark_published(self, velog_id: str, url: str) -> None:
         tab = self._active_tab or self._current_tab()
@@ -2135,10 +2194,12 @@ class VelogApp(tk.Tk):
         self.stop_btn.configure(state="normal" if running else "disabled")
         if running:
             self.status.set("출간 작업 진행 중...")
-        elif self.status.get().endswith("중단하는 중..."):
-            self.status.set("중단됨")
-        elif not running:
-            self.status.set("작업이 완료되었습니다.")
+        else:
+            self.working_id.set("")
+            if self.status.get().endswith("중단하는 중..."):
+                self.status.set("중단됨")
+            else:
+                self.status.set("작업이 완료되었습니다.")
 
     def _append(self, message: str, tag: str = "") -> None:
         ts = datetime.now().strftime("%H:%M:%S")

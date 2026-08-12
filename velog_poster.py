@@ -329,6 +329,19 @@ class VelogPoster:
         self._endpoint: str | None = None
         self._handoff = False
         self._user_foreground_hwnd = 0
+        # 업로드 실패 이미지 → 이후 N계정(10~20) 동안 보류
+        self._image_hold: dict[str, int] = {}
+        self._image_hold_default = (10, 20)
+        self._image_try_limit = 3
+        # 연속으로 이미지 등록이 전부 실패하면 일정 계정 동안 이미지 업로드 휴식
+        self._image_fail_streak = 0
+        self._image_skip_remaining = 0
+        self._image_streak_trigger = 3  # 연속 3계정 실패 시
+        self._image_skip_range = (5, 8)  # 5~8계정 동안 이미지 생략
+        # 최근 사용한 이미지는 가급적 재사용하지 않음
+        self._recent_images: list[str] = []
+        self._recent_image_limit = 8
+        self._temp_upload_files: list[Path] = []
 
     def log(self, message: str, level: str) -> None:
         """모든 로그에 현재 진행 중인 계정 번호를 붙여 내보낸다."""
@@ -362,7 +375,9 @@ class VelogPoster:
                 # 이후 모든 로그에 [현재/전체] 가 자동으로 붙는다.
                 self._prefix = f"[{index}/{total}] "
                 self.log(f"━━━ {label} 작업 시작 ━━━", "info")
+                self._emit(label, "working")
                 self._reset_account_state()
+                self._tick_image_holds()
                 try:
                     self._run_one(pw, chrome, account)
                     completed += 1
@@ -383,8 +398,17 @@ class VelogPoster:
                 finally:
                     # 다음 계정을 위해 이 계정의 Chrome 을 완전히 닫고 정리한다.
                     self._teardown_account()
+                    self._emit("", "working")
+
+                if index < total and not self._stop.is_set():
+                    # 대량 업로드 시 레이트리밋 완화용 계정 간 대기
+                    if self._image_skip_remaining > 0 or self._image_fail_streak > 0:
+                        self._wait("다음 계정 전 대기(이미지 제한 완화)...", _jitter(14, 5))
+                    else:
+                        self._wait("다음 계정 전 대기...", _jitter(8, 3))
 
         self._prefix = ""
+        self._emit("", "working")
         if self._stop.is_set():
             self.log("작업을 중단했습니다.", "info")
         else:
@@ -1144,19 +1168,185 @@ class VelogPoster:
             return ""
 
     # -- 이미지 등록 ------------------------------------------------------
-    def _insert_random_image(self, target: Page, folder: str, link_url: str = "") -> None:
-        """폴더 안 이미지 중 하나를 무작위로 골라 본문에 등록한다.
-        link_url 이 주어지면 등록된 이미지를 클릭 시 그 주소로 이동하도록 링크를 건다."""
+    def _tick_image_holds(self) -> None:
+        """계정 1건 진행할 때마다 보류 카운트를 1씩 줄인다."""
+        if not self._image_hold:
+            return
+        expired: list[str] = []
+        for path, left in list(self._image_hold.items()):
+            if left <= 1:
+                expired.append(path)
+            else:
+                self._image_hold[path] = left - 1
+        for path in expired:
+            self._image_hold.pop(path, None)
+            self.log(f"이미지 보류 해제: {Path(path).name}", "info")
+
+    def _hold_image(self, path: Path) -> None:
+        lo, hi = self._image_hold_default
+        turns = random.randint(lo, hi)
+        key = str(path.resolve()) if path.exists() else str(path)
+        self._image_hold[key] = turns
+        self.log(f"이미지 보류 {turns}건: {path.name} (당분간 다른 파일 우선)", "info")
+
+    def _list_upload_images(self, folder: str) -> list[Path]:
         exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
-        images = [
-            p for p in Path(folder).iterdir()
-            if p.is_file() and p.suffix.lower() in exts
-        ]
+        root = Path(folder)
+        if not root.is_dir():
+            return []
+        images: list[Path] = []
+        for p in root.iterdir():
+            if not p.is_file() or p.suffix.lower() not in exts:
+                continue
+            try:
+                key = str(p.resolve())
+            except OSError:
+                key = str(p)
+            if self._image_hold.get(key, 0) > 0:
+                continue
+            images.append(p)
         if not images:
-            self.log("이미지 폴더에 이미지가 없어 등록을 건너뜁니다.", "info")
+            return []
+        # 최근 사용한 이미지는 가능한 한 제외
+        recent = set(self._recent_images)
+        fresh = []
+        for p in images:
+            try:
+                key = str(p.resolve())
+            except OSError:
+                key = str(p)
+            if key not in recent:
+                fresh.append(p)
+        return fresh if fresh else images
+
+    def _remember_image(self, path: Path) -> None:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        self._recent_images = [k for k in self._recent_images if k != key]
+        self._recent_images.append(key)
+        overflow = len(self._recent_images) - self._recent_image_limit
+        if overflow > 0:
+            self._recent_images = self._recent_images[overflow:]
+
+    def _note_image_outcome(self, success: bool) -> None:
+        if success:
+            self._image_fail_streak = 0
+            return
+        self._image_fail_streak += 1
+        if self._image_fail_streak < self._image_streak_trigger:
+            return
+        lo, hi = self._image_skip_range
+        skip = random.randint(lo, hi)
+        self._image_skip_remaining = skip
+        self._image_fail_streak = 0
+        self.log(
+            f"이미지 연속 실패 → 다음 {skip}계정은 이미지 업로드를 쉬고 출간만 진행합니다.",
+            "info",
+        )
+
+    def _prepare_image_for_upload(self, src: Path) -> Path:
+        """업로드 전 긴 변 1600px 이하로 줄이고 용량을 낮춘 임시 파일을 만든다."""
+        try:
+            from PIL import Image
+        except ImportError:
+            return src
+        try:
+            with Image.open(src) as raw:
+                im = raw.copy()
+            max_side = 1600
+            w, h = im.size
+            if max(w, h) > max_side:
+                ratio = max_side / float(max(w, h))
+                im = im.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.Resampling.LANCZOS)
+
+            suffix = src.suffix.lower()
+            if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+                suffix = ".jpg"
+            if suffix in {".jpg", ".jpeg"} and im.mode not in {"RGB", "L"}:
+                if im.mode == "RGBA":
+                    bg = Image.new("RGB", im.size, (255, 255, 255))
+                    bg.paste(im, mask=im.split()[-1])
+                    im = bg
+                else:
+                    im = im.convert("RGB")
+
+            fd, name = tempfile.mkstemp(prefix="velog-img-", suffix=suffix)
+            os.close(fd)
+            out = Path(name)
+            if suffix in {".jpg", ".jpeg"}:
+                im.save(out, format="JPEG", quality=82, optimize=True)
+            elif suffix == ".png":
+                im.save(out, format="PNG", optimize=True)
+            else:
+                im.save(out)
+            self._temp_upload_files.append(out)
+            return out
+        except Exception:  # noqa: BLE001
+            return src
+
+    def _insert_random_image(self, target: Page, folder: str, link_url: str = "") -> None:
+        """폴더 안 이미지를 무작위로 올려 본문에 넣는다.
+        실패 시 다른 이미지로 재시도하고, 모두 실패해도 출간은 계속한다."""
+        if self._image_skip_remaining > 0:
+            self._image_skip_remaining -= 1
+            self.log(
+                f"이미지 업로드 휴식 중 — 이번 계정은 이미지 없이 출간 "
+                f"(남은 {self._image_skip_remaining}계정)",
+                "info",
+            )
             return
 
-        chosen = random.choice(images)
+        images = self._list_upload_images(folder)
+        if not images:
+            held = len(self._image_hold)
+            if held:
+                self.log(
+                    f"사용 가능한 이미지가 없습니다 (보류 {held}개). 이미지 없이 출간합니다.",
+                    "info",
+                )
+            else:
+                self.log("이미지 폴더에 이미지가 없어 등록을 건너뜁니다.", "info")
+            return
+
+        random.shuffle(images)
+        candidates = images[: max(1, self._image_try_limit)]
+        last_error = ""
+        uploaded = False
+
+        for attempt, chosen in enumerate(candidates, start=1):
+            try:
+                if self._try_upload_image(target, chosen, link_url=link_url):
+                    self._remember_image(chosen)
+                    self._note_image_outcome(True)
+                    uploaded = True
+                    return
+                last_error = "업로드 시간 초과"
+                self._hold_image(chosen)
+            except PostingError as exc:
+                last_error = str(exc)
+                self.log(f"이미지 시도 실패 ({chosen.name}): {exc}", "error")
+                if "이미지 등록 버튼" in last_error:
+                    break
+                self._hold_image(chosen)
+            if attempt < len(candidates):
+                self.log(
+                    f"다른 이미지로 재시도합니다... ({attempt}/{len(candidates)})",
+                    "info",
+                )
+                self._sleep(_jitter(4, 1.5))
+
+        if not uploaded:
+            self._note_image_outcome(False)
+            self.log(
+                f"이미지 등록을 포기하고 출간을 계속합니다. ({last_error or '업로드 실패'})",
+                "error",
+            )
+
+    def _try_upload_image(self, target: Page, chosen: Path, link_url: str = "") -> bool:
+        """한 장 업로드. 성공 True, 시간 초과 False. UI 오류는 PostingError."""
+        upload_path = self._prepare_image_for_upload(chosen)
         self.log(f"이미지를 등록하는 중: {chosen.name}", "info")
 
         editor = target.locator(".CodeMirror")
@@ -1166,7 +1356,6 @@ class VelogPoster:
         except Error:
             pass
 
-        # 본문 맨 위에 커서를 두어 이미지가 원고 제일 상단에 삽입되도록 한다.
         try:
             target.locator(".CodeMirror-scroll").click()
             self._sleep(_jitter(0.4, 0.2))
@@ -1175,7 +1364,6 @@ class VelogPoster:
         except Error:
             pass
 
-        # 에디터 툴바의 이미지 버튼(아이콘 path 로 식별)을 눌러 파일 선택창을 연다.
         image_button = target.locator(
             "button:has(svg path[d^='M21 19V5'])"
         ).first
@@ -1187,13 +1375,12 @@ class VelogPoster:
         try:
             with target.expect_file_chooser(timeout=15_000) as fc:
                 image_button.click()
-            fc.value.set_files(str(chosen))
+            fc.value.set_files(str(upload_path))
         except (Error, PWTimeoutError) as exc:
             raise PostingError("이미지 파일 선택창을 열지 못했습니다.") from exc
 
-        # 업로드 완료(본문에 이미지 markdown 이 추가됨)를 기다린다.
         self.log("이미지 업로드 완료를 기다리는 중...", "info")
-        for _ in range(40):  # 최대 약 80초
+        for _ in range(20):
             if self._stop.wait(2):
                 raise PostingError("사용자가 작업을 중단했습니다.")
             try:
@@ -1204,8 +1391,8 @@ class VelogPoster:
                 self.log("이미지가 본문에 등록되었습니다.", "info")
                 if link_url:
                     self._link_image(target, editor, link_url)
-                return
-        raise PostingError("이미지 업로드가 시간 내에 끝나지 않았습니다.")
+                return True
+        return False
 
     def _link_image(self, target: Page, editor, link_url: str) -> None:
         """본문 첫 이미지에 홈페이지 링크를 연결한다 (마크다운/HTML)."""
@@ -1401,9 +1588,10 @@ class VelogPoster:
 
     def _wait_published_url(self, pw) -> str | None:
         """출간 클릭 후, 게시글 주소(@아이디/제목)로 리다이렉트될 때까지 기다려
-        그 정확한 URL 을 반환한다. (최대 약 100초)"""
+        그 정확한 URL 을 반환한다."""
         self.log("출간 완료 후 게시글 주소를 확인하는 중...", "info")
         last_url = ""
+        username = ""
         for _ in range(50):
             if self._stop.wait(2):
                 raise PostingError("사용자가 작업을 중단했습니다.")
@@ -1416,6 +1604,8 @@ class VelogPoster:
                     if self._is_post_url(last_url):
                         self.log(f"출간 완료 🎉 {last_url}", "success")
                         return last_url
+                    if not username:
+                        username = self._read_velog_username(page)
             except (Error, PWTimeoutError):
                 pass
             finally:
@@ -1424,9 +1614,68 @@ class VelogPoster:
                         browser.close()
                     except Error:
                         pass
-        # 게시글 주소를 끝내 못 잡으면, 중복 출간 방지를 위해 마지막 URL 이라도 반환.
+
+        resolved = self._resolve_post_url_from_profile(pw, username)
+        if resolved:
+            self.log(f"출간 완료 🎉 {resolved}", "success")
+            return resolved
+
         self.log("게시글 주소 확인에 실패했습니다. 창에서 직접 확인해 주세요.", "error")
         return last_url or None
+
+    @staticmethod
+    def _read_velog_username(page: Page) -> str:
+        try:
+            href = page.evaluate(
+                """() => {
+                    const a = document.querySelector('a[href^="/@"]');
+                    return a ? a.getAttribute('href') : '';
+                }"""
+            ) or ""
+        except Error:
+            return ""
+        m = re.match(r"^/@([^/?#]+)", str(href).strip())
+        return m.group(1) if m else ""
+
+    def _resolve_post_url_from_profile(self, pw, username: str) -> str | None:
+        """'/write?id=' 에 머문 경우 프로필에서 최신 글 URL을 한 번 더 찾는다."""
+        if not username or not self._endpoint:
+            return None
+        self.log(f"프로필(@{username})에서 최신 글 주소를 찾는 중...", "info")
+        browser = None
+        try:
+            browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
+            page = self._find_velog_page(browser)
+            if page is None:
+                return None
+            self._goto(page, f"https://velog.io/@{username}")
+            self._sleep(_jitter(2.5, 1.0))
+            href = page.evaluate(
+                """(user) => {
+                    const links = Array.from(document.querySelectorAll('a[href*="/@"]'));
+                    const prefix = '/@' + user + '/';
+                    for (const a of links) {
+                        const h = a.getAttribute('href') || '';
+                        if (h.startsWith(prefix) && h !== prefix && !h.includes('/about') && !h.includes('/series')) {
+                            return h.startsWith('http') ? h : ('https://velog.io' + h);
+                        }
+                    }
+                    return '';
+                }""",
+                username,
+            )
+            href = str(href or "").strip()
+            if href and self._is_post_url(href):
+                return href
+        except (Error, PWTimeoutError, PostingError):
+            return None
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Error:
+                    pass
+        return None
 
     def _confirm_published(self, page: Page) -> bool:
         """출간 후 작성 화면(/write)에서 벗어나면 성공으로 본다."""
@@ -1487,6 +1736,13 @@ class VelogPoster:
         profile, self._temp_profile = self._temp_profile, None
         self._context = None
         self._endpoint = None
+
+        for tmp in self._temp_upload_files:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._temp_upload_files = []
 
         if browser is not None:
             try:
