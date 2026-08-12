@@ -63,7 +63,9 @@ def classify_failure(message: str) -> str:
         return "other"
     if "중단" in text:
         return "other"
-    if any(k in text for k in ("계정 잠김", "포스트 작성 실패", "재가입", "이미 가입")):
+    if any(k in text for k in (
+        "계정 잠김", "포스트 작성 실패", "포스트 수정 실패", "재가입", "이미 가입",
+    )):
         return "locked"
     login_keys = (
         "로그인", "인증 메일", "인증 링크", "TempMail", "가입 인증",
@@ -1562,9 +1564,7 @@ class VelogPoster:
                         return url
 
                     if self._has_publish_fail_toast(page):
-                        raise PostingError(
-                            "계정 잠김: 포스트 작성 실패 — 목록에서 삭제합니다.",
-                        )
+                        raise self._publish_fail_error()
 
                     final = page.locator('[data-testid="publish"]')
                     final_visible = final.count() > 0 and final.first.is_visible()
@@ -1582,9 +1582,7 @@ class VelogPoster:
                             panel_opened = True
                             self._sleep(1.2)
                             if self._has_publish_fail_toast(page):
-                                raise PostingError(
-                                    "계정 잠김: 포스트 작성 실패 — 목록에서 삭제합니다.",
-                                )
+                                raise self._publish_fail_error()
                         # 클릭 직후 곧바로 연결을 끊어(아래 finally),
                         # 인증이 깨끗한 상태에서 검증되도록 한다.
                     else:
@@ -1606,9 +1604,7 @@ class VelogPoster:
                             clicked_publish = True
                             self._sleep(1.0)
                             if self._has_publish_fail_toast(page):
-                                raise PostingError(
-                                    "계정 잠김: 포스트 작성 실패 — 목록에서 삭제합니다.",
-                                )
+                                raise self._publish_fail_error()
                     # else: 패널은 열렸지만 아직 인증 미통과 → 끊고 대기.
             except PostingError:
                 raise
@@ -1642,7 +1638,7 @@ class VelogPoster:
 
     @staticmethod
     def _has_publish_fail_toast(page: Page) -> bool:
-        """Toastify '포스트 작성 실패' 알림이 떠 있으면 계정 잠김으로 본다."""
+        """Toastify '포스트 작성/수정 실패' 알림이 떠 있으면 계정 잠김으로 본다."""
         try:
             return bool(page.evaluate(
                 """() => {
@@ -1651,7 +1647,9 @@ class VelogPoster:
                     );
                     for (const n of nodes) {
                         const t = (n.textContent || '').replace(/\\s+/g, ' ').trim();
-                        if (t.includes('포스트 작성 실패')) return true;
+                        if (t.includes('포스트 작성 실패') || t.includes('포스트 수정 실패')) {
+                            return true;
+                        }
                     }
                     return false;
                 }"""
@@ -1659,6 +1657,11 @@ class VelogPoster:
         except Error:
             return False
 
+    @staticmethod
+    def _publish_fail_error() -> PostingError:
+        return PostingError(
+            "계정 잠김: 포스트 작성/수정 실패 — 목록에서 삭제합니다.",
+        )
     def _wait_published_url(self, pw) -> str | None:
         """출간 클릭 후, 게시글 주소(@아이디/제목)로 리다이렉트될 때까지 기다려
         그 정확한 URL 을 반환한다."""
@@ -1674,9 +1677,7 @@ class VelogPoster:
                 page = self._find_velog_page(browser)
                 if page is not None:
                     if self._has_publish_fail_toast(page):
-                        raise PostingError(
-                            "계정 잠김: 포스트 작성 실패 — 목록에서 삭제합니다.",
-                        )
+                        raise self._publish_fail_error()
                     last_url = page.url or last_url
                     if self._is_post_url(last_url):
                         self.log(f"출간 완료 🎉 {last_url}", "success")
