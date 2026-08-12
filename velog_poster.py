@@ -514,13 +514,14 @@ class VelogPoster:
         self._open_link(pw, page, link)
         page = self._first_page()  # cloudflare 우회로 재연결됐을 수 있음
         is_signup, profile_name = self._handle_signup_if_needed(pw, page, account)
+        # 가입 단계에서 CDP 를 끊었다가 다시 쓰므로, 이후 작업 전에 반드시 재연결한다.
+        self._ensure_connected(pw)
+        self._restore_user_focus()
+        page = self._first_page()
         if not is_signup:
             self.log("로그인 중.. (기존 계정)", "info")
         elif profile_name:
             self._set_blog_title(page, profile_name)
-        # 회원가입 단계에서 재연결했을 수 있으니 연결을 보장한다.
-        self._ensure_connected(pw)
-        self._restore_user_focus()
         target = self._write_post(self._first_page(), title, body, tags=tags)
 
         if image_folder:
@@ -1170,10 +1171,10 @@ class VelogPoster:
     def _set_blog_title(self, page: Page, title: str) -> None:
         """신규 가입 직후 설정 페이지에서 벨로그 제목을 프로필 이름으로 바꾼다."""
         self.log("벨로그 제목을 설정하는 중...", "info")
-        self._goto(page, "https://velog.io/setting")
-        self._sleep(_jitter(2, 0.5))
-
         try:
+            self._goto(page, "https://velog.io/setting")
+            self._sleep(_jitter(2, 0.5))
+
             row = page.locator('div[class*="SettingRow"]').filter(
                 has=page.locator('h3', has_text="벨로그 제목"),
             ).first
@@ -1231,12 +1232,18 @@ class VelogPoster:
             self._sleep(_jitter(1.2, 0.4))
             self.log(f"벨로그 제목을 '{title}'(으)로 변경했습니다.", "success")
         except Error as exc:
+            # 제목 설정 실패해도 출간은 계속 (페이지 재연결 직후 레이스 등)
             self.log(f"벨로그 제목 설정 실패(출간은 계속): {exc}", "info")
 
     def _ensure_connected(self, pw) -> None:
         """signup 단계에서 연결을 끊었을 수 있으니, 끊겨 있으면 재연결한다."""
         if self._browser is not None and self._context is not None:
-            return
+            try:
+                _ = list(self._context.pages)
+                return
+            except Error:
+                self._browser = None
+                self._context = None
         if not self._endpoint:
             return
         browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=20_000)

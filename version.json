@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.26",
-    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511395879",
-    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.26/VelogPoster.zip",
-    "notes":  "Chrome 창 확대 + 가입 버튼 스크롤 후 클릭 — 작은 창에서 버튼 못 누르던 문제 수정",
+    "version":  "1.0.27",
+    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.27/VelogPoster.zip",
+    "notes":  "가입 후 CDP 재연결 뒤 벨로그 제목 설정 — 닫힌 페이지로 goto 하던 오류 수정",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511395879",
-                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.26/VelogPoster.zip",
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.27/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ],
-    "asset_id":  511395879,
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511395879"
+                      ]
 }
