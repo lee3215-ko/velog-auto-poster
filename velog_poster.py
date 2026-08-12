@@ -49,9 +49,6 @@ LogCallback = Callable[[str, str], None]
 # (일반 Chrome 에서 navigator.webdriver 는 false 다.)
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => false });
-// CDP 연결 시 비는 chrome 런타임 흔적을 줄인다 (과도한 위조는 하지 않음).
-if (!window.chrome) { window.chrome = {}; }
-if (!window.chrome.runtime) { window.chrome.runtime = {}; }
 """
 
 
@@ -527,6 +524,9 @@ class VelogPoster:
         if image_folder:
             image_link = random.choice(homepages) if homepages else ""
             self._insert_random_image(target, image_folder, link_url=image_link)
+            self._restore_user_focus()
+        else:
+            self._restore_user_focus()
 
         url = self._publish(pw, target, tags, summary=summary)
         if not url or not self._is_post_url(url):
@@ -648,41 +648,11 @@ class VelogPoster:
             pass
 
     def _type_like_human(self, page: Page, text: str, *, slow: bool = False) -> None:
-        """한 글자씩 입력. 속도 변화·짧은 멈춤·가끔 오타 후 수정으로 사람처럼 보이게 한다."""
+        """한 글자씩 입력. 오타·과도한 멈춤은 쓰지 않는다(탐지·입력 오류 유발)."""
         if not text:
             return
-        for index, ch in enumerate(text):
-            if self._stop.wait(0):
-                raise PostingError("사용자가 작업을 중단했습니다.")
-            # 중간중간 생각하는 듯한 멈춤
-            if index > 0 and random.random() < (0.10 if slow else 0.06):
-                self._sleep(random.uniform(0.25, 0.95 if slow else 0.7))
-            # 드물게 오타 → 백스페이스
-            if (
-                ch.isalnum()
-                and index > 1
-                and index < len(text) - 1
-                and random.random() < 0.035
-            ):
-                wrong = random.choice(string.ascii_lowercase + string.digits)
-                page.keyboard.type(wrong, delay=random.randint(40, 90))
-                self._sleep(random.uniform(0.12, 0.4))
-                page.keyboard.press("Backspace")
-                self._sleep(random.uniform(0.08, 0.25))
-            if slow:
-                delay = random.randint(85, 210)
-            elif random.random() < 0.25:
-                delay = random.randint(30, 65)  # 빠른 연타 구간
-            else:
-                delay = random.randint(55, 150)
-            page.keyboard.type(ch, delay=delay)
-
-    def _move_to_box(self, page: Page, box: dict, *, steps: int | None = None) -> tuple[float, float]:
-        """요소 박스 안 임의 지점으로 마우스를 천천히 이동."""
-        x = box["x"] + box["width"] * random.uniform(0.25, 0.75)
-        y = box["y"] + box["height"] * random.uniform(0.25, 0.75)
-        page.mouse.move(x, y, steps=steps or random.randint(14, 32))
-        return x, y
+        delay = random.randint(55, 120) if slow else random.randint(40, 95)
+        page.keyboard.type(text, delay=delay)
 
     def _scroll_into_view(self, locator) -> None:
         """화면 밖(작은 창)에 있는 버튼을 가운데로 스크롤한다."""
@@ -696,55 +666,21 @@ class VelogPoster:
                 )
             except Error:
                 pass
-        self._sleep(0.25)
+        self._sleep(0.2)
 
     def _stable_click(self, locator, *, timeout: int = 15_000) -> None:
-        """스크롤 후 Playwright 기본 클릭(가입/출간 등 중요 버튼용)."""
+        """스크롤 후 Playwright 기본 클릭(가입 등 중요 버튼용)."""
         target = locator.first if hasattr(locator, "first") else locator
         self._scroll_into_view(target)
         try:
             target.click(timeout=timeout)
         except Error:
-            # 가려져 있으면 force 로 한 번 더
             self._scroll_into_view(target)
             target.click(timeout=timeout, force=True)
 
-    def _click_like_human(self, page: Page, locator, *, timeout: int = 15_000) -> None:
-        """마우스를 옮긴 뒤 짧게 머물렀다가 클릭. 실패 시 안정 클릭으로 폴백."""
-        target = locator.first if hasattr(locator, "first") else locator
-        self._scroll_into_view(target)
-        try:
-            target.wait_for(state="visible", timeout=timeout)
-        except Error:
-            pass
-        try:
-            box = target.bounding_box()
-        except Error:
-            box = None
-        if box and box.get("width", 0) > 1 and box.get("height", 0) > 1:
-            try:
-                x, y = self._move_to_box(page, box)
-                self._sleep(random.uniform(0.12, 0.55))
-                page.mouse.click(x, y, delay=random.randint(40, 120))
-                return
-            except Error:
-                pass
-        self._stable_click(target, timeout=timeout)
-
-    def _human_idle(self, page: Page | None = None, *, lo: float = 0.6, hi: float = 2.0) -> None:
-        """필드를 채우기 전/후 짧게 멈추고, 가능하면 마우스를 조금 움직인다."""
-        if page is not None:
-            try:
-                vp = page.viewport_size or {"width": 1280, "height": 800}
-                page.mouse.move(
-                    random.randint(60, max(80, vp["width"] - 60)),
-                    random.randint(60, max(80, vp["height"] - 60)),
-                    steps=random.randint(6, 16),
-                )
-                if random.random() < 0.35:
-                    page.mouse.wheel(0, random.randint(-160, 160))
-            except Error:
-                pass
+    def _human_idle(self, page: Page | None = None, *, lo: float = 0.4, hi: float = 1.2) -> None:
+        """짧은 대기만. 마우스 궤적/휠은 쓰지 않는다(봇 패턴·스크롤 밀림 유발)."""
+        del page  # API 호환
         self._sleep(_human_delay(lo, hi))
 
     def _set_codemirror_value(self, editor, text: str) -> None:
@@ -838,7 +774,7 @@ class VelogPoster:
     def _request_login(self, pw, page: Page, velog_id: str) -> None:
         self.log("벨로그에 접속하는 중...", "info")
         self._goto(page, "https://velog.io/")
-        self._human_idle(page, lo=2.0, hi=4.5)
+        self._wait("화면이 준비되기를 기다리는 중...", _jitter(2.5, 1.0))
         self._wait_if_cloudflare(pw, page)
         page = self._first_page()  # 우회로 재연결됐을 수 있어 페이지를 다시 잡는다
 
@@ -848,23 +784,23 @@ class VelogPoster:
             login_btn = self._visible_last(page.get_by_role("button", name="로그인", exact=True))
             if login_btn is None:
                 raise PostingError("로그인 버튼을 찾지 못했습니다.")
-            self._click_like_human(page, login_btn)
-            self._human_idle(page, lo=1.2, hi=2.8)
+            login_btn.click(timeout=15_000)
+            self._wait("로그인 창이 열리기를 기다리는 중...", _jitter(2))
 
         self.log("아이디(이메일)를 입력하는 중...", "info")
         email_input.wait_for(state="visible", timeout=15_000)
-        self._click_like_human(page, email_input)
-        self._sleep(_human_delay(0.35, 0.9))
-        # 이메일 주소는 조금 더 천천히
-        self._type_like_human(page, velog_id, slow=True)
-        self._human_idle(page, lo=0.8, hi=2.2)
+        email_input.click()
+        self._sleep(_jitter(0.35, 0.25))
+        self._type_like_human(page, velog_id)
+        self._sleep(_jitter(0.7, 0.4))
 
         self.log("인증 메일을 요청하는 중...", "info")
         submit = self._visible_last(page.get_by_role("button", name="로그인", exact=True))
         if submit is None:
             raise PostingError("이메일 입력 후 로그인 버튼을 찾지 못했습니다.")
-        self._click_like_human(page, submit)
-        self._wait("인증 메일 발송을 기다리는 중...", _human_delay(4.5, 8.0))
+        self._sleep(_jitter(0.35, 0.25))
+        submit.click()
+        self._wait("인증 메일 발송을 기다리는 중...", _jitter(5, 1.5))
 
     @staticmethod
     def _visible_last(locator):
@@ -884,7 +820,7 @@ class VelogPoster:
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/137.0.0.0 Safari/537.36"
+                    "Chrome/131.0.0.0 Safari/537.36"
                 ),
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
@@ -998,43 +934,41 @@ class VelogPoster:
         bio = make_bio(name)
         self.log(f"프로필 이름: {name} / 사용자 ID: {user_id}", "info")
 
-        # 폼을 잠깐 읽는 듯한 대기
-        self._human_idle(page, lo=1.5, hi=3.5)
+        self._sleep(_jitter(0.8, 0.5))
 
         # 프로필 이름
-        self._click_like_human(page, profile_input.first)
-        self._sleep(_human_delay(0.4, 1.0))
-        self._type_like_human(page, name, slow=True)
-        self._human_idle(page, lo=1.0, hi=2.8)
+        profile_input.first.click()
+        self._sleep(_jitter(0.4, 0.3))
+        self._type_like_human(page, name)
+        self._sleep(_jitter(0.7, 0.4))
 
         # 사용자 ID
         uid = page.get_by_placeholder("사용자 ID를 입력하세요.")
         uid.first.wait_for(state="visible", timeout=10_000)
-        self._click_like_human(page, uid.first)
-        self._sleep(_human_delay(0.4, 1.0))
-        self._type_like_human(page, user_id, slow=True)
-        self._human_idle(page, lo=1.2, hi=3.0)
+        uid.first.click()
+        self._sleep(_jitter(0.4, 0.3))
+        self._type_like_human(page, user_id)
+        self._sleep(_jitter(0.7, 0.4))
 
         # 한 줄 소개
         bio_box = page.get_by_placeholder("당신을 한 줄로 소개해보세요")
         if bio_box.count() > 0 and bio_box.first.is_visible():
-            self._click_like_human(page, bio_box.first)
-            self._sleep(_human_delay(0.35, 0.9))
+            bio_box.first.click()
+            self._sleep(_jitter(0.35, 0.25))
             self._type_like_human(page, bio)
-            self._human_idle(page, lo=0.9, hi=2.4)
+            self._sleep(_jitter(0.7, 0.4))
 
         # 약관 동의
-        self._sleep(_jitter(0.6, 0.4))
+        self._sleep(_jitter(0.5, 0.3))
         self._check_agreement(page)
-        self._sleep(_jitter(0.8, 0.5))
-        # 가입 버튼이 창 아래에 가려질 수 있어 미리 스크롤
+        self._sleep(_jitter(0.7, 0.4))
         try:
             page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            self._sleep(0.4)
+            self._sleep(0.35)
         except Error:
             pass
 
-        # 가입 (Cloudflare 인증 대비 → 출간과 동일하게 연결 해제·재연결로 클릭)
+        # 가입 — CDP 연결 중 클릭하지 않음 (Turnstile 실패 원인)
         self._submit_signup(pw, page, profile_input)
         self.log("회원가입을 완료했습니다.", "success")
         if email:
@@ -1044,37 +978,20 @@ class VelogPoster:
                     self.on_signup(email)
                 except Exception:  # noqa: BLE001
                     pass
-        self._sleep(_human_delay(1.5, 3.5))
+        self._sleep(_jitter(1.5, 0.8))
         return True, name
 
     def _submit_signup(self, pw, page: Page, profile_input) -> None:
-        """가입 버튼을 누른다.
+        """가입 버튼: 먼저 연결을 끊고 Turnstile 통과 후 잠깐 붙여 클릭한다.
 
-        Cloudflare Turnstile 은 CDP 연결 중에 실패하기 쉬우므로:
-          1) 연결을 끊고 인증이 통과되길 기다린다.
-          2) 잠깐 재연결해 '가입'이 활성화되면 **한 번만** 안정적으로 클릭한다.
-          3) 폼이 사라질 때까지 기다린다. (실패 시에만 재시도, 최대 5회)
-        가입 클릭에는 마우스 궤적 연출을 쓰지 않는다 — 제출 실패·무한 루프 원인이 됨.
+        CDP 가 붙은 채로 가입을 누르면 Cloudflare 가 실패하는 경우가 많다.
         """
-        join = self._visible_last(page.get_by_role("button", name="가입", exact=True))
-        if join is None:
-            # 화면 밖에 있을 수 있음 → 스크롤 후 다시 찾기
-            try:
-                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-                self._sleep(0.4)
-            except Error:
-                pass
-            join = self._visible_last(page.get_by_role("button", name="가입", exact=True))
-            if join is None:
-                join = page.get_by_role("button", name="가입", exact=True).first
-        if join is not None and self._enabled_within(join, 8):
-            try:
-                self._sleep(_jitter(0.4, 0.3))
-                self._stable_click(join)
-                if self._signup_form_gone(page, profile_input, seconds=12):
-                    return
-            except Error:
-                pass
+        # 화면 밖 버튼 대비 스크롤만 해 두고, 클릭은 연결 해제 뒤에 한다.
+        try:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            self._sleep(0.3)
+        except Error:
+            pass
 
         self.log("가입 인증(Cloudflare) 통과를 위해 연결을 잠시 해제합니다...", "info")
         if not self._endpoint:
@@ -1082,9 +999,9 @@ class VelogPoster:
         self._disconnect_only()
 
         clicks = 0
-        max_clicks = 5
+        max_clicks = 4
         logged_ready = False
-        for _ in range(90):  # 약 6분
+        for _ in range(90):
             if self._stop.wait(0):
                 raise PostingError("사용자가 작업을 중단했습니다.")
             browser = None
@@ -1095,9 +1012,8 @@ class VelogPoster:
                     continue
                 pf = p.get_by_placeholder("프로필 이름을 입력하세요")
                 if pf.count() == 0 or not pf.first.is_visible():
-                    return  # 폼 사라짐 = 가입 완료
+                    return
 
-                # 가입 버튼이 창 아래에 가려지지 않게 스크롤
                 try:
                     p.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
                 except Error:
@@ -1122,7 +1038,7 @@ class VelogPoster:
                 if not logged_ready:
                     self.log("가입 인증 통과 → 가입을 진행합니다.", "info")
                     logged_ready = True
-                self._sleep(_jitter(0.35, 0.25))
+                self._sleep(_jitter(0.3, 0.2))
                 self._stable_click(jb)
                 clicks += 1
                 if self._signup_form_gone(p, pf, seconds=10):
@@ -1254,28 +1170,32 @@ class VelogPoster:
             self._context.add_init_script(STEALTH_SCRIPT)
 
     def _check_agreement(self, page: Page) -> None:
-        """이용약관 동의 체크박스를 켠다.
-
-        체크박스는 체크마크 svg(path d^='M20.285 2')를 감싼 div 이고,
-        그 div 를 클릭하면 토글된다.
-        """
-        # 1) 체크마크 svg 를 가진 div 를 직접 클릭 (제출에 필수 → 안정 클릭)
-        try:
-            box_div = page.locator("div:has(> svg path[d^='M20.285 2'])").first
-            if box_div.count() > 0:
-                box_div.click(timeout=5_000)
-                return
-        except Error:
-            pass
-        # 2) 표준 체크박스 폴백
+        """이용약관 동의 체크박스를 켠다. 이미 체크된 경우 다시 눌러 해제하지 않는다."""
+        # 이미 체크됨
         try:
             cb = page.locator("input[type='checkbox']")
             if cb.count() > 0:
+                if cb.first.is_checked():
+                    return
                 cb.first.check(timeout=3_000)
                 return
         except Error:
             pass
-        # 3) '이용약관' 텍스트 왼쪽 좌표 클릭 폴백
+        # 체크마크 svg 를 가진 div
+        try:
+            box_div = page.locator("div:has(> svg path[d^='M20.285 2'])").first
+            if box_div.count() > 0:
+                # aria / data 로 이미 선택됐는지 추정
+                try:
+                    pressed = box_div.get_attribute("aria-checked") or box_div.get_attribute("data-checked")
+                    if str(pressed).lower() in {"true", "1", "checked"}:
+                        return
+                except Error:
+                    pass
+                box_div.click(timeout=5_000)
+                return
+        except Error:
+            pass
         try:
             link = page.get_by_text("이용약관", exact=False).first
             box = link.bounding_box()
@@ -1339,7 +1259,7 @@ class VelogPoster:
         )
 
         self.log("제목과 본문이 올바르게 입력되었습니다.", "info")
-        self._restore_user_focus()
+        # 포커스 복원은 이미지 등록 이후로 — Control+Home / 툴바 클릭이 먹히도록
         return target
 
     def _click_write_button(self, target: Page) -> None:
@@ -1599,14 +1519,27 @@ class VelogPoster:
         except Error:
             pass
 
-        image_button = target.locator(
-            "button:has(svg path[d^='M21 19V5'])"
-        ).first
-        try:
-            image_button.wait_for(state="visible", timeout=10_000)
-        except Error:
+        image_button = None
+        for sel in (
+            "button:has(svg path[d^='M21 19V5'])",
+            "button[aria-label*='이미지']",
+            "button[title*='이미지']",
+            "button:has-text('이미지')",
+        ):
+            loc = target.locator(sel)
+            try:
+                if loc.count() > 0 and loc.first.is_visible():
+                    image_button = loc.first
+                    break
+            except Error:
+                continue
+        if image_button is None:
             raise PostingError("본문 이미지 등록 버튼을 찾지 못했습니다.")
 
+        try:
+            image_button.scroll_into_view_if_needed(timeout=5_000)
+        except Error:
+            pass
         try:
             with target.expect_file_chooser(timeout=15_000) as fc:
                 image_button.click()

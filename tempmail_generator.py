@@ -303,26 +303,14 @@ class TempMailGenerator:
             pass
 
     def _click_like_human(self, page: Page, locator, *, timeout: int = 15_000) -> None:
+        """중요 UI는 Playwright 클릭 + 스크롤. (마우스 궤적 연출 제거)"""
+        del page
         target = locator.first if hasattr(locator, "first") else locator
+        self._scroll_into_view(target)
         try:
-            target.wait_for(state="visible", timeout=timeout)
+            target.click(timeout=timeout)
         except Error:
-            pass
-        try:
-            box = target.bounding_box()
-        except Error:
-            box = None
-        if box and box.get("width", 0) > 1 and box.get("height", 0) > 1:
-            try:
-                x = box["x"] + box["width"] * random.uniform(0.25, 0.75)
-                y = box["y"] + box["height"] * random.uniform(0.25, 0.75)
-                page.mouse.move(x, y, steps=random.randint(14, 32))
-                self._sleep(random.uniform(0.18, 0.7))
-                page.mouse.click(x, y, delay=random.randint(40, 140))
-                return
-            except Error:
-                pass
-        target.click(timeout=timeout)
+            target.click(timeout=timeout, force=True)
 
     def _goto(self, page: Page, url: str) -> None:
         last: Error | None = None
