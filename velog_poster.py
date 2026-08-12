@@ -552,8 +552,8 @@ class VelogPoster:
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
             "--remote-allow-origins=*",
-            f"--window-size={random.randint(1180, 1360)},{random.randint(760, 900)}",
-            f"--window-position={random.randint(40, 160)},{random.randint(40, 120)}",
+            f"--window-size=1500,1000",
+            f"--window-position={random.randint(20, 80)},{random.randint(20, 60)}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
@@ -683,9 +683,35 @@ class VelogPoster:
         page.mouse.move(x, y, steps=steps or random.randint(14, 32))
         return x, y
 
-    def _click_like_human(self, page: Page, locator, *, timeout: int = 15_000) -> None:
-        """마우스를 옮긴 뒤 짧게 머물렀다가 클릭 (즉시 locator.click 회피)."""
+    def _scroll_into_view(self, locator) -> None:
+        """화면 밖(작은 창)에 있는 버튼을 가운데로 스크롤한다."""
         target = locator.first if hasattr(locator, "first") else locator
+        try:
+            target.scroll_into_view_if_needed(timeout=5_000)
+        except Error:
+            try:
+                target.evaluate(
+                    "el => el.scrollIntoView({block:'center', inline:'nearest', behavior:'instant'})"
+                )
+            except Error:
+                pass
+        self._sleep(0.25)
+
+    def _stable_click(self, locator, *, timeout: int = 15_000) -> None:
+        """스크롤 후 Playwright 기본 클릭(가입/출간 등 중요 버튼용)."""
+        target = locator.first if hasattr(locator, "first") else locator
+        self._scroll_into_view(target)
+        try:
+            target.click(timeout=timeout)
+        except Error:
+            # 가려져 있으면 force 로 한 번 더
+            self._scroll_into_view(target)
+            target.click(timeout=timeout, force=True)
+
+    def _click_like_human(self, page: Page, locator, *, timeout: int = 15_000) -> None:
+        """마우스를 옮긴 뒤 짧게 머물렀다가 클릭. 실패 시 안정 클릭으로 폴백."""
+        target = locator.first if hasattr(locator, "first") else locator
+        self._scroll_into_view(target)
         try:
             target.wait_for(state="visible", timeout=timeout)
         except Error:
@@ -702,7 +728,7 @@ class VelogPoster:
                 return
             except Error:
                 pass
-        target.click(timeout=timeout)
+        self._stable_click(target, timeout=timeout)
 
     def _human_idle(self, page: Page | None = None, *, lo: float = 0.6, hi: float = 2.0) -> None:
         """필드를 채우기 전/후 짧게 멈추고, 가능하면 마우스를 조금 움직인다."""
@@ -1000,6 +1026,12 @@ class VelogPoster:
         self._sleep(_jitter(0.6, 0.4))
         self._check_agreement(page)
         self._sleep(_jitter(0.8, 0.5))
+        # 가입 버튼이 창 아래에 가려질 수 있어 미리 스크롤
+        try:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            self._sleep(0.4)
+        except Error:
+            pass
 
         # 가입 (Cloudflare 인증 대비 → 출간과 동일하게 연결 해제·재연결로 클릭)
         self._submit_signup(pw, page, profile_input)
@@ -1024,10 +1056,20 @@ class VelogPoster:
         가입 클릭에는 마우스 궤적 연출을 쓰지 않는다 — 제출 실패·무한 루프 원인이 됨.
         """
         join = self._visible_last(page.get_by_role("button", name="가입", exact=True))
+        if join is None:
+            # 화면 밖에 있을 수 있음 → 스크롤 후 다시 찾기
+            try:
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                self._sleep(0.4)
+            except Error:
+                pass
+            join = self._visible_last(page.get_by_role("button", name="가입", exact=True))
+            if join is None:
+                join = page.get_by_role("button", name="가입", exact=True).first
         if join is not None and self._enabled_within(join, 8):
             try:
                 self._sleep(_jitter(0.4, 0.3))
-                join.click(timeout=15_000)
+                self._stable_click(join)
                 if self._signup_form_gone(page, profile_input, seconds=12):
                     return
             except Error:
@@ -1054,13 +1096,24 @@ class VelogPoster:
                 if pf.count() == 0 or not pf.first.is_visible():
                     return  # 폼 사라짐 = 가입 완료
 
+                # 가입 버튼이 창 아래에 가려지지 않게 스크롤
+                try:
+                    p.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                except Error:
+                    pass
                 jb = self._visible_last(p.get_by_role("button", name="가입", exact=True))
+                if jb is None:
+                    try:
+                        cand = p.get_by_role("button", name="가입", exact=True)
+                        if cand.count() > 0:
+                            jb = cand.first
+                    except Error:
+                        jb = None
                 if jb is None or self._is_disabled(jb):
                     logged_ready = False
                     continue
 
                 if clicks >= max_clicks:
-                    # 더 이상 누르지 않고 폼이 사라지기만 기다린다.
                     if self._signup_form_gone(p, pf, seconds=2):
                         return
                     continue
@@ -1069,12 +1122,10 @@ class VelogPoster:
                     self.log("가입 인증 통과 → 가입을 진행합니다.", "info")
                     logged_ready = True
                 self._sleep(_jitter(0.35, 0.25))
-                jb.click(timeout=15_000)
+                self._stable_click(jb)
                 clicks += 1
-                # 클릭 직후 연결을 유지한 채 폼 소멸을 확인 (재클릭 스팸 방지)
                 if self._signup_form_gone(p, pf, seconds=10):
                     return
-                # 아직 폼이 있으면 Turnstile 재검증을 위해 끊고 대기
                 logged_ready = False
             except (Error, PWTimeoutError):
                 pass
