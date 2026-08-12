@@ -446,18 +446,16 @@ def extract_zip_to_staging(zip_path: Path, staging_dir: Path) -> Path:
 
 
 def _write_update_script(script_path: Path) -> None:
-    # 일반 문자열(비 f-string) — PowerShell 중괄호를 그대로 둔다.
+    """경로 인자는 JSON 설정 파일에서 읽는다(한글/공백 경로·프로세스 분리에 안전)."""
     preserve = ", ".join(f'"{name}"' for name in sorted(_PRESERVE_FILES))
+    # UTF-8 BOM 으로 저장해야 Windows PowerShell 5.1 이 한글을 깨지 않는다.
     script = r"""param(
-    [string]$Staging,
-    [string]$Install,
-    [string]$Exe,
-    [string]$Inner,
-    [int]$WaitPid
+    [Parameter(Mandatory=$true)][string]$ConfigPath
 )
 $ErrorActionPreference = "Continue"
-$Log = Join-Path $env:TEMP "VelogPoster_update.log"
 $Preserve = @(__PRESERVE__)
+# 기본값(폴백). config.log 가 있으면 그 절대 경로를 쓴다.
+$Log = Join-Path $env:TEMP "VelogPoster_update.log"
 
 function Write-Log([string]$Message) {
     try {
@@ -465,11 +463,37 @@ function Write-Log([string]$Message) {
     } catch {}
 }
 
+if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    Write-Log "config missing"
+    exit 1
+}
+try {
+    $cfg = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+} catch {
+    Write-Log ("config parse error: " + $_)
+    exit 1
+}
+
+# Python 과 TEMP 폴더가 달라도 같은 로그를 쓰도록 절대 경로를 강제한다.
+if ($cfg.log) { $Log = [string]$cfg.log }
+
 Write-Log "update start (powershell)"
+Write-Log ("ConfigPath=" + $ConfigPath)
+
+$Staging = [string]$cfg.staging
+$Install = [string]$cfg.install
+$Exe = [string]$cfg.exe
+$Inner = [string]$cfg.inner
+$WaitPid = 0
+try { $WaitPid = [int]$cfg.wait_pid } catch { $WaitPid = 0 }
+$Marker = [string]$cfg.marker
+
 Write-Log ("Staging=" + $Staging)
 Write-Log ("Install=" + $Install)
 Write-Log ("Exe=" + $Exe)
+Write-Log ("Inner=" + $Inner)
 Write-Log ("WaitPid=" + $WaitPid)
+Write-Log ("Log=" + $Log)
 
 if ($WaitPid -gt 0) {
     $deadline = (Get-Date).AddSeconds(120)
@@ -484,13 +508,17 @@ if ($WaitPid -gt 0) {
         Start-Sleep -Seconds 2
     }
 }
-# 설치 폴더의 exe가 아직 잠겨 있으면 조금 더 기다린다.
+
+# 같은 설치 경로의 exe만 종료 (다른 폴더의 VelogPoster 는 건드리지 않음)
 $exeName = [System.IO.Path]::GetFileNameWithoutExtension($Exe)
-$deadline2 = (Get-Date).AddSeconds(30)
-while ((Get-Date) -lt $deadline2) {
-    $running = Get-Process -Name $exeName -ErrorAction SilentlyContinue
-    if (-not $running) { break }
-    Start-Sleep -Seconds 1
+Get-Process -Name $exeName -ErrorAction SilentlyContinue | ForEach-Object {
+    try {
+        $p = $_.Path
+        if ($p -and ($p -ieq $Exe)) {
+            Write-Log ("stop install exe pid " + $_.Id)
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
 }
 Write-Log "process wait done"
 Start-Sleep -Seconds 2
@@ -508,17 +536,18 @@ foreach ($name in $Preserve) {
     $xfArgs += $name
 }
 if ($xfArgs.Count -gt 0) {
-    & robocopy $src $Install /E /IS /IT /XF @xfArgs /R:8 /W:3 /NFL /NDL /NJH /NJS | Out-Null
+    & robocopy $src $Install /E /IS /IT /XF @xfArgs /R:10 /W:2 /NFL /NDL /NJH /NJS | Out-Null
 } else {
-    & robocopy $src $Install /E /IS /IT /R:8 /W:3 /NFL /NDL /NJH /NJS | Out-Null
+    & robocopy $src $Install /E /IS /IT /R:10 /W:2 /NFL /NDL /NJH /NJS | Out-Null
 }
-Write-Log ("robocopy code " + $LASTEXITCODE)
-if ($LASTEXITCODE -ge 8) {
-    Write-Log ("robocopy failed code " + $LASTEXITCODE)
+$rc = $LASTEXITCODE
+Write-Log ("robocopy code " + $rc)
+if ($rc -ge 8) {
+    Write-Log ("robocopy failed code " + $rc)
     try {
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.MessageBox]::Show(
-            ("업데이트 복사 실패 (코드 " + $LASTEXITCODE + "). 로그: " + $Log),
+            ("업데이트 복사 실패 (코드 " + $rc + "). 로그: " + $Log),
             "VelogPoster",
             "OK",
             "Error"
@@ -527,18 +556,85 @@ if ($LASTEXITCODE -ge 8) {
     exit 1
 }
 
-Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
-Write-Log ("starting " + $Exe)
-if (Test-Path -LiteralPath $Exe) {
-    Start-Process -FilePath $Exe -WorkingDirectory $Install
-} else {
-    Write-Log ("exe missing: " + $Exe)
+if (-not (Test-Path -LiteralPath $Exe)) {
+    Write-Log ("exe missing after copy: " + $Exe)
+    exit 1
 }
+
+if ($Marker) {
+    try {
+        Set-Content -LiteralPath $Marker -Value ("ok " + (Get-Date -Format "o")) -Encoding UTF8
+        Write-Log ("marker written " + $Marker)
+    } catch {
+        Write-Log ("marker write failed: " + $_)
+    }
+}
+
+Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $ConfigPath -Force -ErrorAction SilentlyContinue
+Write-Log ("starting " + $Exe)
+Start-Process -FilePath $Exe -WorkingDirectory $Install
 Write-Log "update success"
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 exit 0
 """
-    script_path.write_text(script.replace("__PRESERVE__", preserve), encoding="utf-8")
+    script_path.write_text(
+        script.replace("__PRESERVE__", preserve),
+        encoding="utf-8-sig",
+    )
+
+
+def _write_vbs_launcher(vbs_path: Path, ps1_path: Path, config_path: Path) -> None:
+    """부모 프로세스가 죽어도 살아남는 WScript 런처."""
+    # VBScript 문자열은 "" 로 이스케이프
+    def q(value: str) -> str:
+        return value.replace('"', '""')
+
+    ps1 = q(str(ps1_path))
+    cfg = q(str(config_path))
+    # powershell 은 -File 로 ps1 만 받고, 경로는 -ConfigPath 로 전달
+    cmd = (
+        f'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
+        f'-File "{ps1}" -ConfigPath "{cfg}"'
+    )
+    vbs = (
+        'Set sh = CreateObject("WScript.Shell")\r\n'
+        f'sh.Run "{q(cmd)}", 0, False\r\n'
+    )
+    # WScript 는 기본적으로 시스템 ANSI 코드페이지를 쓰므로 ASCII 만 사용
+    # (경로는 이미 따옴표 안에 있고, TEMP 경로는 보통 ASCII)
+    vbs_path.write_bytes(vbs.encode("ascii", errors="strict"))
+
+
+def _append_log(message: str) -> None:
+    try:
+        path = get_update_log_path()
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except OSError:
+        pass
+
+
+def wait_for_updater_started(*, after_token: str = "", timeout: float = 12.0) -> bool:
+    """설치 스크립트가 실제로 떠서 로그에 'update start' 를 남겼는지 확인."""
+    log_path = get_update_log_path()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if log_path.is_file():
+                text = log_path.read_text(encoding="utf-8", errors="ignore")
+                if after_token:
+                    idx = text.rfind(after_token)
+                    if idx < 0:
+                        time.sleep(0.25)
+                        continue
+                    text = text[idx + len(after_token) :]
+                if "update start" in text:
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.25)
+    return False
 
 
 def schedule_apply_update(
@@ -548,8 +644,16 @@ def schedule_apply_update(
     exe_name: str,
     zip_inner_folder: str | None = None,
     app_slug: str = "app",
-) -> None:
-    if not can_auto_update():
+    wait_pid: int | None = None,
+    require_frozen: bool = True,
+    verify_started: bool = True,
+) -> Path:
+    """zip 을 풀고 완전 분리된 설치 프로세스를 시작한다.
+
+    Returns:
+        성공 마커 파일 경로 (설치 완료 시 생성됨)
+    """
+    if require_frozen and not can_auto_update():
         raise RuntimeError("Auto-update works only in packaged exe builds.")
 
     validate_zip_file(zip_path)
@@ -557,7 +661,14 @@ def schedule_apply_update(
     target_dir = install_dir or get_install_dir()
     inner = zip_inner_folder or target_dir.name
     exe_path = target_dir / exe_name
-    staging_dir = Path(tempfile.gettempdir()) / f"VelogPoster_staging_{os.getpid()}"
+    pid = os.getpid() if wait_pid is None else int(wait_pid)
+    stamp = f"{pid}_{int(time.time())}"
+    temp = Path(tempfile.gettempdir())
+    staging_dir = temp / f"VelogPoster_staging_{stamp}"
+    script_path = temp / f"{app_slug}_update_{stamp}.ps1"
+    config_path = temp / f"{app_slug}_update_{stamp}.json"
+    vbs_path = temp / f"{app_slug}_update_{stamp}.vbs"
+    marker_path = temp / f"VelogPoster_update_ok_{stamp}.txt"
 
     try:
         extract_zip_to_staging(zip_path, staging_dir)
@@ -565,28 +676,57 @@ def schedule_apply_update(
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise RuntimeError(f"업데이트 zip 풀기 실패: {exc}") from exc
 
-    script_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.ps1"
-    _write_update_script(script_path)
-
-    log_path = get_update_log_path()
-    try:
-        log_path.write_text(
-            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] launcher ready pid={os.getpid()}\n"
-            f"script={script_path}\ninstall={target_dir}\n",
-            encoding="utf-8",
+    # 스테이징에 exe 가 있는지 미리 확인
+    staged_exe = staging_dir / inner / exe_name
+    if not staged_exe.is_file():
+        staged_exe = staging_dir / exe_name
+    if not staged_exe.is_file():
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"업데이트 zip 안에 {exe_name} 이 없습니다. (inner={inner})"
         )
-    except OSError:
-        pass
+
+    config = {
+        "staging": str(staging_dir),
+        "install": str(target_dir),
+        "exe": str(exe_path),
+        "inner": inner,
+        "wait_pid": pid,
+        "marker": str(marker_path),
+        "log": str(get_update_log_path()),
+    }
+    config_path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    _write_update_script(script_path)
+    _write_vbs_launcher(vbs_path, script_path, config_path)
+
+    _append_log(f"launcher ready pid={os.getpid()} wait_pid={pid}")
+    _append_log(f"script={script_path}")
+    _append_log(f"config={config_path}")
+    _append_log(f"vbs={vbs_path}")
+    _append_log(f"install={target_dir}")
+
+    start_token = f"--- launching installer {stamp} ---"
+    _append_log(start_token)
+
+    creationflags = 0
+    creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    # Job Object 에 묶여 있으면 부모 종료 시 자식이 같이 죽는다 → 탈출
+    creationflags |= 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
 
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = 0
-    # 앱이 종료돼도 설치 스크립트가 같이 죽지 않도록 새 프로세스 그룹으로 분리한다.
-    creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    detached = getattr(subprocess, "DETACHED_PROCESS", 0)
-    if detached:
-        creationflags |= detached
-    proc = subprocess.Popen(
+
+    # 1순위: wscript (부모와 완전 분리)
+    launched = False
+    last_error = ""
+    for command in (
+        ["wscript.exe", "//B", "//Nologo", str(vbs_path)],
         [
             "powershell.exe",
             "-NoProfile",
@@ -596,27 +736,46 @@ def schedule_apply_update(
             "Hidden",
             "-File",
             str(script_path),
-            str(staging_dir),
-            str(target_dir),
-            str(exe_path),
-            inner,
-            str(os.getpid()),
+            "-ConfigPath",
+            str(config_path),
         ],
-        startupinfo=startupinfo,
-        creationflags=creationflags,
-        close_fds=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        log_path = get_update_log_path()
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] spawned updater pid={proc.pid}\n")
-    except OSError:
-        pass
+    ):
+        try:
+            proc = subprocess.Popen(
+                command,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+                close_fds=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=str(temp),
+            )
+            _append_log(f"spawned {' '.join(command[:2])} pid={proc.pid}")
+            time.sleep(0.4)
+            if proc.poll() is not None and proc.returncode not in (0, None):
+                last_error = f"exit={proc.returncode}"
+                _append_log(f"launcher exited early: {last_error}")
+                continue
+            launched = True
+            break
+        except OSError as exc:
+            last_error = str(exc)
+            _append_log(f"spawn failed: {exc}")
+            continue
+
+    if not launched:
+        raise RuntimeError(f"업데이트 설치 프로세스를 시작하지 못했습니다: {last_error}")
+
+    if verify_started and not wait_for_updater_started(after_token=start_token, timeout=15.0):
+        raise RuntimeError(
+            "업데이트 설치 스크립트가 시작되지 않았습니다.\n"
+            f"로그를 확인해 주세요: {get_update_log_path()}"
+        )
 
     try:
         zip_path.unlink(missing_ok=True)
     except OSError:
         pass
+
+    return marker_path

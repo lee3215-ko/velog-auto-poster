@@ -236,32 +236,42 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
 
         def finish() -> None:
             try:
-                status.configure(text="설치 중... 잠시 후 다시 실행됩니다.")
+                status.configure(text="설치 스크립트 시작 중...")
                 dialog.update_idletasks()
                 schedule_apply_update(
                     zip_path,
                     exe_name=exe_name,
                     zip_inner_folder=zip_inner_folder,
                     app_slug=app_name,
+                    verify_started=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror(
                     "업데이트 실패",
-                    f"{exc}\n\n로그: {log_path}",
+                    f"{exc}\n\n로그: {log_path}\n\n"
+                    "자동 설치가 시작되지 않았습니다. 앱은 종료하지 않습니다.\n"
+                    "브라우저에서 zip을 받아 설치 폴더에 덮어써 주세요.",
                     parent=root,
                 )
                 try:
                     dialog.destroy()
                 except Exception:  # noqa: BLE001
                     pass
+                if info.url:
+                    webbrowser.open(info.url)
                 return
 
+            try:
+                status.configure(text="설치 중... 앱을 종료합니다.")
+                dialog.update_idletasks()
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 dialog.destroy()
             except Exception:  # noqa: BLE001
                 pass
-            # 설치 스크립트가 먼저 뜨도록 잠시 기다린 뒤 강제 종료한다.
-            time.sleep(2.0)
+            # 설치 스크립트가 WaitPid 를 감지할 시간을 준다.
+            time.sleep(1.0)
             os._exit(0)
 
         root.after(0, finish)
