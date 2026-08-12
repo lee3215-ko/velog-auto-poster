@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.28",
-    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511417313",
-    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.28/VelogPoster.zip",
-    "notes":  "봇탐지 유발 humanization 롤백 — stealth/입력/클릭 단순화, 가입은 CDP 해제 후 클릭, 이미지 버튼·포커스 수정",
+    "version":  "1.0.29",
+    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.29/VelogPoster.zip",
+    "notes":  "Cloudflare Turnstile: 출간/가입을 1.0.19~1.0.23 방식 복구 — 패널 연 직후 CDP 유지 제거",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511417313",
-                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.28/VelogPoster.zip",
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.29/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ],
-    "asset_id":  511417313,
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511417313"
+                      ]
 }

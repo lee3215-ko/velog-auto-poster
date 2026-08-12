@@ -982,68 +982,42 @@ class VelogPoster:
         return True, name
 
     def _submit_signup(self, pw, page: Page, profile_input) -> None:
-        """가입 버튼: 먼저 연결을 끊고 Turnstile 통과 후 잠깐 붙여 클릭한다.
+        """가입 버튼을 누른다. 버튼이 곧바로 활성화돼 있으면 바로 클릭하고,
+        Cloudflare 로 비활성/실패면 연결을 끊어 깨끗한 상태에서 인증을 통과시킨
+        뒤 재연결하여 클릭한다. (출간 단계와 같은 방식)"""
+        join = self._visible_last(page.get_by_role("button", name="가입", exact=True))
+        # 1) 빠르게 활성화돼 있으면 바로 클릭
+        if join is not None and self._enabled_within(join, 6):
+            self._sleep(_jitter(0.4, 0.3))
+            try:
+                join.click(timeout=15_000)
+                if self._signup_form_gone(page, profile_input):
+                    return
+            except Error:
+                pass
 
-        CDP 가 붙은 채로 가입을 누르면 Cloudflare 가 실패하는 경우가 많다.
-        """
-        # 화면 밖 버튼 대비 스크롤만 해 두고, 클릭은 연결 해제 뒤에 한다.
-        try:
-            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            self._sleep(0.3)
-        except Error:
-            pass
-
+        # 2) Cloudflare 차단 가능성 → 연결 해제 후 재연결-감시로 클릭
         self.log("가입 인증(Cloudflare) 통과를 위해 연결을 잠시 해제합니다...", "info")
         if not self._endpoint:
             raise PostingError("가입 인증을 진행할 수 없습니다.")
         self._disconnect_only()
-
-        clicks = 0
-        max_clicks = 4
-        logged_ready = False
-        for _ in range(90):
+        for _ in range(80):  # 약 4분
             if self._stop.wait(0):
                 raise PostingError("사용자가 작업을 중단했습니다.")
             browser = None
             try:
                 browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
                 p = self._find_velog_page(browser)
-                if p is None:
-                    continue
-                pf = p.get_by_placeholder("프로필 이름을 입력하세요")
-                if pf.count() == 0 or not pf.first.is_visible():
-                    return
-
-                try:
-                    p.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-                except Error:
-                    pass
-                jb = self._visible_last(p.get_by_role("button", name="가입", exact=True))
-                if jb is None:
-                    try:
-                        cand = p.get_by_role("button", name="가입", exact=True)
-                        if cand.count() > 0:
-                            jb = cand.first
-                    except Error:
-                        jb = None
-                if jb is None or self._is_disabled(jb):
-                    logged_ready = False
-                    continue
-
-                if clicks >= max_clicks:
-                    if self._signup_form_gone(p, pf, seconds=2):
-                        return
-                    continue
-
-                if not logged_ready:
-                    self.log("가입 인증 통과 → 가입을 진행합니다.", "info")
-                    logged_ready = True
-                self._sleep(_jitter(0.3, 0.2))
-                self._stable_click(jb)
-                clicks += 1
-                if self._signup_form_gone(p, pf, seconds=10):
-                    return
-                logged_ready = False
+                if p is not None:
+                    pf = p.get_by_placeholder("프로필 이름을 입력하세요")
+                    if pf.count() == 0 or not pf.first.is_visible():
+                        return  # 폼이 사라짐 = 가입 완료
+                    jb = self._visible_last(p.get_by_role("button", name="가입", exact=True))
+                    if jb is not None and not self._is_disabled(jb):
+                        self.log("가입 인증 통과 → 가입을 진행합니다.", "info")
+                        self._sleep(_jitter(0.4, 0.3))
+                        jb.click(timeout=15_000)
+                        self._sleep(2)
             except (Error, PWTimeoutError):
                 pass
             finally:
@@ -1053,7 +1027,6 @@ class VelogPoster:
                     except Error:
                         pass
             self._sleep(3)
-
         raise PostingError("가입 인증을 시간 내에 통과하지 못했습니다.")
 
     @staticmethod
@@ -1071,10 +1044,8 @@ class VelogPoster:
             self._sleep(1)
         return not self._is_disabled(locator)
 
-    def _signup_form_gone(self, page: Page, profile_input, *, seconds: float = 15) -> bool:
-        """가입 폼(프로필 이름 입력란)이 사라졌는지 최대 seconds 초 동안 확인."""
-        steps = max(1, int(seconds))
-        for _ in range(steps):
+    def _signup_form_gone(self, page: Page, profile_input) -> bool:
+        for _ in range(15):
             if self._stop.wait(1):
                 raise PostingError("사용자가 작업을 중단했습니다.")
             try:
@@ -1709,9 +1680,6 @@ class VelogPoster:
                             self._sleep(_jitter(0.4, 0.3))
                             first.click(timeout=15_000)
                             panel_opened = True
-                            self._sleep(1.2)
-                            if self._has_publish_fail_toast(page):
-                                raise self._publish_fail_error()
                         # 클릭 직후 곧바로 연결을 끊어(아래 finally),
                         # 인증이 깨끗한 상태에서 검증되도록 한다.
                     else:
@@ -1731,9 +1699,6 @@ class VelogPoster:
                             self._sleep(_jitter(0.4, 0.3))
                             final.first.click(timeout=15_000)
                             clicked_publish = True
-                            self._sleep(1.0)
-                            if self._has_publish_fail_toast(page):
-                                raise self._publish_fail_error()
                     # else: 패널은 열렸지만 아직 인증 미통과 → 끊고 대기.
             except PostingError:
                 raise
@@ -1761,6 +1726,8 @@ class VelogPoster:
         return None
 
     @staticmethod
+
+
     def _is_post_url(url: str) -> bool:
         """발행된 게시글 주소(velog.io/@아이디/제목)인지 판별."""
         return "velog.io/@" in url and "/write" not in url
