@@ -1,10 +1,13 @@
 {
     "version":  "1.0.28",
-    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511417313",
     "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.28/VelogPoster.zip",
     "notes":  "봇탐지 유발 humanization 롤백 — stealth/입력/클릭 단순화, 가입은 CDP 해제 후 클릭, 이미지 버튼·포커스 수정",
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511417313",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.28/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ]
+                      ],
+    "asset_id":  511417313,
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511417313"
 }
