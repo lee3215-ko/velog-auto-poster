@@ -1,10 +1,13 @@
 {
     "version":  "1.0.21",
-    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511216970",
     "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.21/VelogPoster.zip",
     "notes":  "재가입·잠김 계정 즉시 삭제, 실패 원고는 발행완료로 이동하지 않음, 포스트 작성 실패 토스트 감지",
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511216970",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.21/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ]
+                      ],
+    "asset_id":  511216970,
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511216970"
 }
