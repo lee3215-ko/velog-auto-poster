@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import queue
+import random
 import re
 import sys
 import threading
@@ -34,7 +35,6 @@ from velog_poster import (
     read_manuscript,
     relocate_manuscript,
     MANUSCRIPT_DONE_DIR,
-    MANUSCRIPT_FAILED_DIR,
 )
 
 
@@ -64,6 +64,7 @@ NAV_HOVER_BG = "#e2e8f0"
 ACCOUNT_KEYS = (
     "velog_id", "inbox_url", "manuscript_path",
     "published_url", "published_at", "created_at", "mail_mismatch",
+    "fail_count",
 )
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 MANUSCRIPT_EXTS = {".txt", ".html", ".htm", ".md"}
@@ -832,6 +833,7 @@ class VelogApp(tk.Tk):
             ("이름 변경", self._rename_tab),
             ("탭 삭제", self._delete_tab),
             ("원고 일괄 지정", self._bulk_assign_manuscripts),
+            ("성공 목록 보기", self._show_published_list),
         ):
             ttk.Button(btns, text=text, style="Pick.TButton", command=cmd).pack(
                 side="left", padx=(0, 6),
@@ -1628,6 +1630,7 @@ class VelogApp(tk.Tk):
         files = self._list_available_manuscripts(folder)
         if not files:
             return 0
+        random.shuffle(files)
         targets = [
             acc for acc in tab["accounts"]
             if self._is_eligible_for_assign(acc) and not str(acc.get("manuscript_path", "")).strip()
@@ -1637,6 +1640,132 @@ class VelogApp(tk.Tk):
             acc["manuscript_path"] = str(path)
             assigned += 1
         return assigned
+
+    def _show_published_list(self) -> None:
+        """버튼을 누른 시점의 발행 성공 계정을 새 창에 보여 준다."""
+        rows: list[dict[str, str]] = []
+        for tab in self.tabs:
+            for acc in tab["accounts"]:
+                url = str(acc.get("published_url", "")).strip()
+                if not url:
+                    continue
+                rows.append({
+                    "tab": str(tab.get("title", "")),
+                    "velog_id": str(acc.get("velog_id", "")),
+                    "inbox_url": str(acc.get("inbox_url", "")),
+                    "manuscript": Path(acc["manuscript_path"]).name if acc.get("manuscript_path") else "—",
+                    "published_at": str(acc.get("published_at", "")),
+                    "published_url": url,
+                })
+        if not rows:
+            messagebox.showinfo("성공 목록", "현재 발행에 성공한 계정이 없습니다.", parent=self)
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"발행 성공 목록 · {len(rows)}개")
+        win.configure(bg=BG)
+        win.geometry("1100x560")
+        win.minsize(800, 400)
+        win.transient(self)
+
+        wrap = ttk.Frame(win, style="Bg.TFrame", padding=14)
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(
+            wrap,
+            text=f"버튼을 누른 시점의 발행 성공 계정 {len(rows)}개 · 행 더블클릭 시 발행 URL 열기",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+
+        tree_wrap = ttk.Frame(wrap, style="CardBorder.TFrame")
+        tree_wrap.pack(fill="both", expand=True)
+        inner = ttk.Frame(tree_wrap, style="Card.TFrame", padding=6)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        inner.rowconfigure(0, weight=1)
+        inner.columnconfigure(0, weight=1)
+
+        tree = ttk.Treeview(
+            inner,
+            columns=("no", "tab", "id", "inbox", "manuscript", "published_at", "result"),
+            show="headings",
+            selectmode="extended",
+        )
+        tree.heading("no", text="#")
+        tree.heading("tab", text="탭")
+        tree.heading("id", text="아이디")
+        tree.heading("inbox", text="인증 메일함")
+        tree.heading("manuscript", text="원고")
+        tree.heading("published_at", text="발행 시각")
+        tree.heading("result", text="발행 URL")
+        tree.column("no", width=44, stretch=False, anchor="center")
+        tree.column("tab", width=90, stretch=False)
+        tree.column("id", width=180, stretch=False)
+        tree.column("inbox", width=220, stretch=True, minwidth=140)
+        tree.column("manuscript", width=160, stretch=True, minwidth=100)
+        tree.column("published_at", width=140, stretch=False)
+        tree.column("result", width=280, stretch=True, minwidth=160)
+        tree.tag_configure("done", background=DONE_BG, foreground=DONE_FG)
+        tree.tag_configure("even", background="#ffffff")
+        tree.tag_configure("odd", background="#f4f7fb")
+        tree.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(inner, orient="vertical", command=tree.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        hsb = ttk.Scrollbar(inner, orient="horizontal", command=tree.xview)
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
+
+        for index, row in enumerate(rows):
+            at = row["published_at"]
+            parsed = self._parse_time(at)
+            at_disp = parsed.strftime("%Y-%m-%d %H:%M") if parsed is not None else at
+            tags = ("done", "even" if index % 2 == 0 else "odd")
+            tree.insert(
+                "", "end", iid=str(index), tags=tags,
+                values=(
+                    index + 1,
+                    row["tab"],
+                    row["velog_id"],
+                    row["inbox_url"],
+                    row["manuscript"],
+                    at_disp,
+                    row["published_url"],
+                ),
+            )
+
+        def open_url(event=None) -> str:
+            row_id = tree.identify_row(event.y) if event is not None else ""
+            if not row_id:
+                sel = tree.selection()
+                row_id = sel[0] if sel else ""
+            if not row_id:
+                return "break"
+            idx = int(row_id)
+            if 0 <= idx < len(rows):
+                url = rows[idx].get("published_url", "")
+                if url:
+                    webbrowser.open(url)
+            return "break"
+
+        def copy_urls(_event=None) -> str:
+            urls = [
+                rows[int(iid)].get("published_url", "")
+                for iid in tree.selection()
+                if rows[int(iid)].get("published_url")
+            ]
+            if urls:
+                win.clipboard_clear()
+                win.clipboard_append("\n".join(urls))
+            return "break"
+
+        tree.bind("<Double-1>", open_url)
+        tree.bind("<Control-c>", copy_urls)
+        tree.bind("<Control-C>", copy_urls)
+
+        btn_row = ttk.Frame(wrap, style="Bg.TFrame")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(btn_row, text="닫기", style="Ghost.TButton", command=win.destroy).pack(side="right")
+        ttk.Button(btn_row, text="선택 URL 복사", style="Pick.TButton", command=copy_urls).pack(
+            side="right", padx=(0, 8),
+        )
 
     def _tick_gauges(self) -> None:
         removed = self._purge_expired_accounts()
@@ -1710,7 +1839,7 @@ class VelogApp(tk.Tk):
                 messagebox.showinfo(
                     "원고 없음",
                     "원고 폴더에 배정할 원고가 없습니다.\n"
-                    "(이미 배정됐거나 발행완료/실패로 이동한 파일은 제외됩니다)",
+                    "(이미 배정됐거나 발행완료로 이동한 파일은 제외됩니다)",
                     parent=self,
                 )
             else:
@@ -1767,8 +1896,8 @@ class VelogApp(tk.Tk):
     def _on_result(self, velog_id: str, url: str) -> None:
         self._events.put((f"{velog_id}\t{url}", "result"))
 
-    def _on_failed(self, velog_id: str, manuscript_path: str) -> None:
-        self._events.put((f"{velog_id}\t{manuscript_path}", "failed"))
+    def _on_failed(self, velog_id: str, manuscript_path: str, reason: str = "") -> None:
+        self._events.put((f"{velog_id}\t{manuscript_path}\t{reason}", "failed"))
 
     def _add_anchor(self) -> None:
         text = self.anchor_text.get().strip()
@@ -1902,8 +2031,9 @@ class VelogApp(tk.Tk):
                     self._mark_published(velog_id, url)
                     continue
                 if level == "failed":
-                    velog_id, _, manuscript_path = message.partition("\t")
-                    self._mark_failed(velog_id, manuscript_path)
+                    velog_id, _, rest = message.partition("\t")
+                    manuscript_path, _, reason = rest.partition("\t")
+                    self._mark_failed(velog_id, manuscript_path, reason)
                     continue
                 self.status.set(message)
                 tag = "success" if level == "success" else ("error" if level == "error" else "info")
@@ -1931,39 +2061,71 @@ class VelogApp(tk.Tk):
             return
         target["published_url"] = url
         target["published_at"] = datetime.now().isoformat(timespec="seconds")
+        target["fail_count"] = "0"
         self._relocate_manuscript(target, success=True)
         self._fill_tree(tab)
         self._update_summary()
         self._save_settings()
         self._append(f"{velog_id} 발행됨: {url}", "success")
 
-    def _mark_failed(self, velog_id: str, manuscript_path: str) -> None:
+    def _mark_failed(self, velog_id: str, manuscript_path: str, reason: str = "") -> None:
         tab = self._active_tab or self._current_tab()
         if tab is None:
             return
+        target: dict | None = None
         for acc in tab["accounts"]:
             if acc.get("velog_id") != velog_id:
                 continue
-            if manuscript_path and acc.get("manuscript_path", "") != manuscript_path:
-                continue
-            self._relocate_manuscript(acc, success=False)
-            break
+            if manuscript_path and acc.get("manuscript_path", "") == manuscript_path:
+                target = acc
+                break
+            if target is None:
+                target = acc
+        if target is None:
+            return
+
+        # 실패 원고는 폴더에 그대로 두고, 계정만 실패 횟수를 갱신한다.
+        kind = (reason or "").strip().lower()
+        if kind in {"login", "publish"}:
+            try:
+                fails = int(str(target.get("fail_count", "0") or "0").strip() or "0")
+            except ValueError:
+                fails = 0
+            fails += 1
+            target["fail_count"] = str(fails)
+            label = "로그인 실패" if kind == "login" else "출간 실패"
+            if fails >= 2:
+                tab["accounts"] = [a for a in tab["accounts"] if a is not target]
+                self._append(
+                    f"{velog_id} {label} 2회 → 목록에서 삭제했습니다. (원고 파일은 폴더에 유지)",
+                    "error",
+                )
+            else:
+                self._append(
+                    f"{velog_id} {label} (1/2) — 원고는 폴더에 그대로 둡니다. "
+                    "한 번 더 실패하면 목록에서 삭제합니다.",
+                    "error",
+                )
+        else:
+            self._append(
+                f"{velog_id} 발행 실패 — 원고 파일은 폴더에 그대로 둡니다.",
+                "error",
+            )
         self._fill_tree(tab)
+        self._update_summary()
         self._save_settings()
-        self._append(f"{velog_id} 발행 실패 — 원고를 {MANUSCRIPT_FAILED_DIR} 폴더로 옮겼습니다.", "error")
 
     def _relocate_manuscript(self, acc: dict, *, success: bool) -> None:
+        """성공한 원고만 발행완료 폴더로 옮긴다. 실패 시에는 이동하지 않는다."""
+        if not success:
+            return
         path = str(acc.get("manuscript_path", "")).strip()
         if not path:
             return
-        folder = MANUSCRIPT_DONE_DIR if success else MANUSCRIPT_FAILED_DIR
         try:
-            new_path = relocate_manuscript(path, success=success)
-            if success:
-                acc["manuscript_path"] = ""
-            else:
-                acc["manuscript_path"] = new_path
-            self._append(f"원고 이동 → {folder}/{Path(new_path).name}", "info")
+            new_path = relocate_manuscript(path, success=True)
+            acc["manuscript_path"] = ""
+            self._append(f"원고 이동 → {MANUSCRIPT_DONE_DIR}/{Path(new_path).name}", "info")
             self._update_manuscript_section_label()
         except (PostingError, OSError) as exc:
             self._append(f"원고 이동 실패 ({Path(path).name}): {exc}", "error")

@@ -1,13 +1,10 @@
 {
-  "version": "1.0.17",
-  "url": "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/508506986",
-  "download_url": "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.17/VelogPoster.zip",
-  "api_download_url": "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/508506986",
-  "asset_id": 508506986,
-  "download_urls": [
-    "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/508506986",
-    "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.17/VelogPoster.zip",
-    "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-  ],
-  "notes": "자동 업데이트 설치/재실행 수정 (다운로드 후 파일 교체·재시작 안정화)"
+    "version":  "1.0.18",
+    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.18/VelogPoster.zip",
+    "notes":  "실패 원고 유지/랜덤 배정/성공목록, 클립보드 미사용 직접입력, Chrome 포커스 방해 완화",
+    "download_urls":  [
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.18/VelogPoster.zip",
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
+                      ]
 }

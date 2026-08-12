@@ -4,7 +4,7 @@
 - 사용자의 실제 Google Chrome을 '시크릿 모드'로 직접 실행한 뒤 CDP로 연결한다.
   (Playwright 번들 크로미움이 아닌 실제 Chrome을 쓰므로 핑거프린트가 자연스럽다.)
 - navigator.webdriver 등 자동화 흔적을 init script 로 제거한다.
-- 입력은 실제 키 이벤트 / 클립보드 붙여넣기로 처리해 사람과 구분되지 않게 한다.
+- 제목/본문/태그는 시스템 클립보드를 쓰지 않고 직접 입력한다.
 - 모든 대기/입력 사이에 무작위 지터를 둔다.
 """
 
@@ -17,6 +17,7 @@ import shutil
 import socket
 import string
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -53,6 +54,27 @@ Object.defineProperty(navigator, 'webdriver', { get: () => false });
 
 class PostingError(RuntimeError):
     """사용자에게 그대로 보여줄 수 있는 명확한 오류."""
+
+
+def classify_failure(message: str) -> str:
+    """실패 사유를 login / publish / other 로 분류한다."""
+    text = (message or "").strip()
+    if not text:
+        return "other"
+    if "중단" in text:
+        return "other"
+    login_keys = (
+        "로그인", "인증 메일", "인증 링크", "TempMail", "가입 인증",
+        "새 글 작성 버튼", "Cloudflare 인증",
+    )
+    publish_keys = ("출간", "게시글", "이미지")
+    for key in login_keys:
+        if key.lower() in text.lower():
+            return "login"
+    for key in publish_keys:
+        if key in text:
+            return "publish"
+    return "other"
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +318,7 @@ class VelogPoster:
         self._emit = log
         self._prefix = ""  # 진행 중 계정 번호 표시 (예: "[2/5] ")
         # on_result(velog_id, url): 한 계정 발행이 끝나면 결과 URL 을 알린다.
-        # on_failed(velog_id, manuscript_path): 발행 실패 시 원고 정리용.
+        # on_failed(velog_id, manuscript_path, reason): 발행 실패 시 원고 정리·재시도 카운트용.
         self.on_result = on_result
         self.on_failed = on_failed
         self._stop = threading.Event()
@@ -306,6 +328,7 @@ class VelogPoster:
         self._temp_profile: Path | None = None
         self._endpoint: str | None = None
         self._handoff = False
+        self._user_foreground_hwnd = 0
 
     def log(self, message: str, level: str) -> None:
         """모든 로그에 현재 진행 중인 계정 번호를 붙여 내보낸다."""
@@ -346,15 +369,17 @@ class VelogPoster:
                     self.log(f"{label}: 출간 완료 ✅", "success")
                 except PostingError as exc:
                     self.log(f"{label}: {exc}", "error")
-                    self._notify_failed(label, account)
+                    self._notify_failed(label, account, str(exc))
                 except PWTimeoutError:
-                    self.log(f"{label}: 화면 요소를 시간 내에 찾지 못했습니다.", "error")
-                    self._notify_failed(label, account)
+                    msg = "화면 요소를 시간 내에 찾지 못했습니다."
+                    self.log(f"{label}: {msg}", "error")
+                    self._notify_failed(label, account, msg)
                 except Error as exc:
                     if self._stop.is_set():
                         break
-                    self.log(f"{label}: 브라우저 오류 - {exc}", "error")
-                    self._notify_failed(label, account)
+                    msg = f"브라우저 오류 - {exc}"
+                    self.log(f"{label}: {msg}", "error")
+                    self._notify_failed(label, account, msg)
                 finally:
                     # 다음 계정을 위해 이 계정의 Chrome 을 완전히 닫고 정리한다.
                     self._teardown_account()
@@ -365,14 +390,18 @@ class VelogPoster:
         else:
             self.log(f"전체 완료: {completed}/{total}개 계정 출간 🎉", "success")
 
-    def _notify_failed(self, velog_id: str, account: dict[str, str]) -> None:
+    def _notify_failed(self, velog_id: str, account: dict[str, str], message: str = "") -> None:
         if self.on_failed is None:
             return
         path = str(account.get("manuscript_path", "")).strip()
-        if not path:
-            return
+        reason = classify_failure(message)
         try:
-            self.on_failed(velog_id, path)
+            self.on_failed(velog_id, path, reason)
+        except TypeError:
+            try:
+                self.on_failed(velog_id, path)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             pass
 
@@ -396,7 +425,9 @@ class VelogPoster:
             if anchor_text and anchor_url:
                 body = f"{body.rstrip()}\n\n[{anchor_text}]({anchor_url})"
 
+        self._user_foreground_hwnd = self._capture_foreground_hwnd()
         self._launch_incognito(pw, chrome)
+        self._restore_user_focus()
 
         page = self._first_page()
         self._inject_stealth(page)
@@ -414,6 +445,7 @@ class VelogPoster:
             self._set_blog_title(page, profile_name)
         # 회원가입 단계에서 재연결했을 수 있으니 연결을 보장한다.
         self._ensure_connected(pw)
+        self._restore_user_focus()
         target = self._write_post(self._first_page(), title, body, tags=tags)
 
         if image_folder:
@@ -421,7 +453,9 @@ class VelogPoster:
             self._insert_random_image(target, image_folder, link_url=image_link)
 
         url = self._publish(pw, target, tags, summary=summary)
-        if url and self.on_result is not None:
+        if not url:
+            raise PostingError("출간에 실패했습니다. 게시글 주소를 확인하지 못했습니다.")
+        if self.on_result is not None:
             try:
                 self.on_result(velog_id, url)
             except Exception:  # noqa: BLE001
@@ -435,6 +469,7 @@ class VelogPoster:
         #  넘기고 즉시 종료되어 디버깅 포트가 열리지 않는다.)
         self._temp_profile = Path(tempfile.mkdtemp(prefix="velog-chrome-"))
         # 시크릿 모드 + 자동화 배너가 뜨지 않는 안전한 플래그만 사용.
+        # --start-maximized 는 작업 창을 강제로 전면 최대화하므로 쓰지 않는다.
         command = [
             str(chrome),
             "--incognito",
@@ -442,7 +477,8 @@ class VelogPoster:
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
             "--remote-allow-origins=*",
-            "--start-maximized",
+            "--window-size=1280,800",
+            "--window-position=80,60",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
@@ -506,24 +542,55 @@ class VelogPoster:
         self.log(message, "info")
         self._sleep(seconds)
 
+    @staticmethod
+    def _capture_foreground_hwnd() -> int:
+        if sys.platform != "win32":
+            return 0
+        try:
+            import ctypes
+
+            return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _restore_user_focus(self) -> None:
+        """자동화 Chrome이 전면을 뺏은 뒤, 사용자가 쓰던 창으로 포커스를 되돌린다."""
+        hwnd = int(self._user_foreground_hwnd or 0)
+        if sys.platform != "win32" or not hwnd:
+            return
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            if not user32.IsWindow(hwnd):
+                return
+            # 현재 전면이 이미 사용자 창이면 건드리지 않는다.
+            if int(user32.GetForegroundWindow() or 0) == hwnd:
+                return
+            user32.SetForegroundWindow(hwnd)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _type_like_human(self, page: Page, text: str) -> None:
-        """실제 keydown/keyup 이벤트로 한 글자씩 입력한다."""
+        """실제 keydown/keyup 이벤트로 한 글자씩 입력한다. (시스템 클립보드 미사용)"""
         page.keyboard.type(text, delay=random.randint(45, 110))
 
-    def _copy_to_clipboard(self, page: Page, text: str) -> None:
-        """텍스트를 클립보드에 복사한다. (포커스를 잠깐 가져가므로
-        반드시 이 호출 '이후' 에 대상칸을 클릭/포커스해야 한다.)"""
-        page.evaluate(
-            """(text) => {
-                const ta = document.createElement('textarea');
-                ta.value = text;
-                ta.style.position = 'fixed';
-                ta.style.top = '-9999px';
-                document.body.appendChild(ta);
-                ta.focus();
-                ta.select();
-                document.execCommand('copy');
-                document.body.removeChild(ta);
+    def _set_codemirror_value(self, editor, text: str) -> None:
+        """CodeMirror 본문을 클립보드 없이 직접 넣는다."""
+        editor.evaluate(
+            """(el, value) => {
+                const cm = el.CodeMirror;
+                if (!cm) throw new Error('CodeMirror missing');
+                cm.setValue(value);
+                cm.focus();
+                cm.refresh();
+                try {
+                    const ta = cm.getTextArea && cm.getTextArea();
+                    if (ta) {
+                        ta.dispatchEvent(new Event('input', { bubbles: true }));
+                        ta.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                } catch (e) {}
             }""",
             text,
         )
@@ -591,6 +658,7 @@ class VelogPoster:
             if passed:
                 self.log("Cloudflare 통과 확인 → 작업을 계속합니다.", "info")
                 self._ensure_connected(pw)
+                self._restore_user_focus()
                 return
         raise PostingError("Cloudflare 인증을 시간 내에 통과하지 못했습니다.")
 
@@ -983,7 +1051,7 @@ class VelogPoster:
             if not self._fill_tags(target, tag_list):
                 self.log("태그 자동 입력에 실패했습니다. 작성 화면에서 직접 입력해 주세요.", "error")
 
-        # 제목 입력 (붙여넣기) — 포커스 경쟁으로 가끔 실패하므로 검증 후 재시도.
+        # 제목 입력 — 시스템 클립보드를 쓰지 않고 fill 로 직접 넣는다.
         self.log("제목을 입력하는 중...", "info")
         title_box = target.get_by_placeholder("제목을 입력하세요")
         title_box.wait_for(state="visible", timeout=15_000)
@@ -992,11 +1060,12 @@ class VelogPoster:
             label="제목",
             text=title,
             focus=lambda: title_box.click(),
+            write=lambda: (title_box.fill(""), title_box.fill(title)),
             read_back=lambda: self._read_title(title_box).strip(),
             expected=title.strip(),
         )
 
-        # 본문 입력 (CodeMirror)
+        # 본문 입력 (CodeMirror) — setValue 로 직접 입력 (클립보드 미사용)
         self.log("본문을 입력하는 중...", "info")
         editor = target.locator(".CodeMirror")
         editor.wait_for(state="visible", timeout=15_000)
@@ -1005,13 +1074,13 @@ class VelogPoster:
             label="본문",
             text=body,
             focus=lambda: target.locator(".CodeMirror-scroll").click(),
+            write=lambda: self._set_codemirror_value(editor, body),
             read_back=lambda: editor.evaluate("(el) => el.CodeMirror.getValue()"),
             expected=body,
-            select_all=True,
         )
 
         self.log("제목과 본문이 올바르게 입력되었습니다.", "info")
-        target.bring_to_front()
+        self._restore_user_focus()
         return target
 
     def _click_write_button(self, target: Page) -> None:
@@ -1034,20 +1103,23 @@ class VelogPoster:
             self._sleep(_jitter(4))
         raise PostingError("새 글 작성 버튼을 찾지 못했습니다.")
 
-    def _fill_with_retry(self, target: Page, label: str, text: str,
-                         focus, read_back, expected: str,
-                         select_all: bool = False, attempts: int = 3) -> None:
-        """클립보드 붙여넣기로 입력하고, 값이 들어갔는지 확인 후 실패 시 재시도."""
+    def _fill_with_retry(
+        self,
+        target: Page,
+        label: str,
+        text: str,
+        focus,
+        write,
+        read_back,
+        expected: str,
+        attempts: int = 3,
+    ) -> None:
+        """클립보드 없이 직접 입력하고, 값이 들어갔는지 확인 후 실패 시 재시도."""
         for attempt in range(1, attempts + 1):
-            self._copy_to_clipboard(target, text)
-            self._sleep(_jitter(0.3, 0.2))
             focus()
-            self._sleep(_jitter(0.4, 0.2))
-            if select_all:
-                target.keyboard.press("Control+a")
-                self._sleep(0.2)
-            target.keyboard.press("Control+v")
-            self._sleep(_jitter(1.5))
+            self._sleep(_jitter(0.35, 0.2))
+            write()
+            self._sleep(_jitter(1.2))
             try:
                 if read_back() == expected:
                     return
@@ -1199,12 +1271,9 @@ class VelogPoster:
             try:
                 tag_input.click(timeout=5_000)
                 self._sleep(_jitter(0.35, 0.2))
-                self._copy_to_clipboard(target, keyword)
-                tag_input.fill("")
-                self._sleep(_jitter(0.2, 0.1))
-                target.keyboard.press("Control+v")
-                self._sleep(_jitter(0.4, 0.2))
-                target.keyboard.press("Enter")
+                tag_input.fill(keyword)
+                self._sleep(_jitter(0.35, 0.2))
+                tag_input.press("Enter")
                 self._sleep(_jitter(0.55, 0.3))
                 added += 1
             except Error:

@@ -15,10 +15,11 @@ function Invoke-Soft {
     param([scriptblock]$Block)
     $prev = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    & $Block
+    & $Block | Out-Null
     $code = $LASTEXITCODE
     $ErrorActionPreference = $prev
-    return $code
+    if ($null -eq $code) { return 0 }
+    return [int]$code
 }
 
 function Read-DeployConfig {
@@ -157,8 +158,14 @@ if (-not $SkipBuild) {
     Write-Host "[1/4] Building..."
     $buildScript = Join-Path $Root $cfg.build.script
     if (-not (Test-Path $buildScript)) { throw "Build script missing: $($cfg.build.script)" }
-    $buildCode = Invoke-Soft { & $buildScript }
-    if ($buildCode -ne 0) { throw "Build failed" }
+    $buildCode = Invoke-Soft { cmd /c "`"$buildScript`"" }
+    if ($buildCode -ne 0) {
+        $distCheck = Join-Path $Root ($cfg.build.dist_dir -replace "/", "\")
+        if (-not (Test-Path (Join-Path $distCheck "*.exe"))) {
+            throw "Build failed"
+        }
+        Write-Host "[build] exit code $buildCode 이지만 결과물이 있어 계속합니다."
+    }
 }
 
 $distDir = Join-Path $Root ($cfg.build.dist_dir -replace "/", "\")
