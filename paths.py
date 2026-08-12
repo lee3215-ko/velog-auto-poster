@@ -1,4 +1,4 @@
-﻿"""??踰꾩쟾쨌?낅뜲?댄듃 URL (諛고룷 ??publish.ps1 ???먮룞 媛깆떊)."""
+﻿"""앱 버전·업데이트 URL (배포 시 publish.ps1 이 자동 갱신)."""
 
 APP_VERSION = "1.0.18"
 APP_NAME = "VelogPoster"
@@ -11,5 +11,3 @@ GITHUB_REPO = "velog-auto-poster"
 UPDATE_VERSION_URL = (
     f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/main/version.json"
 )
-
-

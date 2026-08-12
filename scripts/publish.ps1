@@ -38,10 +38,11 @@ function Read-AppVersion($cfg) {
 
 function Set-AppVersion($cfg, [string]$Version) {
     $path = Join-Path $Root $cfg.version.file
-    $text = Get-Content $path -Raw
+    $text = [System.IO.File]::ReadAllText($path)
     $var = [regex]::Escape($cfg.version.variable)
     $text = $text -replace "${var}\s*=\s*`"[^`"]+`"", "$($cfg.version.variable) = `"$Version`""
-    Set-Content -Path $path -Value $text -Encoding UTF8
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($path, $text, $utf8NoBom)
 }
 
 function Bump-Version([string]$Version, [string]$Part) {
