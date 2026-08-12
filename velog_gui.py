@@ -151,6 +151,8 @@ class VelogApp(tk.Tk):
 
         # 임시 메일 생성 탭
         self.generated_emails: list[dict[str, str]] = []
+        # 한 번이라도 가입 완료한 이메일 — 재가입 폼이 뜨면 삭제
+        self.signed_up_emails: set[str] = set()
         self.tm_count = tk.IntVar(value=1)
         self.tm_status = tk.StringVar(value="대기 중 — 생성할 개수를 입력하고 [생성 시작]을 누르세요.")
         self.tm_progress_text = tk.StringVar(value="")
@@ -1890,7 +1892,13 @@ class VelogApp(tk.Tk):
             f"[{tab['title']}] {len(pending)}개 계정 자동 출간을 시작합니다.",
             "info",
         )
-        self._poster = VelogPoster(self._post_event, self._on_result, self._on_failed)
+        self._poster = VelogPoster(
+            self._post_event,
+            self._on_result,
+            self._on_failed,
+            signed_up_emails=set(self.signed_up_emails),
+            on_signup=self._on_signup,
+        )
         profile_names = self._parse_profile_names()
         anchors = [dict(a) for a in self.anchors]
         homepages = list(self.homepages)
@@ -1912,6 +1920,9 @@ class VelogApp(tk.Tk):
 
     def _on_failed(self, velog_id: str, manuscript_path: str, reason: str = "") -> None:
         self._events.put((f"{velog_id}\t{manuscript_path}\t{reason}", "failed"))
+
+    def _on_signup(self, email: str) -> None:
+        self._events.put((str(email or "").strip().lower(), "signup"))
 
     def _add_anchor(self) -> None:
         text = self.anchor_text.get().strip()
@@ -2053,6 +2064,13 @@ class VelogApp(tk.Tk):
                     manuscript_path, _, reason = rest.partition("\t")
                     self._mark_failed(velog_id, manuscript_path, reason)
                     continue
+                if level == "signup":
+                    email = (message or "").strip().lower()
+                    if email:
+                        self.signed_up_emails.add(email)
+                        self._save_settings()
+                        self._append(f"가입 이력 저장: {email}", "info")
+                    continue
                 self.status.set(message)
                 tag = "success" if level == "success" else ("error" if level == "error" else "info")
                 self._append(message, tag)
@@ -2105,6 +2123,17 @@ class VelogApp(tk.Tk):
         tab = self._active_tab or self._current_tab()
         if tab is None:
             return
+        # /write?id= 등 초안 URL은 성공이 아니다 → 원고를 발행완료로 옮기지 않는다.
+        if "velog.io/@" not in url or "/write" in url:
+            for acc in tab["accounts"]:
+                if acc.get("velog_id") == velog_id:
+                    self._mark_failed(
+                        velog_id,
+                        str(acc.get("manuscript_path", "")),
+                        "publish",
+                    )
+                    return
+            return
         accounts = tab["accounts"]
         target: dict | None = None
         for acc in accounts:
@@ -2143,9 +2172,17 @@ class VelogApp(tk.Tk):
         if target is None:
             return
 
-        # 실패 원고는 폴더에 그대로 두고, 계정만 실패 횟수를 갱신한다.
+        # 실패 원고는 폴더에 그대로 두고(성공 폴더로 이동 금지), 계정만 처리한다.
         kind = (reason or "").strip().lower()
-        if kind in {"login", "publish"}:
+        if kind == "locked":
+            # 잠김 / 재가입 → 즉시 삭제, 원고는 원위치 유지
+            target["manuscript_path"] = ""
+            tab["accounts"] = [a for a in tab["accounts"] if a is not target]
+            self._append(
+                f"{velog_id} 잠김·재가입 → 목록에서 삭제했습니다. (실패 원고는 폴더에 유지)",
+                "error",
+            )
+        elif kind in {"login", "publish"}:
             try:
                 fails = int(str(target.get("fail_count", "0") or "0").strip() or "0")
             except ValueError:
@@ -2154,6 +2191,7 @@ class VelogApp(tk.Tk):
             target["fail_count"] = str(fails)
             label = "로그인 실패" if kind == "login" else "출간 실패"
             if fails >= 2:
+                target["manuscript_path"] = ""
                 tab["accounts"] = [a for a in tab["accounts"] if a is not target]
                 self._append(
                     f"{velog_id} {label} 2회 → 목록에서 삭제했습니다. (원고 파일은 폴더에 유지)",
@@ -2632,6 +2670,13 @@ class VelogApp(tk.Tk):
                     for g in generated
                     if isinstance(g, dict) and g.get("email") and g.get("inbox_url")
                 ]
+            signed = data.get("signed_up_emails", [])
+            if isinstance(signed, list):
+                self.signed_up_emails = {
+                    str(e).strip().lower()
+                    for e in signed
+                    if str(e).strip()
+                }
         except (OSError, ValueError):
             pass
         if not self.tabs:
@@ -2661,6 +2706,7 @@ class VelogApp(tk.Tk):
                         "homepages": self.homepages,
                         "tabs": tabs,
                         "generated_emails": self.generated_emails,
+                        "signed_up_emails": sorted(self.signed_up_emails),
                     },
                     ensure_ascii=False, indent=2,
                 ),

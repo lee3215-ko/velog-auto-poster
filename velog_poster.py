@@ -57,12 +57,14 @@ class PostingError(RuntimeError):
 
 
 def classify_failure(message: str) -> str:
-    """실패 사유를 login / publish / other 로 분류한다."""
+    """실패 사유를 login / publish / locked / other 로 분류한다."""
     text = (message or "").strip()
     if not text:
         return "other"
     if "중단" in text:
         return "other"
+    if any(k in text for k in ("계정 잠김", "포스트 작성 실패", "재가입", "이미 가입")):
+        return "locked"
     login_keys = (
         "로그인", "인증 메일", "인증 링크", "TempMail", "가입 인증",
         "새 글 작성 버튼", "Cloudflare 인증",
@@ -314,13 +316,26 @@ def make_bio(name: str) -> str:
 # 메인 엔진
 # ---------------------------------------------------------------------------
 class VelogPoster:
-    def __init__(self, log: LogCallback, on_result=None, on_failed=None) -> None:
+    def __init__(
+        self,
+        log: LogCallback,
+        on_result=None,
+        on_failed=None,
+        *,
+        signed_up_emails: set[str] | None = None,
+        on_signup=None,
+    ) -> None:
         self._emit = log
         self._prefix = ""  # 진행 중 계정 번호 표시 (예: "[2/5] ")
         # on_result(velog_id, url): 한 계정 발행이 끝나면 결과 URL 을 알린다.
         # on_failed(velog_id, manuscript_path, reason): 발행 실패 시 원고 정리·재시도 카운트용.
+        # on_signup(email): 신규 가입 성공 시 기억용.
         self.on_result = on_result
         self.on_failed = on_failed
+        self.on_signup = on_signup
+        self._signed_up_emails = {
+            str(e).strip().lower() for e in (signed_up_emails or set()) if str(e).strip()
+        }
         self._stop = threading.Event()
         self._process: subprocess.Popen | None = None
         self._browser = None
@@ -477,7 +492,7 @@ class VelogPoster:
             self._insert_random_image(target, image_folder, link_url=image_link)
 
         url = self._publish(pw, target, tags, summary=summary)
-        if not url:
+        if not url or not self._is_post_url(url):
             raise PostingError("출간에 실패했습니다. 게시글 주소를 확인하지 못했습니다.")
         if self.on_result is not None:
             try:
@@ -824,7 +839,22 @@ class VelogPoster:
                 pass
             self._sleep(1)
         if not appeared:
-            return False, None  # 이미 가입된 계정
+            # 이미 가입된 계정 — 이후 재가입 폼이 뜨면 삭제하도록 이력에 남긴다.
+            email = str(account.get("velog_id", "")).strip().lower()
+            if email and email not in self._signed_up_emails:
+                self._signed_up_emails.add(email)
+                if self.on_signup is not None:
+                    try:
+                        self.on_signup(email)
+                    except Exception:  # noqa: BLE001
+                        pass
+            return False, None
+
+        email = str(account.get("velog_id", "")).strip().lower()
+        if email and email in self._signed_up_emails:
+            raise PostingError(
+                "재가입 시도 — 이전에 가입했던 아이디입니다. 목록에서 삭제합니다.",
+            )
 
         self.log("회원가입 중.. (신규 계정)", "info")
         names = account.get("profile_names") or DEFAULT_PROFILE_NAMES
@@ -862,6 +892,13 @@ class VelogPoster:
         # 가입 (Cloudflare 인증 대비 → 출간과 동일하게 연결 해제·재연결로 클릭)
         self._submit_signup(pw, page, profile_input)
         self.log("회원가입을 완료했습니다.", "success")
+        if email:
+            self._signed_up_emails.add(email)
+            if self.on_signup is not None:
+                try:
+                    self.on_signup(email)
+                except Exception:  # noqa: BLE001
+                    pass
         self._sleep(_jitter(2))
         return True, name
 
@@ -1524,6 +1561,11 @@ class VelogPoster:
                         self.log(f"출간 완료 🎉 {url}", "success")
                         return url
 
+                    if self._has_publish_fail_toast(page):
+                        raise PostingError(
+                            "계정 잠김: 포스트 작성 실패 — 목록에서 삭제합니다.",
+                        )
+
                     final = page.locator('[data-testid="publish"]')
                     final_visible = final.count() > 0 and final.first.is_visible()
 
@@ -1538,6 +1580,11 @@ class VelogPoster:
                             self._sleep(_jitter(0.4, 0.3))
                             first.click(timeout=15_000)
                             panel_opened = True
+                            self._sleep(1.2)
+                            if self._has_publish_fail_toast(page):
+                                raise PostingError(
+                                    "계정 잠김: 포스트 작성 실패 — 목록에서 삭제합니다.",
+                                )
                         # 클릭 직후 곧바로 연결을 끊어(아래 finally),
                         # 인증이 깨끗한 상태에서 검증되도록 한다.
                     else:
@@ -1557,7 +1604,14 @@ class VelogPoster:
                             self._sleep(_jitter(0.4, 0.3))
                             final.first.click(timeout=15_000)
                             clicked_publish = True
+                            self._sleep(1.0)
+                            if self._has_publish_fail_toast(page):
+                                raise PostingError(
+                                    "계정 잠김: 포스트 작성 실패 — 목록에서 삭제합니다.",
+                                )
                     # else: 패널은 열렸지만 아직 인증 미통과 → 끊고 대기.
+            except PostingError:
+                raise
             except (Error, PWTimeoutError):
                 pass
             finally:
@@ -1586,6 +1640,25 @@ class VelogPoster:
         """발행된 게시글 주소(velog.io/@아이디/제목)인지 판별."""
         return "velog.io/@" in url and "/write" not in url
 
+    @staticmethod
+    def _has_publish_fail_toast(page: Page) -> bool:
+        """Toastify '포스트 작성 실패' 알림이 떠 있으면 계정 잠김으로 본다."""
+        try:
+            return bool(page.evaluate(
+                """() => {
+                    const nodes = document.querySelectorAll(
+                        '.Toastify__toast-body, [role="alert"], .Toastify__toast'
+                    );
+                    for (const n of nodes) {
+                        const t = (n.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (t.includes('포스트 작성 실패')) return true;
+                    }
+                    return false;
+                }"""
+            ))
+        except Error:
+            return False
+
     def _wait_published_url(self, pw) -> str | None:
         """출간 클릭 후, 게시글 주소(@아이디/제목)로 리다이렉트될 때까지 기다려
         그 정확한 URL 을 반환한다."""
@@ -1600,12 +1673,18 @@ class VelogPoster:
                 browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
                 page = self._find_velog_page(browser)
                 if page is not None:
+                    if self._has_publish_fail_toast(page):
+                        raise PostingError(
+                            "계정 잠김: 포스트 작성 실패 — 목록에서 삭제합니다.",
+                        )
                     last_url = page.url or last_url
                     if self._is_post_url(last_url):
                         self.log(f"출간 완료 🎉 {last_url}", "success")
                         return last_url
                     if not username:
                         username = self._read_velog_username(page)
+            except PostingError:
+                raise
             except (Error, PWTimeoutError):
                 pass
             finally:
@@ -1621,7 +1700,10 @@ class VelogPoster:
             return resolved
 
         self.log("게시글 주소 확인에 실패했습니다. 창에서 직접 확인해 주세요.", "error")
-        return last_url or None
+        # /write?id= 는 초안 주소이므로 성공으로 반환하지 않는다.
+        if last_url and self._is_post_url(last_url):
+            return last_url
+        return None
 
     @staticmethod
     def _read_velog_username(page: Page) -> str:
