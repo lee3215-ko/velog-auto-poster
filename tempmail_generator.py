@@ -303,10 +303,18 @@ class TempMailGenerator:
             pass
 
     def _click_like_human(self, page: Page, locator, *, timeout: int = 15_000) -> None:
-        """중요 UI는 Playwright 클릭 + 스크롤. (마우스 궤적 연출 제거)"""
+        """스크롤 후 Playwright 클릭."""
         del page
         target = locator.first if hasattr(locator, "first") else locator
-        self._scroll_into_view(target)
+        try:
+            target.scroll_into_view_if_needed(timeout=5_000)
+        except Error:
+            try:
+                target.evaluate(
+                    "el => el.scrollIntoView({block:'center', inline:'nearest', behavior:'instant'})"
+                )
+            except Error:
+                pass
         try:
             target.click(timeout=timeout)
         except Error:
