@@ -996,10 +996,10 @@ class VelogPoster:
             self._type_like_human(page, bio)
             self._human_idle(page, lo=0.9, hi=2.4)
 
-        # 약관 동의 — 읽고 체크하는 간격
-        self._human_idle(page, lo=0.8, hi=2.0)
+        # 약관 동의
+        self._sleep(_jitter(0.6, 0.4))
         self._check_agreement(page)
-        self._human_idle(page, lo=1.2, hi=3.2)
+        self._sleep(_jitter(0.8, 0.5))
 
         # 가입 (Cloudflare 인증 대비 → 출간과 동일하게 연결 해제·재연결로 클릭)
         self._submit_signup(pw, page, profile_input)
@@ -1015,53 +1015,67 @@ class VelogPoster:
         return True, name
 
     def _submit_signup(self, pw, page: Page, profile_input) -> None:
-        """가입 버튼을 누른다. 버튼이 곧바로 활성화돼 있으면 바로 클릭하고,
-        Cloudflare 로 비활성/실패면 연결을 끊어 깨끗한 상태에서 인증을 통과시킨
-        뒤 재연결하여 클릭한다. (출간 단계와 같은 방식)"""
+        """가입 버튼을 누른다.
+
+        Cloudflare Turnstile 은 CDP 연결 중에 실패하기 쉬우므로:
+          1) 연결을 끊고 인증이 통과되길 기다린다.
+          2) 잠깐 재연결해 '가입'이 활성화되면 **한 번만** 안정적으로 클릭한다.
+          3) 폼이 사라질 때까지 기다린다. (실패 시에만 재시도, 최대 5회)
+        가입 클릭에는 마우스 궤적 연출을 쓰지 않는다 — 제출 실패·무한 루프 원인이 됨.
+        """
         join = self._visible_last(page.get_by_role("button", name="가입", exact=True))
-        # 1) 빠르게 활성화돼 있으면 바로 클릭
-        if join is not None and self._enabled_within(join, 6):
-            self._sleep(_human_delay(0.5, 1.4))
+        if join is not None and self._enabled_within(join, 8):
             try:
-                self._click_like_human(page, join)
-                if self._signup_form_gone(page, profile_input):
+                self._sleep(_jitter(0.4, 0.3))
+                join.click(timeout=15_000)
+                if self._signup_form_gone(page, profile_input, seconds=12):
                     return
             except Error:
                 pass
 
-        # 2) Cloudflare 차단 가능성 → 연결 해제 후 재연결-감시로 클릭
         self.log("가입 인증(Cloudflare) 통과를 위해 연결을 잠시 해제합니다...", "info")
         if not self._endpoint:
             raise PostingError("가입 인증을 진행할 수 없습니다.")
         self._disconnect_only()
-        for _ in range(80):  # 약 4분
+
+        clicks = 0
+        max_clicks = 5
+        logged_ready = False
+        for _ in range(90):  # 약 6분
             if self._stop.wait(0):
                 raise PostingError("사용자가 작업을 중단했습니다.")
             browser = None
             try:
                 browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
                 p = self._find_velog_page(browser)
-                if p is not None:
-                    pf = p.get_by_placeholder("프로필 이름을 입력하세요")
-                    if pf.count() == 0 or not pf.first.is_visible():
-                        return  # 폼이 사라짐 = 가입 완료
-                    jb = self._visible_last(p.get_by_role("button", name="가입", exact=True))
-                    if jb is not None and not self._is_disabled(jb):
-                        self.log("가입 인증 통과 → 가입을 진행합니다.", "info")
-                        self._sleep(_human_delay(0.5, 1.5))
-                        try:
-                            box = jb.bounding_box()
-                        except Error:
-                            box = None
-                        if box:
-                            x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
-                            y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
-                            p.mouse.move(x, y, steps=random.randint(12, 24))
-                            self._sleep(random.uniform(0.15, 0.5))
-                            p.mouse.click(x, y, delay=random.randint(40, 120))
-                        else:
-                            jb.click(timeout=15_000)
-                        self._sleep(2)
+                if p is None:
+                    continue
+                pf = p.get_by_placeholder("프로필 이름을 입력하세요")
+                if pf.count() == 0 or not pf.first.is_visible():
+                    return  # 폼 사라짐 = 가입 완료
+
+                jb = self._visible_last(p.get_by_role("button", name="가입", exact=True))
+                if jb is None or self._is_disabled(jb):
+                    logged_ready = False
+                    continue
+
+                if clicks >= max_clicks:
+                    # 더 이상 누르지 않고 폼이 사라지기만 기다린다.
+                    if self._signup_form_gone(p, pf, seconds=2):
+                        return
+                    continue
+
+                if not logged_ready:
+                    self.log("가입 인증 통과 → 가입을 진행합니다.", "info")
+                    logged_ready = True
+                self._sleep(_jitter(0.35, 0.25))
+                jb.click(timeout=15_000)
+                clicks += 1
+                # 클릭 직후 연결을 유지한 채 폼 소멸을 확인 (재클릭 스팸 방지)
+                if self._signup_form_gone(p, pf, seconds=10):
+                    return
+                # 아직 폼이 있으면 Turnstile 재검증을 위해 끊고 대기
+                logged_ready = False
             except (Error, PWTimeoutError):
                 pass
             finally:
@@ -1071,6 +1085,7 @@ class VelogPoster:
                     except Error:
                         pass
             self._sleep(3)
+
         raise PostingError("가입 인증을 시간 내에 통과하지 못했습니다.")
 
     @staticmethod
@@ -1088,8 +1103,10 @@ class VelogPoster:
             self._sleep(1)
         return not self._is_disabled(locator)
 
-    def _signup_form_gone(self, page: Page, profile_input) -> bool:
-        for _ in range(15):
+    def _signup_form_gone(self, page: Page, profile_input, *, seconds: float = 15) -> bool:
+        """가입 폼(프로필 이름 입력란)이 사라졌는지 최대 seconds 초 동안 확인."""
+        steps = max(1, int(seconds))
+        for _ in range(steps):
             if self._stop.wait(1):
                 raise PostingError("사용자가 작업을 중단했습니다.")
             try:
@@ -1184,11 +1201,11 @@ class VelogPoster:
         체크박스는 체크마크 svg(path d^='M20.285 2')를 감싼 div 이고,
         그 div 를 클릭하면 토글된다.
         """
-        # 1) 체크마크 svg 를 가진 div 를 직접 클릭
+        # 1) 체크마크 svg 를 가진 div 를 직접 클릭 (제출에 필수 → 안정 클릭)
         try:
             box_div = page.locator("div:has(> svg path[d^='M20.285 2'])").first
             if box_div.count() > 0:
-                self._click_like_human(page, box_div, timeout=5_000)
+                box_div.click(timeout=5_000)
                 return
         except Error:
             pass
@@ -1196,7 +1213,7 @@ class VelogPoster:
         try:
             cb = page.locator("input[type='checkbox']")
             if cb.count() > 0:
-                self._click_like_human(page, cb.first, timeout=3_000)
+                cb.first.check(timeout=3_000)
                 return
         except Error:
             pass
@@ -1205,11 +1222,7 @@ class VelogPoster:
             link = page.get_by_text("이용약관", exact=False).first
             box = link.bounding_box()
             if box:
-                x = box["x"] - 16
-                y = box["y"] + box["height"] / 2
-                page.mouse.move(x, y, steps=random.randint(10, 20))
-                self._sleep(random.uniform(0.15, 0.4))
-                page.mouse.click(x, y)
+                page.mouse.click(box["x"] - 16, box["y"] + box["height"] / 2)
                 return
         except Error:
             pass
