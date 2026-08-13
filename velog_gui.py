@@ -26,7 +26,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from paths import APP_VERSION, EXE_NAME, UPDATE_VERSION_URL
-from tempmail_generator import TempMailGenerator
+from tempmail_generator import TempMailGenerator, normalize_email_domain, normalize_email_domains
 from update_ui import schedule_update_check
 from velog_poster import (
     ADGUARD_TEMPMAIL_URL,
@@ -248,6 +248,8 @@ class VelogApp(tk.Tk):
         self.anchor_url = tk.StringVar()
         self.homepage_search = tk.StringVar()
         self.tm_loop_until_stop = tk.BooleanVar(value=True)
+        self.tm_domain_input = tk.StringVar()
+        self.tm_domains: list[str] = []
         self._collapse_state = {"image": False, "advanced": False, "account": False, "manuscript": True}
         self.status = tk.StringVar(value="대기 중 — 계정을 등록한 뒤 [전체 출간 시작]을 누르세요.")
         self.tab_summary = tk.StringVar(value="계정 0개")
@@ -601,6 +603,37 @@ class VelogApp(tk.Tk):
         ttk.Label(
             ctrl, text="생성 간격은 매번 랜덤하게 달라집니다.", style="Hint.TLabel",
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        ttk.Label(ctrl, text="허용 도메인", style="Field.TLabel").grid(
+            row=4, column=0, sticky="nw", padx=(0, 8), pady=(12, 0),
+        )
+        domain_wrap = ttk.Frame(ctrl, style="Card.TFrame")
+        domain_wrap.grid(row=4, column=1, sticky="ew", pady=(12, 0))
+        domain_wrap.columnconfigure(0, weight=1)
+        ttk.Label(
+            domain_wrap,
+            text="@blenched.com 처럼 뒷주소를 넣으면 해당 도메인만 저장합니다.",
+            style="Hint.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        domain_entry = ttk.Entry(domain_wrap, textvariable=self.tm_domain_input, font=(FONT, 10))
+        domain_entry.grid(row=1, column=0, sticky="ew", ipady=3, pady=(6, 0), padx=(0, 6))
+        domain_entry.bind("<Return>", lambda _e: self._add_tm_domain())
+        ttk.Button(
+            domain_wrap, text="추가", style="Pick.TButton", command=self._add_tm_domain,
+        ).grid(row=1, column=1, sticky="e", pady=(6, 0))
+        self.tm_domain_list = tk.Listbox(
+            domain_wrap, height=3, font=(FONT, 9), relief="solid", borderwidth=1,
+            activestyle="none", highlightthickness=0, selectmode="extended",
+        )
+        self.tm_domain_list.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(
+            domain_wrap, text="선택 삭제", style="Pick.TButton", command=self._delete_tm_domains,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(
+            domain_wrap,
+            text="비우면 모든 도메인을 저장합니다. 목록이 있으면 입력된 도메인만 포스팅 계정에 넣습니다.",
+            style="Hint.TLabel",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         btns = ttk.Frame(left, style="Bg.TFrame")
         btns.pack(fill="x", pady=(0, 8))
@@ -2903,6 +2936,44 @@ class VelogApp(tk.Tk):
                 self.tm_progress.configure(mode="determinate", value=0, maximum=100)
                 self.tm_progress_text.set(f"{self._tm_run_done}개 완료")
 
+    def _refresh_tm_domain_list(self) -> None:
+        if not hasattr(self, "tm_domain_list"):
+            return
+        self.tm_domain_list.delete(0, "end")
+        for domain in self.tm_domains:
+            self.tm_domain_list.insert("end", f"@{domain}")
+
+    def _add_tm_domain(self) -> None:
+        raw = self.tm_domain_input.get().strip()
+        if not raw:
+            messagebox.showwarning("입력 확인", "이메일 뒷주소를 입력해 주세요. 예: @blenched.com", parent=self)
+            return
+        try:
+            domain = normalize_email_domain(raw)
+        except PostingError as exc:
+            messagebox.showwarning("입력 확인", str(exc), parent=self)
+            return
+        if domain in self.tm_domains:
+            messagebox.showinfo("허용 도메인", f"@{domain} 은 이미 목록에 있습니다.", parent=self)
+            return
+        self.tm_domains.append(domain)
+        self.tm_domain_input.set("")
+        self._refresh_tm_domain_list()
+        self._save_settings()
+
+    def _delete_tm_domains(self) -> None:
+        if not hasattr(self, "tm_domain_list"):
+            return
+        selected = list(self.tm_domain_list.curselection())
+        if not selected:
+            messagebox.showinfo("허용 도메인", "삭제할 도메인을 선택해 주세요.", parent=self)
+            return
+        for index in reversed(selected):
+            if 0 <= index < len(self.tm_domains):
+                del self.tm_domains[index]
+        self._refresh_tm_domain_list()
+        self._save_settings()
+
     def _start_tempmail(self) -> None:
         if self._tm_worker is not None or self._poster is not None:
             messagebox.showinfo("임시 메일", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
@@ -2930,6 +3001,7 @@ class VelogApp(tk.Tk):
         self._set_tm_progress(0, max(count, 1) if not loop else 0)
         self._set_tm_running(True)
         tab_title = self.tabs[tab_index]["title"]
+        domains = list(self.tm_domains)
         if loop:
             self._append_tm_log(
                 f"임시 메일 연속 생성을 시작합니다. (「{tab_title}」로 자동 이동 · 중단 시까지)",
@@ -2940,11 +3012,18 @@ class VelogApp(tk.Tk):
                 f"{count}개 임시 메일 생성 → 「{tab_title}」 탭으로 자동 이동합니다.",
                 "info",
             )
+        if domains:
+            shown = ", ".join(f"@{d}" for d in domains)
+            self._append_tm_log(f"허용 도메인만 저장: {shown}", "info")
+        else:
+            self._append_tm_log("허용 도메인이 없어 생성된 모든 주소를 저장합니다.", "info")
 
         def on_created(email: str, url: str) -> None:
             self._tm_events.put((f"{email}\t{url}", "created"))
 
-        self._tm_generator = TempMailGenerator(self._post_tm_event, on_created)
+        self._tm_generator = TempMailGenerator(
+            self._post_tm_event, on_created, allowed_domains=domains,
+        )
         self._tm_worker = threading.Thread(
             target=self._run_tempmail, args=(count, loop), daemon=True,
         )
@@ -3069,6 +3148,9 @@ class VelogApp(tk.Tk):
             self.image_folder.set(str(data.get("image_folder", "")))
             self.manuscript_folder.set(str(data.get("manuscript_folder", "")))
             self.tm_loop_until_stop.set(bool(data.get("tm_loop_until_stop", True)))
+            raw_domains = data.get("tm_domains", [])
+            if isinstance(raw_domains, list):
+                self.tm_domains = normalize_email_domains([str(d) for d in raw_domains])
             now_iso = datetime.now().isoformat(timespec="seconds")
 
             tabs = data.get("tabs")
@@ -3139,6 +3221,8 @@ class VelogApp(tk.Tk):
         self._rebuild_tabs()
         if hasattr(self, "tm_tree"):
             self._refresh_tm_tree()
+        if hasattr(self, "tm_domain_list"):
+            self._refresh_tm_domain_list()
         self._update_manuscript_section_label()
 
     def _save_settings(self) -> None:
@@ -3150,6 +3234,7 @@ class VelogApp(tk.Tk):
                         "image_folder": self.image_folder.get().strip(),
                         "manuscript_folder": self.manuscript_folder.get().strip(),
                         "tm_loop_until_stop": bool(self.tm_loop_until_stop.get()),
+                        "tm_domains": self.tm_domains,
                         "profile_names": self._parse_profile_names(),
                         "anchors": self.anchors,
                         "homepages": self.homepages,

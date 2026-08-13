@@ -61,9 +61,16 @@ def _random_delay(base: float, spread: float, *, lo_scale: float = 0.7, hi_scale
 class TempMailGenerator:
     """TempMail.co 에서 임시 메일함을 자동으로 만든다."""
 
-    def __init__(self, log: LogCallback, on_created: CreatedCallback | None = None) -> None:
+    def __init__(
+        self,
+        log: LogCallback,
+        on_created: CreatedCallback | None = None,
+        *,
+        allowed_domains: list[str] | None = None,
+    ) -> None:
         self._emit = log
         self.on_created = on_created
+        self._allowed_domains = normalize_email_domains(allowed_domains or [])
         self._stop = threading.Event()
         self._process: subprocess.Popen | None = None
         self._browser = None
@@ -97,21 +104,30 @@ class TempMailGenerator:
             self._wait_if_cloudflare(pw, page)
             page = self._first_page()
 
-            index = 0
+            if self._allowed_domains:
+                shown = ", ".join(f"@{d}" for d in self._allowed_domains)
+                self.log(f"허용 도메인만 저장합니다: {shown}", "info")
+
+            accepted = 0
             while True:
                 if self._stop.is_set():
                     break
-                index += 1
-                if not loop_until_stop and index > count:
+                if not loop_until_stop and accepted >= count:
                     break
-                label = f"#{index}" if loop_until_stop else f"[{index}/{count}]"
+                label = f"#{accepted + 1}" if loop_until_stop else f"[{accepted + 1}/{count}]"
                 self.log(f"{label} 새 임시 메일 생성 중...", "info")
+                skipped = False
                 try:
-                    email, url = self._generate_one(pw)
-                    results.append((email, url))
-                    self.log(f"{label} 생성 완료: {email}", "success")
-                    if self.on_created is not None:
-                        self.on_created(email, url)
+                    result = self._generate_one(pw)
+                    if result is None:
+                        skipped = True
+                    else:
+                        email, url = result
+                        results.append((email, url))
+                        accepted += 1
+                        self.log(f"{label} 생성 완료: {email}", "success")
+                        if self.on_created is not None:
+                            self.on_created(email, url)
                 except PostingError as exc:
                     self.log(f"{label} {exc}", "error")
                 except (Error, PWTimeoutError) as exc:
@@ -121,9 +137,9 @@ class TempMailGenerator:
 
                 if self._stop.is_set():
                     break
-                if not loop_until_stop and index >= count:
+                if not loop_until_stop and accepted >= count:
                     break
-                wait_s = _human_delay(12.0, 48.0)
+                wait_s = _human_delay(8.0, 22.0) if skipped else _human_delay(12.0, 48.0)
                 self.log(f"다음 생성까지 {wait_s:.1f}초 대기...", "info")
                 self._sleep(wait_s)
 
@@ -727,8 +743,27 @@ class TempMailGenerator:
         self._sleep(_random_delay(*DELAY_AFTER_CLOSE))
         return email, inbox_url
 
+    def _domain_allowed(self, email: str) -> bool:
+        if not self._allowed_domains:
+            return True
+        domain = email_domain_of(email)
+        return bool(domain) and domain in self._allowed_domains
+
+    def _keep_or_skip(self, page: Page, email: str) -> tuple[str, str] | None:
+        email = (email or "").strip()
+        if not email:
+            raise PostingError("화면에서 새 이메일 주소를 읽지 못했습니다.")
+        if not self._domain_allowed(email):
+            shown = ", ".join(f"@{d}" for d in self._allowed_domains)
+            self.log(f"허용 도메인 아님 → 건너뜀: {email} (허용: {shown})", "info")
+            self._last_completed_email = email
+            return None
+        result = self._save_and_copy(page, email)
+        self._last_completed_email = result[0]
+        return result
+
     # -- 이메일 생성 1회 ---------------------------------------------------
-    def _generate_one(self, pw) -> tuple[str, str]:
+    def _generate_one(self, pw) -> tuple[str, str] | None:
         page = self._active_page(pw)
         displayed = self._read_displayed_email(page) or ""
 
@@ -738,9 +773,7 @@ class TempMailGenerator:
             and displayed.lower() != self._last_completed_email.lower()
         ):
             self.log(f"이미 생성된 이메일 확인 → New Email 건너뜀: {displayed}", "success")
-            result = self._save_and_copy(page, displayed)
-            self._last_completed_email = result[0]
-            return result
+            return self._keep_or_skip(page, displayed)
 
         # Inbox에 환영 메일이 보이면 New Email 금지 — 본문 일치까지 대기
         if (
@@ -754,9 +787,7 @@ class TempMailGenerator:
             )
             self._wait_for_welcome_match(page)
             current = self._read_displayed_email(page) or displayed
-            result = self._save_and_copy(page, current)
-            self._last_completed_email = result[0]
-            return result
+            return self._keep_or_skip(page, current)
 
         previous = displayed
         self._sleep(_random_delay(*DELAY_BEFORE_NEW))
@@ -775,19 +806,12 @@ class TempMailGenerator:
         if self._is_welcome_verified(page, require_new=previous):
             current = self._read_displayed_email(page)
             self.log(f"생성 완료 확인 → Save address 진행: {current}", "success")
-            result = self._save_and_copy(page, current)
-            self._last_completed_email = result[0]
-            return result
+            return self._keep_or_skip(page, current or "")
 
         self._wait_for_welcome_match(page, require_new=previous)
 
         current_email = self._read_displayed_email(page) or ""
-        if not current_email:
-            raise PostingError("화면에서 새 이메일 주소를 읽지 못했습니다.")
-
-        result = self._save_and_copy(page, current_email)
-        self._last_completed_email = result[0]
-        return result
+        return self._keep_or_skip(page, current_email)
 
     @staticmethod
     def _read_displayed_email(page: Page) -> str:
@@ -867,6 +891,39 @@ class TempMailGenerator:
             page.keyboard.press("Escape")
         except Error:
             pass
+
+
+def email_domain_of(email: str) -> str:
+    text = (email or "").strip().lower()
+    if "@" not in text:
+        return ""
+    return text.rsplit("@", 1)[-1].strip()
+
+
+def normalize_email_domain(value: str) -> str:
+    text = (value or "").strip().lower().lstrip("@")
+    if "@" in text:
+        text = text.rsplit("@", 1)[-1].strip()
+    text = re.sub(r"^https?://", "", text)
+    text = text.split("/")[0].strip(" .")
+    if not text or "." not in text or " " in text:
+        raise PostingError("이메일 뒷주소 형식이 아닙니다. 예: @blenched.com")
+    return text
+
+
+def normalize_email_domains(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in values:
+        try:
+            domain = normalize_email_domain(str(raw))
+        except PostingError:
+            continue
+        if domain in seen:
+            continue
+        seen.add(domain)
+        result.append(domain)
+    return result
 
 
 def normalize_tempmail_url(value: str) -> str:
