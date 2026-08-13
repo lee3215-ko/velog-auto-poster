@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 import random
 import re
@@ -71,7 +72,7 @@ def classify_failure(message: str) -> str:
         return "image"
     login_keys = (
         "로그인", "인증 메일", "인증 링크", "TempMail", "가입 인증",
-        "새 글 작성 버튼", "Cloudflare 인증",
+        "새 글 작성 버튼", "Cloudflare 인증", "AdGuard",
     )
     publish_keys = ("출간", "게시글")
     for key in login_keys:
@@ -126,8 +127,9 @@ def parse_tempmail_address(inbox_url: str) -> tuple[str, str]:
 
 
 def extract_velog_link(body: str) -> str:
+    text = html.unescape(body or "")
     parser = _LinkParser()
-    parser.feed(body)
+    parser.feed(text)
     candidates: list[str] = []
     for link in parser.links:
         parsed = urlparse(link)
@@ -135,8 +137,22 @@ def extract_velog_link(body: str) -> str:
             if parsed.path != "/" or parsed.query:
                 candidates.append(link)
     if not candidates:
+        for match in re.finditer(r"https://(?:www\.)?velog\.io/[^\s\"'<>\\]+", text, re.I):
+            link = match.group(0).rstrip(").,;")
+            parsed = urlparse(link)
+            if parsed.path != "/" or parsed.query:
+                candidates.append(link)
+    if not candidates:
         raise PostingError("인증 메일에서 벨로그 인증 링크를 찾지 못했습니다.")
+    for link in reversed(candidates):
+        low = link.lower()
+        if "email" in low or "login" in low or "code=" in low or "token" in low:
+            return link
     return candidates[-1]
+
+
+ADGUARD_TEMPMAIL_URL = "https://adguard.com/ko/adguard-temp-mail/overview.html"
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 
 def _strip_html(text: str) -> str:
@@ -340,15 +356,18 @@ class VelogPoster:
         *,
         signed_up_emails: set[str] | None = None,
         on_signup=None,
+        on_account=None,
     ) -> None:
         self._emit = log
         self._prefix = ""  # 진행 중 계정 번호 표시 (예: "[2/5] ")
         # on_result(velog_id, url): 한 계정 발행이 끝나면 결과 URL 을 알린다.
         # on_failed(velog_id, manuscript_path, reason): 발행 실패 시 원고 정리·재시도 카운트용.
         # on_signup(email): 신규 가입 성공 시 기억용.
+        # on_account(email, manuscript_path): AdGuard 등에서 주소가 만들어지면 목록 등록용.
         self.on_result = on_result
         self.on_failed = on_failed
         self.on_signup = on_signup
+        self.on_account = on_account
         self._signed_up_emails = {
             str(e).strip().lower() for e in (signed_up_emails or set()) if str(e).strip()
         }
@@ -464,6 +483,9 @@ class VelogPoster:
 
     def _run_one(self, pw, chrome: Path, account: dict[str, str]) -> None:
         """한 계정의 전체 흐름을 수행한다."""
+        if str(account.get("mail_provider") or "").strip().lower() == "adguard":
+            self._run_one_adguard(pw, chrome, account)
+            return
         velog_id = account["velog_id"].strip()
         inbox_url = normalize_url(account["inbox_url"])
         title, body, tags = read_manuscript(account["manuscript_path"])
@@ -520,6 +542,77 @@ class VelogPoster:
         if self.on_result is not None:
             try:
                 self.on_result(velog_id, url)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _run_one_adguard(self, pw, chrome: Path, account: dict[str, str]) -> None:
+        """AdGuard 임시메일 생성 → 벨로그 가입/로그인 → 작성 → 출간."""
+        title, body, tags = read_manuscript(account["manuscript_path"])
+        image_folder = (account.get("image_folder") or "").strip()
+        homepages = [str(u).strip() for u in (account.get("homepages") or []) if str(u).strip()]
+        anchors = account.get("anchors") or []
+        if anchors:
+            a = random.choice(anchors)
+            anchor_text = (a.get("anchor") or "").strip()
+            anchor_url = (a.get("url") or "").strip()
+            if anchor_text and anchor_url:
+                body = f"{body.rstrip()}\n\n[{anchor_text}]({anchor_url})"
+
+        self._user_foreground_hwnd = self._capture_foreground_hwnd()
+        self._launch_incognito(pw, chrome)
+        self._restore_user_focus()
+
+        mail = self._first_page()
+        self._inject_stealth(mail)
+        email = self._adguard_create_address(pw, mail)
+        account["velog_id"] = email
+        self._emit(email, "working")
+        if self.on_account is not None:
+            try:
+                self.on_account(email, str(account.get("manuscript_path") or ""))
+            except Exception:  # noqa: BLE001
+                pass
+
+        self._ensure_connected(pw)
+        assert self._context is not None
+        velog = self._context.new_page()
+        self._inject_stealth(velog)
+        self._request_login(pw, velog, email)
+
+        self._ensure_connected(pw)
+        mail = self._page_by_host("adguard.com")
+        link = self._wait_adguard_velog_mail(mail)
+        velog = self._page_by_host("velog.io")
+        self._open_link(pw, velog, link)
+
+        self._ensure_connected(pw)
+        velog = self._page_by_host("velog.io")
+        is_signup, profile_name = self._handle_signup_if_needed(pw, velog, account)
+        self._ensure_connected(pw)
+        self._restore_user_focus()
+        velog = self._page_by_host("velog.io")
+        if not is_signup:
+            self.log("로그인 중.. (기존 계정)", "info")
+        elif profile_name:
+            self._set_blog_title(velog, profile_name)
+
+        image_link = random.choice(homepages) if (image_folder and homepages) else ""
+        target = self._write_post(
+            self._page_by_host("velog.io"),
+            title,
+            body,
+            tags=tags,
+            image_folder=image_folder,
+            image_link=image_link,
+        )
+        self._restore_user_focus()
+
+        url = self._publish(pw, target)
+        if not url or not self._is_post_url(url):
+            raise PostingError("출간에 실패했습니다. 게시글 주소를 확인하지 못했습니다.")
+        if self.on_result is not None:
+            try:
+                self.on_result(email, url)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -726,6 +819,15 @@ class VelogPoster:
         자동 통과되게 한 뒤 재연결한다. (사람 클릭 불필요)"""
         if not self._is_interstitial(page):
             return
+        needle = "velog.io"
+        try:
+            host = (urlparse(page.url).netloc or "").lower()
+            if "adguard.com" in host:
+                needle = "adguard.com"
+            elif host:
+                needle = host
+        except Exception:  # noqa: BLE001
+            pass
         self.log("Cloudflare 사람 확인 감지 → 연결을 끊어 자동 우회합니다...", "info")
         if not self._endpoint:
             return
@@ -738,7 +840,7 @@ class VelogPoster:
             passed = False
             try:
                 browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
-                p = self._find_velog_page(browser)
+                p = self._find_page_containing(browser, needle)
                 if p is not None and not self._is_interstitial(p):
                     passed = True
             except (Error, PWTimeoutError):
@@ -762,7 +864,8 @@ class VelogPoster:
         self._goto(page, "https://velog.io/")
         self._wait("화면이 준비되기를 기다리는 중...", _jitter(2.5, 1.0))
         self._wait_if_cloudflare(pw, page)
-        page = self._first_page()  # 우회로 재연결됐을 수 있어 페이지를 다시 잡는다
+        self._ensure_connected(pw)
+        page = self._page_by_host("velog.io")
 
         email_input = page.get_by_placeholder("이메일을 입력하세요.")
         if not email_input.is_visible():
@@ -880,6 +983,122 @@ class VelogPoster:
         self._goto(page, link)
         self._wait("로그인 처리가 끝나기를 기다리는 중...", _human_delay(6.0, 11.0))
         self._wait_if_cloudflare(pw, page)
+
+    # -- AdGuard 임시 메일 ------------------------------------------------
+    def _adguard_create_address(self, pw, page: Page) -> str:
+        self.log("AdGuard 임시 메일에 접속하는 중...", "info")
+        self._goto(page, ADGUARD_TEMPMAIL_URL)
+        self._wait("AdGuard 화면이 준비되기를 기다리는 중...", _jitter(3.0, 1.2))
+        self._wait_if_cloudflare(pw, page)
+        self._ensure_connected(pw)
+        page = self._page_by_host("adguard.com")
+        self._adguard_dismiss_banners(page)
+
+        existing = self._adguard_read_email(page)
+        if existing:
+            self.log(f"이미 생성된 AdGuard 주소: {existing}", "success")
+            return existing
+
+        btn = page.locator("button.address__get-address-btn")
+        if btn.count() == 0 or not btn.first.is_visible():
+            btn = page.get_by_role("button", name="주소 생성")
+        if btn.count() == 0:
+            btn = page.locator("button:has-text('주소 생성')")
+        try:
+            btn.first.wait_for(state="visible", timeout=25_000)
+        except (Error, PWTimeoutError) as exc:
+            raise PostingError("AdGuard '주소 생성' 버튼을 찾지 못했습니다.") from exc
+        self._sleep(_jitter(0.6, 0.3))
+        self._stable_click(btn.first)
+        self.log("주소 생성 버튼을 눌렀습니다. 메일 주소를 기다리는 중...", "info")
+
+        for _ in range(40):
+            if self._stop.wait(1):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            email = self._adguard_read_email(page)
+            if email:
+                self.log(f"AdGuard 임시 메일 생성: {email}", "success")
+                return email
+        raise PostingError("AdGuard 임시 메일 주소가 시간 내에 나타나지 않았습니다.")
+
+    def _adguard_dismiss_banners(self, page: Page) -> None:
+        for name in ("동의", "수락", "Accept", "I agree", "확인"):
+            try:
+                loc = page.get_by_role("button", name=name)
+                if loc.count() > 0 and loc.first.is_visible():
+                    loc.first.click(timeout=3_000)
+                    self._sleep(0.4)
+                    return
+            except Error:
+                continue
+
+    @staticmethod
+    def _adguard_read_email(page: Page) -> str:
+        selectors = (
+            "span.address__copy-text",
+            "button.address__copy .address__copy-text",
+            "button.address__copy",
+        )
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if loc.count() == 0:
+                    continue
+                text = (loc.first.inner_text(timeout=2_000) or "").strip()
+                match = _EMAIL_RE.search(text)
+                if match:
+                    return match.group(0)
+            except Error:
+                continue
+        return ""
+
+    def _wait_adguard_velog_mail(self, page: Page) -> str:
+        self.log("AdGuard 받은편지함에서 벨로그 인증 메일을 기다리는 중...", "info")
+        for _ in range(36):
+            if self._stop.wait(5):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            try:
+                rows = page.locator(".email-row")
+                for index in range(rows.count()):
+                    row = rows.nth(index)
+                    try:
+                        sender = (row.locator(".email-row__from").inner_text() or "").strip()
+                        desc = (row.locator(".email-row__desc").inner_text() or "").strip()
+                    except Error:
+                        continue
+                    blob = f"{sender} {desc}".lower()
+                    if "adguard.com" in blob or "adguard 임시" in blob or "환영합니다" in desc:
+                        continue
+                    if "velog" not in blob and "verify@" not in blob:
+                        continue
+                    self.log(f"인증 메일 확인: {sender} / {desc}", "info")
+                    self._stable_click(row)
+                    self._sleep(_jitter(1.6, 0.6))
+                    return self._adguard_extract_link(page)
+            except Error:
+                pass
+        raise PostingError("3분 안에 AdGuard 받은편지함에 벨로그 인증 메일이 도착하지 않았습니다.")
+
+    def _adguard_extract_link(self, page: Page) -> str:
+        iframe = page.locator("iframe.letter-iframe__content, .letter-iframe iframe")
+        try:
+            iframe.first.wait_for(state="attached", timeout=15_000)
+        except (Error, PWTimeoutError) as exc:
+            raise PostingError("인증 메일 본문을 열지 못했습니다.") from exc
+        srcdoc = ""
+        try:
+            srcdoc = iframe.first.get_attribute("srcdoc") or ""
+        except Error:
+            srcdoc = ""
+        if srcdoc.strip():
+            return extract_velog_link(srcdoc)
+        try:
+            frame = iframe.first.content_frame
+            if frame is not None:
+                return extract_velog_link(frame.content())
+        except Error:
+            pass
+        raise PostingError("인증 메일에서 벨로그 인증 링크를 찾지 못했습니다.")
 
     # -- 신규 계정 회원가입 ----------------------------------------------
     def _handle_signup_if_needed(self, pw, page: Page, account: dict) -> tuple[bool, str | None]:
@@ -1818,19 +2037,34 @@ class VelogPoster:
                 return True
         return False
 
+    def _page_by_host(self, host: str) -> Page:
+        """현재 컨텍스트에서 host 가 들어간 탭을 찾는다. 최신 탭 우선."""
+        if self._context is None:
+            raise PostingError("브라우저 연결이 없습니다.")
+        for page in reversed(self._context.pages):
+            try:
+                if page.is_closed():
+                    continue
+                if host in (page.url or ""):
+                    return page
+            except Error:
+                continue
+        raise PostingError(f"{host} 탭을 찾지 못했습니다.")
+
     @staticmethod
-    def _find_velog_page(browser) -> Page | None:
+    def _find_page_containing(browser, needle: str) -> Page | None:
         for ctx in browser.contexts:
-            for p in ctx.pages:
+            for page in ctx.pages:
                 try:
-                    if "velog.io" in p.url:
-                        return p
+                    if needle in (page.url or ""):
+                        return page
                 except Error:
                     continue
-        for ctx in browser.contexts:
-            if ctx.pages:
-                return ctx.pages[0]
         return None
+
+    @staticmethod
+    def _find_velog_page(browser) -> Page | None:
+        return VelogPoster._find_page_containing(browser, "velog.io")
 
     def _disconnect_only(self) -> None:
         """Chrome 창/프로세스는 그대로 두고 현재 CDP 연결만 해제한다."""

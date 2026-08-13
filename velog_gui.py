@@ -29,6 +29,7 @@ from paths import APP_VERSION, EXE_NAME, UPDATE_VERSION_URL
 from tempmail_generator import TempMailGenerator
 from update_ui import schedule_update_check
 from velog_poster import (
+    ADGUARD_TEMPMAIL_URL,
     DEFAULT_PROFILE_NAMES,
     PostingError,
     VelogPoster,
@@ -66,7 +67,7 @@ NAV_HOVER_BG = "#e2e8f0"
 ACCOUNT_KEYS = (
     "velog_id", "inbox_url", "manuscript_path",
     "published_url", "published_at", "created_at", "mail_mismatch",
-    "fail_count",
+    "fail_count", "mail_provider",
 )
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 MANUSCRIPT_EXTS = {".txt", ".html", ".htm", ".md"}
@@ -280,6 +281,13 @@ class VelogApp(tk.Tk):
         self._tm_run_done = 0
         self._tm_target_tab_index = 0
 
+        self.ag_count = tk.IntVar(value=1)
+        self.ag_loop_until_stop = tk.BooleanVar(value=False)
+        self.ag_status = tk.StringVar(
+            value="대기 중 — 원고 폴더를 지정한 뒤 [출간 시작]을 누르세요.",
+        )
+        self.ag_progress_text = tk.StringVar(value="")
+
         self._build_style()
         self._build_ui()
         self._bind_shortcuts()
@@ -382,6 +390,7 @@ class VelogApp(tk.Tk):
         items = (
             ("posting", "벨로그 포스팅"),
             ("tempmail", "임시 메일 생성"),
+            ("adguard", "AdGuard 출간"),
             ("log", "실행 로그"),
         )
         for index, (key, label) in enumerate(items):
@@ -492,13 +501,16 @@ class VelogApp(tk.Tk):
 
         posting_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         tempmail_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
+        adguard_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         log_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         self._main_views["posting"] = posting_frame
         self._main_views["tempmail"] = tempmail_frame
+        self._main_views["adguard"] = adguard_frame
         self._main_views["log"] = log_frame
 
         self._build_posting_tab(posting_frame)
         self._build_tempmail_tab(tempmail_frame)
+        self._build_adguard_tab(adguard_frame)
         self._build_log_tab(log_frame)
         self._switch_main_view("posting")
 
@@ -694,6 +706,80 @@ class VelogApp(tk.Tk):
         self.tm_log_box.tag_config("success", foreground="#4ade80")
         self.tm_log_box.tag_config("error", foreground="#f87171")
         self.tm_log_box.tag_config("info", foreground="#94a3b8")
+
+    def _build_adguard_tab(self, root: ttk.Frame) -> None:
+        header = ttk.Frame(root, style="Bg.TFrame")
+        header.pack(side="top", fill="x", pady=(0, 8))
+        ttk.Label(header, text="AdGuard 임시메일 출간", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="주소 생성 → 벨로그 가입 → 원고 작성 → 출간까지 한 계정씩 이어서 진행합니다.",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        bottom = ttk.Frame(root, style="Bg.TFrame")
+        bottom.pack(side="bottom", fill="x", pady=(8, 0))
+        prog_row = ttk.Frame(bottom, style="Bg.TFrame")
+        prog_row.pack(fill="x", pady=(0, 6))
+        self.ag_progress = ttk.Progressbar(
+            prog_row, mode="determinate", style="green.Horizontal.TProgressbar",
+        )
+        self.ag_progress.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ttk.Label(prog_row, textvariable=self.ag_progress_text, style="Sub.TLabel").pack(side="right")
+
+        action_row = ttk.Frame(bottom, style="Bg.TFrame")
+        action_row.pack(fill="x")
+        action_row.columnconfigure(0, weight=3)
+        action_row.columnconfigure(1, weight=1)
+        self.ag_start_btn = ttk.Button(
+            action_row, text="▶  출간 시작", style="Primary.TButton", command=self._start_adguard,
+        )
+        self.ag_start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.ag_stop_btn = ttk.Button(
+            action_row, text="■  중단", style="Danger.TButton",
+            command=self._stop, state="disabled",
+        )
+        self.ag_stop_btn.grid(row=0, column=1, sticky="ew")
+        ttk.Label(bottom, textvariable=self.ag_status, style="Status.TLabel").pack(
+            fill="x", pady=(8, 0),
+        )
+
+        body = self._section(
+            root,
+            "출간 설정",
+            "원고 폴더·이미지·앵커·사이트 URL은 「벨로그 포스팅」 탭 설정을 그대로 사용합니다.",
+        )
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="출간 개수", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Spinbox(body, from_=1, to=100, textvariable=self.ag_count, width=8, font=(FONT, 10)).grid(
+            row=0, column=1, sticky="w",
+        )
+        ttk.Label(
+            body, text="원고 폴더에서 아직 배정되지 않은 파일 수만큼 진행합니다.",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            body, text="중단할 때까지 남은 원고를 모두 출간 (개수 무시)",
+            variable=self.ag_loop_until_stop,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        info = ttk.Frame(root, style="CardBorder.TFrame")
+        info.pack(fill="both", expand=True, pady=(0, 0))
+        card = ttk.Frame(info, style="Card.TFrame", padding=(16, 14))
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+        ttk.Label(card, text="진행 순서", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(
+            card,
+            text=(
+                "1. 시크릿 Chrome으로 AdGuard 임시메일 접속\n"
+                "2. 「주소 생성」 후 나온 이메일로 벨로그 로그인 요청\n"
+                "3. 받은편지함의 벨로그 인증 메일을 열어 가입\n"
+                "4. 이미지 첨부 → 원고 작성 → 출간\n"
+                "5. 성공한 계정은 선택한 탭 목록에 발행 완료로 추가"
+            ),
+            style="Hint.TLabel",
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
 
     def _build_inputs(self, parent: ttk.Frame) -> None:
         # 이미지 · 사이트 URL (접기/펴기)
@@ -1373,6 +1459,8 @@ class VelogApp(tk.Tk):
 
     @staticmethod
     def _is_mail_mismatch(velog_id: str, inbox_url: str) -> bool:
+        if "adguard" in (inbox_url or "").lower():
+            return False
         try:
             email, _ = parse_tempmail_address(inbox_url)
         except PostingError:
@@ -2010,14 +2098,20 @@ class VelogApp(tk.Tk):
         if total <= 0:
             self.progress.configure(value=0, maximum=100)
             self.progress_text.set("")
+            if hasattr(self, "ag_progress"):
+                self.ag_progress.configure(value=0, maximum=100)
+                self.ag_progress_text.set("")
             return
         self.progress.configure(maximum=total, value=done)
         self.progress_text.set(f"{done} / {total} 진행")
+        if hasattr(self, "ag_progress"):
+            self.ag_progress.configure(maximum=total, value=done)
+            self.ag_progress_text.set(f"{done} / {total} 진행")
 
     # -- 실행 / 중단 ------------------------------------------------------
     def _start(self) -> None:
-        if self._cleaning:
-            messagebox.showinfo("출간", "목록 정리가 끝난 뒤 시작해 주세요.", parent=self)
+        if self._cleaning or self._tm_worker is not None:
+            messagebox.showinfo("출간", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
             return
         tab = self._current_tab()
         if tab is None or not tab["accounts"]:
@@ -2043,7 +2137,9 @@ class VelogApp(tk.Tk):
 
         pending = [
             a for a in tab["accounts"]
-            if str(a.get("manuscript_path", "")).strip() and self._is_eligible_for_assign(a)
+            if str(a.get("manuscript_path", "")).strip()
+            and self._is_eligible_for_assign(a)
+            and str(a.get("mail_provider", "")).strip().lower() != "adguard"
         ]
         if not pending:
             if folder and not self._list_available_manuscripts(folder):
@@ -2092,6 +2188,7 @@ class VelogApp(tk.Tk):
             self._on_failed,
             signed_up_emails=set(self.signed_up_emails),
             on_signup=self._on_signup,
+            on_account=self._on_adguard_account,
         )
         profile_names = self._parse_profile_names()
         anchors = [dict(a) for a in self.anchors]
@@ -2109,6 +2206,118 @@ class VelogApp(tk.Tk):
         self._worker = threading.Thread(target=self._run, args=(accounts,), daemon=True)
         self._worker.start()
 
+    def _start_adguard(self) -> None:
+        if self._cleaning or self._poster is not None or self._tm_worker is not None:
+            messagebox.showinfo("출간", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
+            return
+        folder = self.manuscript_folder.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning(
+                "원고 폴더",
+                "「벨로그 포스팅」 탭에서 원고 폴더를 먼저 지정해 주세요.",
+                parent=self,
+            )
+            return
+        files = self._list_available_manuscripts(folder)
+        if not files:
+            messagebox.showinfo(
+                "원고 없음",
+                "출간할 원고가 없습니다.\n"
+                "원고 폴더에 파일을 넣거나, 이미 배정된 원고는 제외됩니다.",
+                parent=self,
+            )
+            return
+        loop = bool(self.ag_loop_until_stop.get())
+        try:
+            count = int(self.ag_count.get())
+        except (tk.TclError, ValueError):
+            count = 1
+        if not loop:
+            files = files[: max(1, min(count, 100))]
+        image_folder = self.image_folder.get().strip()
+        try:
+            if image_folder:
+                self._check_image_folder(image_folder)
+            for path in files:
+                read_manuscript(str(path))
+        except PostingError as exc:
+            messagebox.showwarning("등록 정보 확인", str(exc), parent=self)
+            return
+
+        if not self.tabs:
+            self.tabs.append({"title": "기본", "accounts": []})
+            self._rebuild_tabs()
+        tab_index = self._ask_account_tab()
+        if tab_index is None:
+            return
+        self._active_tab = self.tabs[tab_index]
+        tab_title = self._active_tab["title"]
+
+        jobs = [
+            {
+                "velog_id": "",
+                "inbox_url": ADGUARD_TEMPMAIL_URL,
+                "manuscript_path": str(path),
+                "mail_provider": "adguard",
+                "image_folder": image_folder,
+                "profile_names": self._parse_profile_names(),
+                "anchors": [dict(a) for a in self.anchors],
+                "homepages": list(self.homepages),
+            }
+            for path in files
+        ]
+        self._run_total = len(jobs)
+        self._run_done = 0
+        self._set_progress(0, self._run_total)
+        self._set_running(True)
+        self._switch_main_view("log")
+        self._append(
+            f"AdGuard 출간 시작 — 「{tab_title}」 {len(jobs)}건 "
+            "(주소 생성 → 가입 → 작성 → 출간)",
+            "info",
+        )
+        self._poster = VelogPoster(
+            self._post_event,
+            self._on_result,
+            self._on_failed,
+            signed_up_emails=set(self.signed_up_emails),
+            on_signup=self._on_signup,
+            on_account=self._on_adguard_account,
+        )
+        self._worker = threading.Thread(target=self._run, args=(jobs,), daemon=True)
+        self._worker.start()
+
+    def _ensure_listed_account(
+        self,
+        velog_id: str,
+        manuscript_path: str,
+        *,
+        provider: str = "adguard",
+    ) -> None:
+        tab = self._active_tab or self._current_tab()
+        if tab is None or not (velog_id or "").strip():
+            return
+        for acc in tab["accounts"]:
+            if acc.get("velog_id") == velog_id:
+                if manuscript_path:
+                    acc["manuscript_path"] = manuscript_path
+                acc["mail_provider"] = provider
+                self._fill_tree(tab)
+                self._save_settings()
+                return
+        tab["accounts"].append({
+            "velog_id": velog_id.strip(),
+            "inbox_url": ADGUARD_TEMPMAIL_URL,
+            "manuscript_path": manuscript_path,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "mail_mismatch": "",
+            "mail_provider": provider,
+        })
+        self._fill_tree(tab)
+        self._update_summary()
+        self._save_settings()
+        self._append(f"AdGuard 계정 등록: {velog_id}", "info")
+
     def _on_result(self, velog_id: str, url: str) -> None:
         self._events.put((f"{velog_id}\t{url}", "result"))
 
@@ -2117,6 +2326,9 @@ class VelogApp(tk.Tk):
 
     def _on_signup(self, email: str) -> None:
         self._events.put((str(email or "").strip().lower(), "signup"))
+
+    def _on_adguard_account(self, email: str, manuscript_path: str) -> None:
+        self._events.put((f"{email}\t{manuscript_path}", "account"))
 
     def _add_anchor(self) -> None:
         text = self.anchor_text.get().strip()
@@ -2226,9 +2438,13 @@ class VelogApp(tk.Tk):
     def _stop(self) -> None:
         if self._poster is not None:
             self.status.set("중단하는 중...")
+            if hasattr(self, "ag_status"):
+                self.ag_status.set("중단하는 중...")
             self._append("중단을 요청했습니다.", "info")
             self._poster.stop()
             self.stop_btn.configure(state="disabled")
+            if hasattr(self, "ag_stop_btn"):
+                self.ag_stop_btn.configure(state="disabled")
 
     def _post_event(self, message: str, level: str) -> None:
         self._events.put((message, level))
@@ -2259,6 +2475,10 @@ class VelogApp(tk.Tk):
                     self._run_done += 1
                     self._set_progress(self._run_done, self._run_total)
                     self._mark_failed(velog_id, manuscript_path, reason)
+                    continue
+                if level == "account":
+                    email, _, path = message.partition("\t")
+                    self._ensure_listed_account(email, path, provider="adguard")
                     continue
                 if level == "signup":
                     email = (message or "").strip().lower()
@@ -2344,6 +2564,12 @@ class VelogApp(tk.Tk):
                 target = acc
                 break
         if target is None:
+            for acc in accounts:
+                if acc.get("velog_id") == velog_id:
+                    target = acc
+                    break
+        if target is None:
+            self._ensure_listed_account(velog_id, "", provider="adguard")
             for acc in accounts:
                 if acc.get("velog_id") == velog_id:
                     target = acc
@@ -2440,16 +2666,23 @@ class VelogApp(tk.Tk):
     def _set_running(self, running: bool) -> None:
         self.start_btn.configure(state="disabled" if running else "normal")
         self.stop_btn.configure(state="normal" if running else "disabled")
+        if hasattr(self, "ag_start_btn"):
+            self.ag_start_btn.configure(state="disabled" if running else "normal")
+            self.ag_stop_btn.configure(state="normal" if running else "disabled")
+        if hasattr(self, "tm_start_btn"):
+            self.tm_start_btn.configure(state="disabled" if running else "normal")
         if hasattr(self, "clean_btn"):
             self.clean_btn.configure(state="disabled" if (running or self._cleaning) else "normal")
         if running:
             self.status.set("출간 작업 진행 중...")
+            if hasattr(self, "ag_status"):
+                self.ag_status.set("출간 작업 진행 중...")
         else:
             self.working_id.set("")
-            if self.status.get().endswith("중단하는 중..."):
-                self.status.set("중단됨")
-            else:
-                self.status.set("작업이 완료되었습니다.")
+            done_text = "중단됨" if self.status.get().endswith("중단하는 중...") else "작업이 완료되었습니다."
+            self.status.set(done_text)
+            if hasattr(self, "ag_status"):
+                self.ag_status.set(done_text)
 
     def _append(self, message: str, tag: str = "") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -2651,6 +2884,10 @@ class VelogApp(tk.Tk):
     def _set_tm_running(self, running: bool) -> None:
         self.tm_start_btn.configure(state="disabled" if running else "normal")
         self.tm_stop_btn.configure(state="normal" if running else "disabled")
+        if hasattr(self, "start_btn"):
+            self.start_btn.configure(state="disabled" if running else "normal")
+        if hasattr(self, "ag_start_btn"):
+            self.ag_start_btn.configure(state="disabled" if running else "normal")
         if running:
             self.tm_status.set("임시 메일 생성 중...")
         else:
@@ -2667,7 +2904,8 @@ class VelogApp(tk.Tk):
                 self.tm_progress_text.set(f"{self._tm_run_done}개 완료")
 
     def _start_tempmail(self) -> None:
-        if self._tm_worker is not None:
+        if self._tm_worker is not None or self._poster is not None:
+            messagebox.showinfo("임시 메일", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
             return
         loop = bool(self.tm_loop_until_stop.get())
         try:
