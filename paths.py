@@ -1,6 +1,6 @@
 """앱 버전·업데이트 URL (배포 시 publish.ps1 이 자동 갱신)."""
 
-APP_VERSION = "1.0.36"
+APP_VERSION = "1.0.37"
 APP_NAME = "VelogPoster"
 EXE_NAME = "VelogPoster.exe"
 ZIP_INNER_FOLDER = "VelogPoster"

@@ -647,10 +647,16 @@ class VelogPoster:
                 self._sleep(_jitter(1.2, 0.5))
             try:
                 self._user_foreground_hwnd = self._capture_foreground_hwnd()
-                self._launch_incognito(pw, path, browser_name=name)
+                self._launch_incognito(
+                    pw,
+                    path,
+                    browser_name=name,
+                    incognito=False,
+                    start_url=ADGUARD_TEMPMAIL_URL,
+                    connect_delay=_human_delay(8.0, 14.0),
+                )
                 self._restore_user_focus()
                 mail = self._first_page()
-                self._inject_stealth(mail)
                 email = self._adguard_create_address(pw, mail)
                 break
             except BrowserCheckFailed as exc:
@@ -665,9 +671,11 @@ class VelogPoster:
                     continue
                 raise
         else:
+            tried = ", ".join(n for n, _ in browsers) or "Chrome"
             raise PostingError(
-                "AdGuard 브라우저 확인에 실패했습니다. "
-                "Edge 등 다른 브라우저를 설치한 뒤 다시 시도해 주세요.",
+                f"AdGuard 브라우저 확인에 실패했습니다. "
+                f"이미 설치된 {tried}로 시도했지만 통과하지 못했습니다. "
+                "브라우저를 따로 설치할 필요는 없습니다. 잠시 뒤 다시 시도해 주세요.",
             ) from last_blocked
         account["velog_id"] = email
         self._emit(email, "working")
@@ -721,7 +729,16 @@ class VelogPoster:
                 pass
 
     # -- Chrome 실행 / 연결 -----------------------------------------------
-    def _launch_incognito(self, pw, chrome: Path, *, browser_name: str = "Chrome") -> None:
+    def _launch_incognito(
+        self,
+        pw,
+        chrome: Path,
+        *,
+        browser_name: str = "Chrome",
+        incognito: bool = True,
+        start_url: str = "about:blank",
+        connect_delay: float = 0.0,
+    ) -> None:
         port = self._free_port()
         # 이미 실행 중인 사용자 Chrome과 충돌하지 않도록 전용 임시 프로필을 쓴다.
         # (전용 user-data-dir 가 없으면 새 chrome.exe 가 기존 인스턴스에 명령만
@@ -729,12 +746,8 @@ class VelogPoster:
         self._browser_label = browser_name or "Chrome"
         slug = re.sub(r"[^a-z0-9]+", "-", self._browser_label.lower()).strip("-") or "chrome"
         self._temp_profile = Path(tempfile.mkdtemp(prefix=f"velog-{slug}-"))
-        private_flag = "--inprivate" if "msedge" in chrome.name.lower() else "--incognito"
-        # 시크릿 모드 + 자동화 배너가 뜨지 않는 안전한 플래그만 사용.
-        # --start-maximized 는 작업 창을 강제로 전면 최대화하므로 쓰지 않는다.
         command = [
             str(chrome),
-            private_flag,
             f"--user-data-dir={self._temp_profile}",
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
@@ -744,21 +757,27 @@ class VelogPoster:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
-            "about:blank",
+            start_url or "about:blank",
         ]
-        self.log(f"{self._browser_label} 시크릿 창을 여는 중...", "info")
+        if incognito:
+            command.insert(1, "--inprivate" if "msedge" in chrome.name.lower() else "--incognito")
+        mode = "시크릿 창" if incognito else "창"
+        self.log(f"{self._browser_label} {mode}을 여는 중...", "info")
         try:
             self._process = subprocess.Popen(command, close_fds=True)
         except OSError as rest:
-            raise PostingError(f"{self._browser_label} 시크릿 창을 실행하지 못했습니다.") from rest
+            raise PostingError(f"{self._browser_label} {mode}을 실행하지 못했습니다.") from rest
 
         endpoint = f"http://127.0.0.1:{port}"
         self._endpoint = endpoint  # 출간 단계에서 재연결할 때 사용
         self._wait_for_endpoint(endpoint)
+        if connect_delay > 0:
+            self.log("브라우저 확인이 끝나기를 기다리는 중... (자동화 연결 전)", "info")
+            self._sleep(connect_delay)
         try:
             self._browser = pw.chromium.connect_over_cdp(endpoint, timeout=20_000)
-        except Error as exc:
-            raise PostingError(f"{self._browser_label}에 연결하지 못했습니다.") from exc
+        except Error as rest:
+            raise PostingError(f"{self._browser_label}에 연결하지 못했습니다.") from rest
 
         if not self._browser.contexts:
             raise PostingError(f"{self._browser_label} 컨텍스트를 찾지 못했습니다.")
@@ -1115,14 +1134,22 @@ class VelogPoster:
         return page
 
     def _adguard_create_address(self, pw, page: Page) -> str:
-        self.log("AdGuard 임시 메일에 접속하는 중...", "info")
-        self._goto(page, ADGUARD_TEMPMAIL_URL)
-        self._wait("AdGuard 화면이 준비되기를 기다리는 중...", _jitter(3.0, 1.2))
+        already = "tempmail.adguard.com" in (page.url or "").lower()
+        if already:
+            self.log("AdGuard 화면 확인 중...", "info")
+            self._wait("브라우저 확인 이후 화면을 읽는 중...", _jitter(1.5, 0.8))
+        else:
+            self.log("AdGuard 임시 메일에 접속하는 중...", "info")
+            self._goto(page, ADGUARD_TEMPMAIL_URL)
+            self._wait("AdGuard 화면이 준비되기를 기다리는 중...", _jitter(3.0, 1.2))
         self._wait_if_cloudflare(pw, page)
         self._ensure_connected(pw)
         page = self._adguard_mail_page()
         self._adguard_dismiss_banners(page)
         root = self._adguard_scope(page)
+        if self._adguard_browser_blocked(page, root):
+            page = self._adguard_recover_browser_check(pw, page)
+            root = self._adguard_scope(page)
         self._adguard_raise_if_blocked(page, root)
 
         btn = None
@@ -1162,6 +1189,26 @@ class VelogPoster:
             raise BrowserCheckFailed(
                 "AdGuard 브라우저 확인 실패 — 다른 브라우저로 다시 엽니다.",
             )
+
+    def _adguard_recover_browser_check(self, pw, page: Page) -> Page:
+        """확인 실패 화면이면 CDP를 끊고 사람이 연 것처럼 다시 읽는다."""
+        self.log("AdGuard 브라우저 확인 실패 → 연결을 끊고 다시 확인합니다...", "info")
+        if not self._endpoint:
+            return page
+        self._disconnect_only()
+        self._sleep(_human_delay(10.0, 18.0))
+        self._ensure_connected(pw)
+        try:
+            page = self._adguard_mail_page()
+        except PostingError:
+            page = self._first_page()
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=30_000)
+        except (Error, PWTimeoutError):
+            self._goto(page, ADGUARD_TEMPMAIL_URL)
+        self._wait("AdGuard 화면을 다시 확인하는 중...", _jitter(2.5, 1.0))
+        self._adguard_dismiss_banners(page)
+        return page
 
     def _adguard_browser_blocked(self, page: Page, root=None) -> bool:
         scopes = []

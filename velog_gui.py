@@ -746,7 +746,7 @@ class VelogApp(tk.Tk):
         ttk.Label(header, text="AdGuard 임시메일 출간", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="주소 생성 → 벨로그 가입 → 원고 작성 → 출간까지 한 계정씩 이어서 진행합니다. 브라우저 확인 실패 시 Edge 등으로 자동 전환합니다.",
+            text="주소 생성 → 벨로그 가입 → 원고 작성 → 출간까지 한 계정씩 이어서 진행합니다. 브라우저 확인 실패 시 연결을 끊거나 Edge로 바꿔 다시 시도합니다.",
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
