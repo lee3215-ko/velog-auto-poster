@@ -151,8 +151,15 @@ def extract_velog_link(body: str) -> str:
     return candidates[-1]
 
 
-ADGUARD_TEMPMAIL_URL = "https://adguard.com/ko/adguard-temp-mail/overview.html"
+ADGUARD_TEMPMAIL_URL = "https://tempmail.adguard.com/?_locale=ko"
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_ADGUARD_CREATE_SELECTORS = (
+    "button.address__get-address-btn",
+    "button:has-text('주소 생성')",
+    "button:has-text('Get address')",
+    "button:has-text('Get email')",
+    "button:has-text('Create address')",
+)
 
 
 def _strip_html(text: str) -> str:
@@ -580,7 +587,7 @@ class VelogPoster:
         self._request_login(pw, velog, email)
 
         self._ensure_connected(pw)
-        mail = self._page_by_host("adguard.com")
+        mail = self._adguard_mail_page()
         link = self._wait_adguard_velog_mail(mail)
         velog = self._page_by_host("velog.io")
         self._open_link(pw, velog, link)
@@ -985,41 +992,103 @@ class VelogPoster:
         self._wait_if_cloudflare(pw, page)
 
     # -- AdGuard 임시 메일 ------------------------------------------------
+    def _adguard_mail_page(self) -> Page:
+        try:
+            return self._page_by_host("tempmail.adguard.com")
+        except PostingError:
+            return self._page_by_host("adguard.com")
+
+    def _adguard_scope(self, page: Page):
+        """임시메일 UI 문서. overview 페이지면 교차출처 iframe 안을 쓴다."""
+        try:
+            iframe = page.locator("iframe.temp-mail-app__iframe")
+            if iframe.count() > 0:
+                return page.frame_locator("iframe.temp-mail-app__iframe")
+        except Error:
+            pass
+        try:
+            for frame in page.frames:
+                if "tempmail.adguard.com" in (frame.url or "").lower():
+                    return frame
+        except Error:
+            pass
+        return page
+
     def _adguard_create_address(self, pw, page: Page) -> str:
         self.log("AdGuard 임시 메일에 접속하는 중...", "info")
         self._goto(page, ADGUARD_TEMPMAIL_URL)
         self._wait("AdGuard 화면이 준비되기를 기다리는 중...", _jitter(3.0, 1.2))
         self._wait_if_cloudflare(pw, page)
         self._ensure_connected(pw)
-        page = self._page_by_host("adguard.com")
+        page = self._adguard_mail_page()
         self._adguard_dismiss_banners(page)
+        root = self._adguard_scope(page)
 
-        existing = self._adguard_read_email(page)
-        if existing:
-            self.log(f"이미 생성된 AdGuard 주소: {existing}", "success")
-            return existing
+        btn = None
+        for _ in range(40):
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            existing = self._adguard_read_email(root)
+            if existing:
+                self.log(f"이미 생성된 AdGuard 주소: {existing}", "success")
+                return existing
+            btn = self._adguard_find_create_button(root)
+            if btn is not None:
+                break
+            self._sleep(0.5)
+        if btn is None:
+            raise PostingError("AdGuard '주소 생성' 버튼을 찾지 못했습니다.")
 
-        btn = page.locator("button.address__get-address-btn")
-        if btn.count() == 0 or not btn.first.is_visible():
-            btn = page.get_by_role("button", name="주소 생성")
-        if btn.count() == 0:
-            btn = page.locator("button:has-text('주소 생성')")
-        try:
-            btn.first.wait_for(state="visible", timeout=25_000)
-        except (Error, PWTimeoutError) as exc:
-            raise PostingError("AdGuard '주소 생성' 버튼을 찾지 못했습니다.") from exc
         self._sleep(_jitter(0.6, 0.3))
-        self._stable_click(btn.first)
+        self._stable_click(btn)
         self.log("주소 생성 버튼을 눌렀습니다. 메일 주소를 기다리는 중...", "info")
 
         for _ in range(40):
             if self._stop.wait(1):
                 raise PostingError("사용자가 작업을 중단했습니다.")
-            email = self._adguard_read_email(page)
+            email = self._adguard_read_email(root)
             if email:
                 self.log(f"AdGuard 임시 메일 생성: {email}", "success")
                 return email
         raise PostingError("AdGuard 임시 메일 주소가 시간 내에 나타나지 않았습니다.")
+
+    def _adguard_find_create_button(self, root):
+        for sel in _ADGUARD_CREATE_SELECTORS:
+            loc = root.locator(sel)
+            try:
+                if loc.count() > 0 and loc.first.is_visible():
+                    return loc.first
+            except Error:
+                continue
+        try:
+            loc = root.get_by_role(
+                "button",
+                name=re.compile(r"(주소\s*생성|Get address|Create address|Generate)", re.I),
+            )
+            if loc.count() > 0 and loc.first.is_visible():
+                return loc.first
+        except Error:
+            pass
+        try:
+            loc = root.locator("section.address button, .address__in button, .address__field button")
+            for i in range(loc.count()):
+                btn = loc.nth(i)
+                try:
+                    if not btn.is_visible():
+                        continue
+                    cls = btn.get_attribute("class") or ""
+                    text = (btn.inner_text() or "").replace("\n", " ").strip().lower()
+                except Error:
+                    continue
+                if "address__copy" in cls:
+                    continue
+                if "변경" in text or "change" in text or "복사" in text:
+                    continue
+                if "생성" in text or "get" in text or "create" in text or "address__get" in cls:
+                    return btn
+        except Error:
+            pass
+        return None
 
     def _adguard_dismiss_banners(self, page: Page) -> None:
         for name in ("동의", "수락", "Accept", "I agree", "확인"):
@@ -1033,7 +1102,7 @@ class VelogPoster:
                 continue
 
     @staticmethod
-    def _adguard_read_email(page: Page) -> str:
+    def _adguard_read_email(root) -> str:
         selectors = (
             "span.address__copy-text",
             "button.address__copy .address__copy-text",
@@ -1041,7 +1110,7 @@ class VelogPoster:
         )
         for sel in selectors:
             try:
-                loc = page.locator(sel)
+                loc = root.locator(sel)
                 if loc.count() == 0:
                     continue
                 text = (loc.first.inner_text(timeout=2_000) or "").strip()
@@ -1054,11 +1123,12 @@ class VelogPoster:
 
     def _wait_adguard_velog_mail(self, page: Page) -> str:
         self.log("AdGuard 받은편지함에서 벨로그 인증 메일을 기다리는 중...", "info")
+        root = self._adguard_scope(page)
         for _ in range(36):
             if self._stop.wait(5):
                 raise PostingError("사용자가 작업을 중단했습니다.")
             try:
-                rows = page.locator(".email-row")
+                rows = root.locator(".email-row")
                 for index in range(rows.count()):
                     row = rows.nth(index)
                     try:
@@ -1074,12 +1144,12 @@ class VelogPoster:
                     self.log(f"인증 메일 확인: {sender} / {desc}", "info")
                     self._stable_click(row)
                     self._sleep(_jitter(1.6, 0.6))
-                    return self._adguard_extract_link(page)
+                    return self._adguard_extract_link(root)
             except Error:
                 pass
         raise PostingError("3분 안에 AdGuard 받은편지함에 벨로그 인증 메일이 도착하지 않았습니다.")
 
-    def _adguard_extract_link(self, page: Page) -> str:
+    def _adguard_extract_link(self, page) -> str:
         iframe = page.locator("iframe.letter-iframe__content, .letter-iframe iframe")
         try:
             iframe.first.wait_for(state="attached", timeout=15_000)
