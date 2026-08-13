@@ -57,7 +57,7 @@ class PostingError(RuntimeError):
 
 
 def classify_failure(message: str) -> str:
-    """실패 사유를 login / publish / locked / other 로 분류한다."""
+    """실패 사유를 login / publish / locked / image / other 로 분류한다."""
     text = (message or "").strip()
     if not text:
         return "other"
@@ -67,11 +67,13 @@ def classify_failure(message: str) -> str:
         "계정 잠김", "포스트 작성 실패", "포스트 수정 실패", "재가입", "이미 가입",
     )):
         return "locked"
+    if any(k in text for k in ("이미지 등록", "이미지 첨부", "이미지 업로드", "이미지 파일 선택")):
+        return "image"
     login_keys = (
         "로그인", "인증 메일", "인증 링크", "TempMail", "가입 인증",
         "새 글 작성 버튼", "Cloudflare 인증",
     )
-    publish_keys = ("출간", "게시글", "이미지")
+    publish_keys = ("출간", "게시글")
     for key in login_keys:
         if key.lower() in text.lower():
             return "login"
@@ -181,23 +183,6 @@ def extract_hashtags(text: str) -> tuple[str, list[str]]:
         lines.pop()
     body = "\n".join(lines).rstrip("\n")
     return body, tags
-
-
-def extract_summary(body: str, max_len: int = 150) -> str:
-    """출간 소개란용 — 원고 상단 본문을 평문으로 추출."""
-    text = body
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
-    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
-    text = re.sub(r"#{1,6}\s+", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return ""
-    for chunk in re.split(r"(?<=[.!?。])\s+|\n+", text):
-        chunk = chunk.strip()
-        if chunk:
-            return chunk[:max_len]
-    return text[:max_len]
 
 
 def _parse_markdown_manuscript(text: str) -> tuple[str, str, list[str]]:
@@ -482,7 +467,6 @@ class VelogPoster:
         velog_id = account["velog_id"].strip()
         inbox_url = normalize_url(account["inbox_url"])
         title, body, tags = read_manuscript(account["manuscript_path"])
-        summary = extract_summary(body)
         image_folder = (account.get("image_folder") or "").strip()
         homepages = [str(u).strip() for u in (account.get("homepages") or []) if str(u).strip()]
         parse_tempmail_address(inbox_url)  # 사전 검증
@@ -519,16 +503,18 @@ class VelogPoster:
             self.log("로그인 중.. (기존 계정)", "info")
         elif profile_name:
             self._set_blog_title(page, profile_name)
-        target = self._write_post(self._first_page(), title, body, tags=tags)
+        image_link = random.choice(homepages) if (image_folder and homepages) else ""
+        target = self._write_post(
+            self._first_page(),
+            title,
+            body,
+            tags=tags,
+            image_folder=image_folder,
+            image_link=image_link,
+        )
+        self._restore_user_focus()
 
-        if image_folder:
-            image_link = random.choice(homepages) if homepages else ""
-            self._insert_random_image(target, image_folder, link_url=image_link)
-            self._restore_user_focus()
-        else:
-            self._restore_user_focus()
-
-        url = self._publish(pw, target, tags, summary=summary)
+        url = self._publish(pw, target)
         if not url or not self._is_post_url(url):
             raise PostingError("출간에 실패했습니다. 게시글 주소를 확인하지 못했습니다.")
         if self.on_result is not None:
@@ -1178,7 +1164,15 @@ class VelogPoster:
         self.log("약관 동의 체크박스를 자동으로 누르지 못했습니다. 창에서 직접 체크해 주세요.", "error")
 
     # -- 글 작성 ----------------------------------------------------------
-    def _write_post(self, page: Page, title: str, body: str, tags: list[str] | None = None) -> Page:
+    def _write_post(
+        self,
+        page: Page,
+        title: str,
+        body: str,
+        tags: list[str] | None = None,
+        image_folder: str = "",
+        image_link: str = "",
+    ) -> Page:
         assert self._context is not None
         # 인증 후 velog 탭으로 이동
         target = next(
@@ -1194,6 +1188,11 @@ class VelogPoster:
         self.log("새 글 작성 버튼을 누르는 중...", "info")
         self._click_write_button(target)
         self._wait("작성 화면이 준비되기를 기다리는 중...", _jitter(4))
+
+        # 원고(제목/본문)보다 이미지를 먼저 첨부한다.
+        if image_folder:
+            target.locator(".CodeMirror").wait_for(state="visible", timeout=15_000)
+            self._insert_random_image(target, image_folder, link_url=image_link)
 
         tag_list = [t.strip().lstrip("#").strip() for t in (tags or []) if t.strip()]
         if tag_list:
@@ -1215,22 +1214,30 @@ class VelogPoster:
             expected=title.strip(),
         )
 
-        # 본문 입력 (CodeMirror) — setValue 로 직접 입력 (클립보드 미사용)
+        # 본문 입력 (CodeMirror) — 이미 넣은 이미지 뒤에 원고를 이어 붙인다.
         self.log("본문을 입력하는 중...", "info")
         editor = target.locator(".CodeMirror")
         editor.wait_for(state="visible", timeout=15_000)
+        body_to_write = body
+        if image_folder:
+            try:
+                current = editor.evaluate("(el) => el.CodeMirror.getValue()") or ""
+            except Error:
+                current = ""
+            current = str(current).rstrip()
+            if current:
+                body_to_write = f"{current}\n\n{body.lstrip()}"
         self._fill_with_retry(
             target,
             label="본문",
-            text=body,
+            text=body_to_write,
             focus=lambda: target.locator(".CodeMirror-scroll").click(),
-            write=lambda: self._set_codemirror_value(editor, body),
+            write=lambda: self._set_codemirror_value(editor, body_to_write),
             read_back=lambda: editor.evaluate("(el) => el.CodeMirror.getValue()"),
-            expected=body,
+            expected=body_to_write,
         )
 
         self.log("제목과 본문이 올바르게 입력되었습니다.", "info")
-        # 포커스 복원은 이미지 등록 이후로 — Control+Home / 툴바 클릭이 먹히도록
         return target
 
     def _click_write_button(self, target: Page) -> None:
@@ -1361,16 +1368,6 @@ class VelogPoster:
             self._image_fail_streak = 0
             return
         self._image_fail_streak += 1
-        if self._image_fail_streak < self._image_streak_trigger:
-            return
-        lo, hi = self._image_skip_range
-        skip = random.randint(lo, hi)
-        self._image_skip_remaining = skip
-        self._image_fail_streak = 0
-        self.log(
-            f"이미지 연속 실패 → 다음 {skip}계정은 이미지 업로드를 쉬고 출간만 진행합니다.",
-            "info",
-        )
 
     def _prepare_image_for_upload(self, src: Path) -> Path:
         """업로드 전 긴 변 1600px 이하로 줄이고 용량을 낮춘 임시 파일을 만든다."""
@@ -1413,40 +1410,20 @@ class VelogPoster:
             return src
 
     def _insert_random_image(self, target: Page, folder: str, link_url: str = "") -> None:
-        """폴더 안 이미지를 무작위로 올려 본문에 넣는다.
-        실패 시 다른 이미지로 재시도하고, 모두 실패해도 출간은 계속한다."""
-        if self._image_skip_remaining > 0:
-            self._image_skip_remaining -= 1
-            self.log(
-                f"이미지 업로드 휴식 중 — 이번 계정은 이미지 없이 출간 "
-                f"(남은 {self._image_skip_remaining}계정)",
-                "info",
-            )
-            return
-
+        """폴더 안 이미지를 무작위로 올려 본문에 넣는다. 실패하면 계정 실패로 처리한다."""
         images = self._list_upload_images(folder)
         if not images:
-            held = len(self._image_hold)
-            if held:
-                self.log(
-                    f"사용 가능한 이미지가 없습니다 (보류 {held}개). 이미지 없이 출간합니다.",
-                    "info",
-                )
-            else:
-                self.log("이미지 폴더에 이미지가 없어 등록을 건너뜁니다.", "info")
-            return
+            raise PostingError("이미지 등록 실패 — 사용할 이미지가 없습니다.")
 
         random.shuffle(images)
         candidates = images[: max(1, self._image_try_limit)]
         last_error = ""
-        uploaded = False
 
         for attempt, chosen in enumerate(candidates, start=1):
             try:
                 if self._try_upload_image(target, chosen, link_url=link_url):
                     self._remember_image(chosen)
                     self._note_image_outcome(True)
-                    uploaded = True
                     return
                 last_error = "업로드 시간 초과"
                 self._hold_image(chosen)
@@ -1463,12 +1440,10 @@ class VelogPoster:
                 )
                 self._sleep(_jitter(4, 1.5))
 
-        if not uploaded:
-            self._note_image_outcome(False)
-            self.log(
-                f"이미지 등록을 포기하고 출간을 계속합니다. ({last_error or '업로드 실패'})",
-                "error",
-            )
+        self._note_image_outcome(False)
+        raise PostingError(
+            f"이미지 등록에 실패했습니다. ({last_error or '업로드 실패'})",
+        )
 
     def _try_upload_image(self, target: Page, chosen: Path, link_url: str = "") -> bool:
         """한 장 업로드. 성공 True, 시간 초과 False. UI 오류는 PostingError."""
@@ -1608,22 +1583,8 @@ class VelogPoster:
             self.log(f"태그 {added}개 입력 완료.", "success")
         return added > 0
 
-    def _fill_publish_summary(self, page: Page, summary: str) -> None:
-        """출간 패널 소개란 입력."""
-        if not summary:
-            return
-        self._sleep(_jitter(0.8, 0.4))
-        desc = page.get_by_placeholder("당신의 포스트를 짧게 소개해보세요")
-        desc.wait_for(state="visible", timeout=12_000)
-        desc.click(timeout=5_000)
-        self._sleep(_jitter(0.3, 0.2))
-        desc.fill("")
-        desc.fill(summary)
-        self._sleep(_jitter(0.5, 0.3))
-        self.log(f"소개 입력: {summary[:40]}{'…' if len(summary) > 40 else ''}", "info")
-
     # -- 출간 ------------------------------------------------------------
-    def _publish(self, pw, target: Page, tags: list[str] | None = None, summary: str = "") -> str | None:
+    def _publish(self, pw, target: Page) -> str | None:
         """출간 단계.
 
         Cloudflare Turnstile 은 출간 패널이 '처음 렌더링되는 순간'의 브라우저
@@ -1644,9 +1605,7 @@ class VelogPoster:
             return None
 
         panel_opened = False
-        summary_filled = False
         clicked_publish = False
-        summary_text = (summary or "").strip()
         # 패널 열기 → (끊고 인증 통과 대기) → 활성화되면 최종 출간 클릭, 을 감시한다.
         for _ in range(120):  # 약 6분
             if self._stop.wait(0):
@@ -1683,15 +1642,6 @@ class VelogPoster:
                         # 클릭 직후 곧바로 연결을 끊어(아래 finally),
                         # 인증이 깨끗한 상태에서 검증되도록 한다.
                     else:
-                        if summary_text and not summary_filled:
-                            try:
-                                self._fill_publish_summary(page, summary_text)
-                                summary_filled = True
-                            except (Error, PWTimeoutError):
-                                self.log(
-                                    "소개 자동 입력에 실패했습니다. 출간 패널에서 직접 입력해 주세요.",
-                                    "error",
-                                )
                         if not final.first.is_disabled() and not clicked_publish:
                             # 인증 통과 상태 → 최종 출간 클릭 후, 연결을 끊고
                             # 깨끗한 상태에서 게시글 주소로 리다이렉트되길 기다린다.

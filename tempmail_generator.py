@@ -279,28 +279,9 @@ class TempMailGenerator:
             raise PostingError("사용자가 작업을 중단했습니다.")
 
     def _human_pause(self, page: Page, message: str, seconds: float) -> None:
+        del page
         self.log(message, "info")
-        self._human_wiggle(page)
         self._sleep(seconds)
-
-    @staticmethod
-    def _human_wiggle(page: Page) -> None:
-        """마우스를 살짝 움직여 사람처럼 보이게 한다."""
-        try:
-            vp = page.viewport_size or {"width": 1280, "height": 800}
-            x = random.randint(80, max(100, vp["width"] - 80))
-            y = random.randint(80, max(100, vp["height"] - 80))
-            page.mouse.move(x, y, steps=random.randint(10, 28))
-            if random.random() < 0.55:
-                page.mouse.wheel(0, random.randint(-180, 220))
-            if random.random() < 0.25:
-                page.mouse.move(
-                    random.randint(100, max(120, vp["width"] - 100)),
-                    random.randint(100, max(120, vp["height"] - 100)),
-                    steps=random.randint(8, 16),
-                )
-        except Error:
-            pass
 
     def _click_like_human(self, page: Page, locator, *, timeout: int = 15_000) -> None:
         """스크롤 후 Playwright 클릭."""
@@ -377,115 +358,41 @@ class TempMailGenerator:
             return False
         return True
 
-    def _try_click_turnstile(self, page: Page) -> bool:
-        """Turnstile 체크박스를 사람처럼 클릭 시도."""
-        clicked = False
-        self._human_wiggle(page)
-
-        for frame in page.frames:
-            furl = (frame.url or "").lower()
-            if "challenges.cloudflare.com" not in furl and "turnstile" not in furl:
-                continue
-            for sel in (
-                "input[type='checkbox']",
-                "label.ctp-checkbox-label",
-                ".ctp-checkbox-label",
-                "#challenge-stage",
-                "body",
-            ):
-                try:
-                    loc = frame.locator(sel).first
-                    if loc.count() == 0:
-                        continue
-                    box = loc.bounding_box()
-                    if box:
-                        cx = box["x"] + box["width"] / 2
-                        cy = box["y"] + box["height"] / 2
-                        page.mouse.move(cx, cy, steps=random.randint(10, 22))
-                        self._sleep(_jitter(0.5, 0.3))
-                    loc.click(timeout=5_000, force=True)
-                    clicked = True
-                    break
-                except Error:
-                    continue
-            if clicked:
-                break
-
-        if not clicked:
-            try:
-                iframe = page.locator(
-                    "iframe[src*='challenges.cloudflare'], iframe[src*='turnstile']"
-                ).first
-                if iframe.count() > 0 and iframe.is_visible():
-                    box = iframe.bounding_box()
-                    if box:
-                        x = box["x"] + min(30, box["width"] * 0.12)
-                        y = box["y"] + box["height"] / 2
-                        page.mouse.move(x, y, steps=random.randint(12, 20))
-                        self._sleep(_jitter(0.5, 0.3))
-                        page.mouse.click(x, y)
-                        clicked = True
-            except Error:
-                pass
-
-        if not clicked:
-            try:
-                loc = page.get_by_text("사람인지 확인", exact=False)
-                if loc.count() > 0 and loc.first.is_visible():
-                    box = loc.first.bounding_box()
-                    if box:
-                        page.mouse.click(box["x"] - 22, box["y"] + box["height"] / 2)
-                        clicked = True
-            except Error:
-                pass
-
-        if clicked:
-            self.log("Turnstile 체크박스 자동 클릭 시도.", "info")
-            self._sleep(_jitter(2.5, 1.0))
-        return clicked
+    def _cf_page_ready(self, page: Page, previous_email: str = "") -> bool:
+        """캡차가 지나갔고 메일 화면을 쓸 수 있는지. CDP로 체크박스에 손대지 않는다."""
+        if self._is_verify_modal_blocking(page) or self._is_interstitial(page):
+            return False
+        if self._is_welcome_verified(page, require_new=previous_email):
+            return True
+        if self._is_tempmail_ready(page, previous_email):
+            return True
+        return bool(self._read_displayed_email(page))
 
     def _wait_if_cloudflare(self, pw, page: Page) -> None:
+        """벨로그와 동일: 연결을 끊고 캡차가 스스로 통과되길 기다린다."""
         if self._is_tempmail_ready(page):
             self.log("TempMail 화면이 이미 준비되어 있습니다.", "info")
             return
         if not self._is_verify_modal_blocking(page) and not self._is_interstitial(page):
             return
 
-        self.log("봇 인증 감지 → 자동 우회를 시도합니다...", "info")
+        self.log("Cloudflare 감지 → 연결을 끊어 깨끗한 상태에서 통과를 기다립니다...", "info")
         if not self._endpoint:
             return
         self._disconnect_only()
-        turnstile_tried = False
 
-        for attempt in range(60):
+        for _ in range(60):
             if self._stop.is_set():
                 raise PostingError("사용자가 작업을 중단했습니다.")
-            self._sleep(_jitter(3, 1.5))
+            self._sleep(4)
 
             browser = None
-            page = None
+            passed = False
             try:
                 browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
-                page = self._find_tempmail_page(browser)
-
-                if page is None:
-                    continue
-
-                # 이메일이 이미 생성됐으면 HTML에 turnstile 흔적이 있어도 진행
-                if self._is_welcome_verified(page) or self._is_tempmail_ready(page):
-                    self.log("이메일 화면 확인 → 계속 진행합니다.", "success")
-                    self._ensure_connected(pw)
-                    return
-
-                if self._is_verify_modal_blocking(page):
-                    if not turnstile_tried or attempt % 4 == 3:
-                        self._try_click_turnstile(page)
-                        turnstile_tried = True
-                elif not self._is_interstitial(page):
-                    if self._read_displayed_email(page):
-                        self.log("인증 없이 TempMail 준비됨 → 계속 진행.", "success")
-                        self._ensure_connected(pw)
-                        return
+                found = self._find_tempmail_page(browser)
+                if found is not None and self._cf_page_ready(found):
+                    passed = True
             except (Error, PWTimeoutError):
                 pass
             finally:
@@ -494,52 +401,43 @@ class TempMailGenerator:
                         browser.close()
                     except Error:
                         pass
+            if passed:
+                self.log("Cloudflare 통과 확인 → 작업을 계속합니다.", "success")
+                self._ensure_connected(pw)
+                return
 
-        # 마지막으로 한 번 더 — 이미 생성된 경우 놓치지 않도록
         self._ensure_connected(pw)
         page = self._active_page(pw)
-        if self._is_welcome_verified(page) or self._is_tempmail_ready(page):
+        if self._cf_page_ready(page):
             self.log("대기 종료 후 이메일 화면 확인 → 계속 진행.", "success")
             return
         raise PostingError("봇 인증을 시간 내에 통과하지 못했습니다.")
 
     def _wait_after_new_email(self, pw, previous_email: str) -> None:
-        """New Email 클릭 후 새 주소·Inbox 준비를 기다린다."""
+        """New Email 클릭 직후 연결을 끊고, 새 주소·캡차 통과만 감시한다."""
         if not self._endpoint:
             raise PostingError("브라우저 연결이 끊어졌습니다.")
 
-        self.log("새 메일 생성 및 봇 인증 통과를 기다리는 중...", "info")
+        self.log("새 메일 생성 및 Cloudflare 통과를 기다리는 중...", "info")
         self._disconnect_only()
-        turnstile_tried = False
 
-        for attempt in range(90):
+        for _ in range(90):
             if self._stop.is_set():
                 raise PostingError("사용자가 작업을 중단했습니다.")
-            self._sleep(_jitter(3, 1.5))
+            self._sleep(4)
 
             browser = None
+            passed = False
+            label = ""
             try:
                 browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
                 page = self._find_tempmail_page(browser)
-                if page is None:
-                    continue
-
-                # 상단·본문 이메일 일치 = 생성 완료
-                if self._is_welcome_verified(page, require_new=previous_email):
-                    email = self._read_displayed_email(page)
-                    self.log(f"새 이메일+환영메일 확인: {email}", "success")
-                    self._ensure_connected(pw)
-                    return
-
-                if self._is_tempmail_ready(page, previous_email):
-                    self.log(f"새 이메일 확인: {self._read_displayed_email(page)}", "success")
-                    self._ensure_connected(pw)
-                    return
-
-                if self._is_verify_modal_blocking(page):
-                    if not turnstile_tried or attempt % 4 == 3:
-                        self._try_click_turnstile(page)
-                        turnstile_tried = True
+                if page is not None and self._cf_page_ready(page, previous_email):
+                    passed = True
+                    if self._is_welcome_verified(page, require_new=previous_email):
+                        label = f"새 이메일+환영메일 확인: {self._read_displayed_email(page)}"
+                    else:
+                        label = f"새 이메일 확인: {self._read_displayed_email(page)}"
             except (Error, PWTimeoutError):
                 pass
             finally:
@@ -548,8 +446,11 @@ class TempMailGenerator:
                         browser.close()
                     except Error:
                         pass
+            if passed:
+                self.log(label or "새 이메일 확인", "success")
+                self._ensure_connected(pw)
+                return
 
-        # 타임아웃 직전 — 화면에 새 이메일만 있어도 진행
         self._ensure_connected(pw)
         page = self._active_page(pw)
         if self._is_welcome_verified(page, require_new=previous_email):
@@ -763,7 +664,6 @@ class TempMailGenerator:
             if self._stop.is_set():
                 raise PostingError("사용자가 작업을 중단했습니다.")
             self._sleep(_random_delay(*DELAY_INBOX_POLL))
-            self._human_wiggle(page)
 
             if self._is_welcome_verified(page, require_new=require_new):
                 email = self._read_displayed_email(page)
@@ -801,7 +701,6 @@ class TempMailGenerator:
         if save_btn.count() == 0:
             save_btn = page.locator("button:has-text('Save address')")
         save_btn.first.wait_for(state="visible", timeout=15_000)
-        self._human_wiggle(page)
         self._sleep(_human_delay(0.8, 2.2))
         self._click_like_human(page, save_btn.first)
         self._sleep(_random_delay(*DELAY_AFTER_SAVE))
@@ -860,7 +759,6 @@ class TempMailGenerator:
             return result
 
         previous = displayed
-        self._human_wiggle(page)
         self._sleep(_random_delay(*DELAY_BEFORE_NEW))
 
         new_btn = page.get_by_role("button", name="New Email")

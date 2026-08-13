@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.30",
-    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511634356",
-    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.30/VelogPoster.zip",
-    "notes":  "TempMail: 누락된 _scroll_into_view 호출 AttributeError 수정",
+    "version":  "1.0.31",
+    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.31/VelogPoster.zip",
+    "notes":  "진행 게이지는 실패 포함 처리 건수 표시. 원고 작성 전 이미지 첨부, 실패 시 계정 삭제. 출간 패널 소개 입력 제거. TempMail Cloudflare는 벨로그와 같이 연결 해제 후 대기. 창 크기·버튼이 화면에 가리지 않도록 UI 조정.",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511634356",
-                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.30/VelogPoster.zip",
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.31/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ],
-    "asset_id":  511634356,
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/511634356"
+                      ]
 }

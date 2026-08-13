@@ -18,6 +18,8 @@ import re
 import sys
 import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -73,7 +75,123 @@ DONE_BG = "#dcfce7"
 DONE_FG = "#166534"
 GAUGE_DAYS = 6.0
 GAUGE_SEGMENTS = 6
-PUBLISH_COOLDOWN_HOURS = 12.0
+_404_MARKERS = (
+    "페이지를 찾을 수 없",
+    "존재하지 않는 포스트",
+    "존재하지 않는 페이지",
+    "존재하지 않는 글",
+)
+
+
+def _work_area() -> tuple[int, int, int, int]:
+    """작업 표시줄을 제외한 화면 영역 (x, y, width, height)."""
+    try:
+        import ctypes
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        rect = RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            if width > 200 and height > 200:
+                return int(rect.left), int(rect.top), width, height
+    except Exception:  # noqa: BLE001
+        pass
+    return 0, 0, 1280, 720
+
+
+def _place_window(
+    win: tk.Misc,
+    width: int,
+    height: int,
+    parent: tk.Misc | None = None,
+    *,
+    margin: int = 32,
+) -> None:
+    """창 크기를 화면 안에 맞추고, 잘리지 않게 배치한다."""
+    win.update_idletasks()
+    ax, ay, aw, ah = _work_area()
+    if aw <= 200 or ah <= 200:
+        aw = max(int(win.winfo_screenwidth()), 800)
+        ah = max(int(win.winfo_screenheight()), 600)
+        ax = ay = 0
+    max_w = max(aw - margin, 640)
+    max_h = max(ah - margin, 480)
+    w = min(max(int(width), 320), max_w)
+    h = min(max(int(height), 240), max_h)
+    if parent is not None:
+        parent.update_idletasks()
+        px = int(parent.winfo_rootx())
+        py = int(parent.winfo_rooty())
+        pw = max(int(parent.winfo_width()), 1)
+        ph = max(int(parent.winfo_height()), 1)
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+    else:
+        x = ax + (aw - w) // 2
+        y = ay + (ah - h) // 2
+    x = min(max(x, ax), ax + max(aw - w, 0))
+    y = min(max(y, ay), ay + max(ah - h, 0))
+    win.geometry(f"{w}x{h}+{x}+{y}")
+
+
+def _url_is_velog_404(url: str) -> bool | None:
+    """발행 URL이 404(삭제된 글)인지 확인. True=404, False=정상, None=확인 실패."""
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    request = urllib.request.Request(
+        raw,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            body = response.read(200_000).decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as exc:
+        if exc.code in {404, 410}:
+            return True
+        if exc.code >= 500:
+            return None
+        try:
+            body = exc.read(200_000).decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            return None
+        status = exc.code
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+
+    if status in {404, 410}:
+        return True
+    text = re.sub(r"<script[\s\S]*?</script>", " ", body, flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    lowered = re.sub(r"\s+", " ", text).strip().lower()
+    if any(marker.lower() in lowered for marker in _404_MARKERS):
+        return True
+    # SPA 타이틀만 404 인 경우
+    title_m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+    if title_m and "404" in title_m.group(1):
+        return True
+    return False
 TM_TAB_COLORS = (
     ("#dcfce7", "#166534"),
     ("#dbeafe", "#1d4ed8"),
@@ -118,8 +236,6 @@ class VelogApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"벨로그 자동 포스팅 v{APP_VERSION}")
-        self.geometry("1520x860")
-        self.minsize(1200, 720)
         self.configure(bg=BG)
 
         self.velog_id = tk.StringVar()
@@ -148,6 +264,7 @@ class VelogApp(tk.Tk):
         self._worker: threading.Thread | None = None
         self._run_total = 0
         self._run_done = 0
+        self._cleaning = False
 
         # 임시 메일 생성 탭
         self.generated_emails: list[dict[str, str]] = []
@@ -167,6 +284,7 @@ class VelogApp(tk.Tk):
         self._build_ui()
         self._bind_shortcuts()
         self._load_settings()
+        self._fit_main_window()
         schedule_update_check(
             self,
             version_url=UPDATE_VERSION_URL,
@@ -204,7 +322,7 @@ class VelogApp(tk.Tk):
         st.configure("Bg.TFrame", background=BG)
         st.configure("Card.TFrame", background=CARD)
         st.configure("CardBorder.TFrame", background=BORDER)
-        st.configure("Title.TLabel", background=BG, foreground=INK, font=(FONT, 20, "bold"))
+        st.configure("Title.TLabel", background=BG, foreground=INK, font=(FONT, 16, "bold"))
         st.configure("Sub.TLabel", background=BG, foreground=SUBTLE, font=(FONT, 9))
         st.configure("Section.TLabel", background=CARD, foreground=INK, font=(FONT, 11, "bold"))
         st.configure("SectionSub.TLabel", background=CARD, foreground=SUBTLE, font=(FONT, 8))
@@ -357,16 +475,24 @@ class VelogApp(tk.Tk):
         canvas.bind_all("<MouseWheel>", _wheel, add="+")
         return inner
 
+    def _fit_main_window(self) -> None:
+        """시작 시 작업 표시줄에 버튼이 가리지 않게 창 크기·위치를 맞춘다."""
+        _, _, aw, ah = _work_area()
+        min_w = min(980, max(aw - 48, 720))
+        min_h = min(620, max(ah - 48, 480))
+        self.minsize(min_w, min_h)
+        _place_window(self, 1400, 780)
+
     # -- 레이아웃 ---------------------------------------------------------
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, style="Bg.TFrame", padding=(12, 10))
+        root = ttk.Frame(self, style="Bg.TFrame", padding=(10, 8))
         root.pack(fill="both", expand=True)
 
         content = self._build_main_nav(root)
 
-        posting_frame = ttk.Frame(content, style="Bg.TFrame", padding=(18, 14))
-        tempmail_frame = ttk.Frame(content, style="Bg.TFrame", padding=(18, 14))
-        log_frame = ttk.Frame(content, style="Bg.TFrame", padding=(18, 14))
+        posting_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
+        tempmail_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
+        log_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         self._main_views["posting"] = posting_frame
         self._main_views["tempmail"] = tempmail_frame
         self._main_views["log"] = log_frame
@@ -379,34 +505,20 @@ class VelogApp(tk.Tk):
     def _build_posting_tab(self, root: ttk.Frame) -> None:
         # 헤더
         header = ttk.Frame(root, style="Bg.TFrame")
-        header.pack(fill="x", pady=(0, 12))
+        header.pack(side="top", fill="x", pady=(0, 8))
         ttk.Label(header, text="벨로그 자동 포스팅", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
             text="① 계정 등록  →  ② 원고 폴더/지정  →  ③ 전체 출간 시작",
             style="Sub.TLabel",
-        ).pack(anchor="w", pady=(4, 0))
+        ).pack(anchor="w", pady=(2, 0))
 
-        # 본문 (좌 | 우) — 계정 목록에 넓은 공간
-        body = ttk.Panedwindow(root, orient="horizontal")
-        body.pack(fill="both", expand=True)
-
-        left_wrap = ttk.Frame(body, style="Bg.TFrame")
-        center = ttk.Frame(body, style="Bg.TFrame")
-        body.add(left_wrap, weight=0)
-        body.add(center, weight=1)
-
-        sidebar = self._scrollable_sidebar(left_wrap)
-        self._build_inputs(sidebar)
-        self._build_list(center)
-
-        # 하단 실행 바
+        # 하단 실행 바를 먼저 붙여 창이 작아도 버튼이 가려지지 않게 한다.
         bottom = ttk.Frame(root, style="Bg.TFrame")
-        bottom.pack(fill="x", pady=(12, 0))
-        bottom.columnconfigure(0, weight=1)
+        bottom.pack(side="bottom", fill="x", pady=(8, 0))
 
         prog_row = ttk.Frame(bottom, style="Bg.TFrame")
-        prog_row.pack(fill="x", pady=(0, 8))
+        prog_row.pack(fill="x", pady=(0, 6))
         self.progress = ttk.Progressbar(
             prog_row, mode="determinate", style="green.Horizontal.TProgressbar",
         )
@@ -427,18 +539,31 @@ class VelogApp(tk.Tk):
         )
         self.stop_btn.grid(row=0, column=1, sticky="ew")
         ttk.Label(bottom, textvariable=self.status, style="Status.TLabel").pack(
-            fill="x", pady=(10, 0),
+            fill="x", pady=(8, 0),
         )
+
+        # 본문 (좌 | 우) — 계정 목록에 넓은 공간
+        body = ttk.Panedwindow(root, orient="horizontal")
+        body.pack(fill="both", expand=True)
+
+        left_wrap = ttk.Frame(body, style="Bg.TFrame")
+        center = ttk.Frame(body, style="Bg.TFrame")
+        body.add(left_wrap, weight=0)
+        body.add(center, weight=1)
+
+        sidebar = self._scrollable_sidebar(left_wrap)
+        self._build_inputs(sidebar)
+        self._build_list(center)
 
     def _build_tempmail_tab(self, root: ttk.Frame) -> None:
         header = ttk.Frame(root, style="Bg.TFrame")
-        header.pack(fill="x", pady=(0, 12))
+        header.pack(side="top", fill="x", pady=(0, 8))
         ttk.Label(header, text="TempMail 임시 메일 자동 생성", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
             text="tempmail.co 접속 → New Email → 확인 → Save address → Copy Link 순서로 자동 진행",
             style="Sub.TLabel",
-        ).pack(anchor="w", pady=(4, 0))
+        ).pack(anchor="w", pady=(2, 0))
 
         body = ttk.Panedwindow(root, orient="horizontal")
         body.pack(fill="both", expand=True)
@@ -466,7 +591,7 @@ class VelogApp(tk.Tk):
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         btns = ttk.Frame(left, style="Bg.TFrame")
-        btns.pack(fill="x", pady=(0, 10))
+        btns.pack(fill="x", pady=(0, 8))
         btns.columnconfigure(0, weight=1)
         btns.columnconfigure(1, weight=1)
         self.tm_start_btn = ttk.Button(
@@ -479,10 +604,14 @@ class VelogApp(tk.Tk):
         self.tm_stop_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         prog = ttk.Frame(left, style="Bg.TFrame")
-        prog.pack(fill="x", pady=(0, 10))
+        prog.pack(fill="x", pady=(0, 8))
         self.tm_progress = ttk.Progressbar(prog, mode="determinate", style="green.Horizontal.TProgressbar")
         self.tm_progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
         ttk.Label(prog, textvariable=self.tm_progress_text, style="Sub.TLabel").pack(side="right")
+
+        ttk.Label(left, textvariable=self.tm_status, style="Status.TLabel").pack(
+            side="bottom", fill="x", pady=(8, 0),
+        )
 
         # 생성 결과 목록
         list_card = ttk.Frame(left, style="CardBorder.TFrame")
@@ -543,8 +672,6 @@ class VelogApp(tk.Tk):
         )
         ttk.Button(act, text="선택 삭제", style="Ghost.TButton",
                    command=self._delete_generated).grid(row=0, column=2, sticky="ew", padx=(4, 0))
-
-        ttk.Label(left, textvariable=self.tm_status, style="Status.TLabel").pack(fill="x", pady=(10, 0))
 
         # 로그
         ttk.Label(right, text="생성 로그", style="LogTitle.TLabel").pack(anchor="w", pady=(0, 6))
@@ -820,8 +947,26 @@ class VelogApp(tk.Tk):
         self._collapse_state[key] = not self._collapse_state[key]
 
     def _build_list(self, parent: ttk.Frame) -> None:
+        legend = ttk.Frame(parent, style="Bg.TFrame")
+        legend.pack(side="bottom", fill="x", pady=(8, 0))
+        for color, fg, label in (
+            (DONE_BG, DONE_FG, "발행 완료"),
+            ("#fff3bf", "#5c3c00", "메일 불일치"),
+            ("#ffe3e3", "#c92a2a", "6일 만료"),
+        ):
+            chip = tk.Label(
+                legend, text=f"  {label}  ", bg=color, fg=fg,
+                font=(FONT, 9), padx=6, pady=3,
+            )
+            chip.pack(side="left", padx=(0, 8))
+        ttk.Label(
+            legend,
+            text="원고 더블클릭 · 결과 더블클릭=URL · Ctrl+C=복사 · Del=삭제",
+            style="Sub.TLabel",
+        ).pack(side="right")
+
         top = ttk.Frame(parent, style="Bg.TFrame")
-        top.pack(fill="x", pady=(0, 10))
+        top.pack(side="top", fill="x", pady=(0, 8))
         title_row = ttk.Frame(top, style="Bg.TFrame")
         title_row.pack(side="left", fill="x", expand=True)
         ttk.Label(title_row, text="계정 목록", style="Title.TLabel").pack(side="left")
@@ -843,7 +988,7 @@ class VelogApp(tk.Tk):
         ).pack(padx=1, pady=1)
 
         btns = ttk.Frame(parent, style="Bg.TFrame")
-        btns.pack(fill="x", pady=(0, 8))
+        btns.pack(side="top", fill="x", pady=(0, 8))
         for text, cmd in (
             ("＋ 탭 추가", self._add_tab),
             ("이름 변경", self._rename_tab),
@@ -852,8 +997,12 @@ class VelogApp(tk.Tk):
             ("성공 목록 보기", self._show_published_list),
         ):
             ttk.Button(btns, text=text, style="Pick.TButton", command=cmd).pack(
-                side="left", padx=(0, 6),
+                side="left", padx=(0, 6), pady=(0, 4),
             )
+        self.clean_btn = ttk.Button(
+            btns, text="목록정리하기", style="Pick.TButton", command=self._start_clean_list,
+        )
+        self.clean_btn.pack(side="left", padx=(0, 6), pady=(0, 4))
 
         nb_wrap = ttk.Frame(parent, style="CardBorder.TFrame")
         nb_wrap.pack(fill="both", expand=True)
@@ -870,25 +1019,6 @@ class VelogApp(tk.Tk):
             text="등록된 계정이 없습니다.\n왼쪽에서 계정을 추가하거나 일괄 등록하세요.",
             style="Sub.TLabel", justify="center", font=(FONT, 11),
         )
-
-        # 범례
-        legend = ttk.Frame(parent, style="Bg.TFrame")
-        legend.pack(fill="x", pady=(10, 0))
-        for color, fg, label in (
-            (DONE_BG, DONE_FG, "발행 쿨다운(12h)"),
-            ("#fff3bf", "#5c3c00", "메일 불일치"),
-            ("#ffe3e3", "#c92a2a", "6일 만료"),
-        ):
-            chip = tk.Label(
-                legend, text=f"  {label}  ", bg=color, fg=fg,
-                font=(FONT, 9), padx=6, pady=3,
-            )
-            chip.pack(side="left", padx=(0, 8))
-        ttk.Label(
-            legend,
-            text="원고 더블클릭 · 결과 더블클릭=URL · Ctrl+C=복사 · Del=삭제",
-            style="Sub.TLabel",
-        ).pack(side="right")
 
     def _make_tree(self, parent):
         frame = ttk.Frame(parent, style="Card.TFrame")
@@ -981,9 +1111,7 @@ class VelogApp(tk.Tk):
 
         win.protocol("WM_DELETE_WINDOW", cancel)
         win.update_idletasks()
-        px = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
-        py = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
-        win.geometry(f"+{max(px, 0)}+{max(py, 0)}")
+        _place_window(win, max(win.winfo_reqwidth(), 420), max(win.winfo_reqheight(), 220), self)
         self.wait_window(win)
         return result[0]
 
@@ -1078,16 +1206,16 @@ class VelogApp(tk.Tk):
 
     def _build_log_tab(self, root: ttk.Frame) -> None:
         header = ttk.Frame(root, style="Bg.TFrame")
-        header.pack(fill="x", pady=(0, 12))
+        header.pack(side="top", fill="x", pady=(0, 8))
         ttk.Label(header, text="실행 로그", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
             text="출간·업데이트·오류 메시지가 시간순으로 기록됩니다.",
             style="Sub.TLabel",
-        ).pack(anchor="w", pady=(4, 0))
+        ).pack(anchor="w", pady=(2, 0))
 
         toolbar = ttk.Frame(root, style="Bg.TFrame")
-        toolbar.pack(fill="x", pady=(0, 8))
+        toolbar.pack(side="top", fill="x", pady=(0, 8))
         ttk.Label(toolbar, textvariable=self.log_summary, style="Stat.TLabel").pack(side="left")
         btn_row = ttk.Frame(toolbar, style="Bg.TFrame")
         btn_row.pack(side="right")
@@ -1270,28 +1398,35 @@ class VelogApp(tk.Tk):
         win = tk.Toplevel(self)
         win.title("여러 계정 일괄 등록")
         win.configure(bg=BG)
-        win.geometry("680x560")
-        win.minsize(560, 480)
         win.transient(self)
         win.grab_set()
+        _, _, aw, ah = _work_area()
+        win.minsize(min(480, max(aw - 80, 360)), min(400, max(ah - 80, 280)))
+        _place_window(win, 680, 560, self)
 
-        wrap = ttk.Frame(win, style="Bg.TFrame", padding=20)
+        wrap = ttk.Frame(win, style="Bg.TFrame", padding=16)
         wrap.pack(fill="both", expand=True)
-        ttk.Label(wrap, text="여러 계정 일괄 등록", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(wrap, text="여러 계정 일괄 등록", style="Title.TLabel").pack(side="top", anchor="w")
         ttk.Label(
             wrap,
             text="아이디와 인증 메일함(tempmail.co) URL을 한 줄씩 번갈아 붙여넣으세요.",
             style="Sub.TLabel",
-        ).pack(anchor="w", pady=(4, 12))
+        ).pack(side="top", anchor="w", pady=(4, 12))
 
         example = tk.Text(
             wrap, height=4, font=("Consolas", 9), bg="#f8fafc", fg=SUBTLE,
             relief="solid", borderwidth=1, state="disabled",
         )
-        example.pack(fill="x", pady=(0, 10))
+        example.pack(side="top", fill="x", pady=(0, 10))
         example.configure(state="normal")
         example.insert("1.0", "user1@email.com\nhttps://tempmail.co/address/user1@email.com/키값\nuser2@email.com\nhttps://tempmail.co/address/...")
         example.configure(state="disabled")
+
+        btns = ttk.Frame(wrap, style="Bg.TFrame")
+        btns.pack(side="bottom", fill="x", pady=(14, 0))
+        ttk.Button(btns, text="취소", style="Ghost.TButton", command=win.destroy).pack(side="right")
+        register_btn = ttk.Button(btns, text="등록하기", style="Primary.TButton")
+        register_btn.pack(side="right", padx=(0, 8))
 
         box = ttk.Frame(wrap, style="Bg.TFrame")
         box.pack(fill="both", expand=True)
@@ -1347,12 +1482,7 @@ class VelogApp(tk.Tk):
                 messagebox.showinfo("일괄 등록", msg, parent=win)
             win.destroy()
 
-        btns = ttk.Frame(wrap, style="Bg.TFrame")
-        btns.pack(fill="x", pady=(14, 0))
-        ttk.Button(btns, text="취소", style="Ghost.TButton", command=win.destroy).pack(side="right")
-        ttk.Button(btns, text="등록하기", style="Primary.TButton", command=do_register).pack(
-            side="right", padx=(0, 8),
-        )
+        register_btn.configure(command=do_register)
 
     def _selected_indices(self) -> list[int]:
         if self.tree is None:
@@ -1518,9 +1648,6 @@ class VelogApp(tk.Tk):
                         values=(index + 1, vid, status, acc.get("inbox_url", ""), man, result))
 
     def _status_text(self, acc: dict) -> str:
-        if acc.get("published_url") and self._is_on_cooldown(acc):
-            rem_h = self._cooldown_hours_left(acc)
-            return f"쿨다운 {rem_h:.1f}h"
         if acc.get("published_url"):
             return "완료"
         rem = self._remaining_days(acc.get("created_at", ""))
@@ -1530,7 +1657,7 @@ class VelogApp(tk.Tk):
 
     def _row_tags(self, acc: dict, index: int = 0) -> tuple:
         tags = ["even" if index % 2 == 0 else "odd"]
-        if acc.get("published_url") and self._is_on_cooldown(acc):
+        if acc.get("published_url"):
             tags.append("done")
         if self._remaining_days(acc.get("created_at", "")) <= 0:
             tags.append("expired")
@@ -1554,24 +1681,12 @@ class VelogApp(tk.Tk):
                 continue
         return None
 
-    def _cooldown_hours_left(self, acc: dict) -> float:
-        posted = self._parse_time(str(acc.get("published_at", "")))
-        if posted is None:
-            return PUBLISH_COOLDOWN_HOURS
-        elapsed_h = (datetime.now() - posted).total_seconds() / 3600.0
-        return max(0.0, PUBLISH_COOLDOWN_HOURS - elapsed_h)
-
-    def _is_on_cooldown(self, acc: dict) -> bool:
-        if not acc.get("published_url"):
-            return False
-        return self._cooldown_hours_left(acc) > 0
-
     def _is_eligible_for_assign(self, acc: dict) -> bool:
         if not str(acc.get("velog_id", "")).strip():
             return False
-        if self._remaining_days(acc.get("created_at", "")) <= 0:
+        if acc.get("published_url"):
             return False
-        if self._is_on_cooldown(acc):
+        if self._remaining_days(acc.get("created_at", "")) <= 0:
             return False
         return True
 
@@ -1585,21 +1700,6 @@ class VelogApp(tk.Tk):
             return GAUGE_DAYS
         elapsed = (datetime.now() - t).total_seconds() / 86400.0
         return max(0.0, GAUGE_DAYS - elapsed)
-
-    def _refresh_cooldowns(self) -> int:
-        """12시간 지난 발행 계정을 다시 배정 가능 상태로 되돌린다."""
-        cleared = 0
-        for tab in self.tabs:
-            for acc in tab["accounts"]:
-                if not acc.get("published_url"):
-                    continue
-                if self._is_on_cooldown(acc):
-                    continue
-                acc.pop("published_url", None)
-                acc.pop("published_at", None)
-                acc["manuscript_path"] = ""
-                cleared += 1
-        return cleared
 
     def _purge_expired_accounts(self) -> int:
         """6일 만료 계정을 목록에서 삭제한다."""
@@ -1680,9 +1780,10 @@ class VelogApp(tk.Tk):
         win = tk.Toplevel(self)
         win.title(f"발행 성공 목록 · {len(rows)}개")
         win.configure(bg=BG)
-        win.geometry("1100x560")
-        win.minsize(800, 400)
         win.transient(self)
+        _, _, aw, ah = _work_area()
+        win.minsize(min(640, max(aw - 80, 480)), min(360, max(ah - 80, 280)))
+        _place_window(win, 1100, 560, self)
 
         wrap = ttk.Frame(win, style="Bg.TFrame", padding=14)
         wrap.pack(fill="both", expand=True)
@@ -1690,7 +1791,13 @@ class VelogApp(tk.Tk):
             wrap,
             text=f"버튼을 누른 시점의 발행 성공 계정 {len(rows)}개 · 행 더블클릭 시 발행 URL 열기",
             style="Sub.TLabel",
-        ).pack(anchor="w", pady=(0, 8))
+        ).pack(side="top", anchor="w", pady=(0, 8))
+
+        btn_row = ttk.Frame(wrap, style="Bg.TFrame")
+        btn_row.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(btn_row, text="닫기", style="Ghost.TButton", command=win.destroy).pack(side="right")
+        copy_btn = ttk.Button(btn_row, text="선택 URL 복사", style="Pick.TButton")
+        copy_btn.pack(side="right", padx=(0, 8))
 
         tree_wrap = ttk.Frame(wrap, style="CardBorder.TFrame")
         tree_wrap.pack(fill="both", expand=True)
@@ -1775,25 +1882,111 @@ class VelogApp(tk.Tk):
         tree.bind("<Double-1>", open_url)
         tree.bind("<Control-c>", copy_urls)
         tree.bind("<Control-C>", copy_urls)
+        copy_btn.configure(command=copy_urls)
 
-        btn_row = ttk.Frame(wrap, style="Bg.TFrame")
-        btn_row.pack(fill="x", pady=(10, 0))
-        ttk.Button(btn_row, text="닫기", style="Ghost.TButton", command=win.destroy).pack(side="right")
-        ttk.Button(btn_row, text="선택 URL 복사", style="Pick.TButton", command=copy_urls).pack(
-            side="right", padx=(0, 8),
-        )
+    def _start_clean_list(self) -> None:
+        """현재 탭의 발행 URL을 열어 404이면 해당 계정을 목록에서 삭제한다."""
+        if self._poster is not None or self._cleaning:
+            messagebox.showinfo("목록 정리", "다른 작업이 끝난 뒤 다시 시도해 주세요.", parent=self)
+            return
+        tab = self._current_tab()
+        if tab is None:
+            return
+        targets = [
+            acc for acc in tab["accounts"]
+            if str(acc.get("published_url", "")).strip()
+        ]
+        if not targets:
+            messagebox.showinfo(
+                "목록 정리",
+                "현재 탭에 발행 결과 URL이 있는 계정이 없습니다.",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "목록 정리",
+            f"현재 탭 [{tab.get('title', '')}] 의 발행 URL {len(targets)}개를 확인합니다.\n"
+            "404(삭제된 글)이면 해당 계정을 목록에서 삭제합니다.\n\n계속할까요?",
+            parent=self,
+        ):
+            return
+        self._cleaning = True
+        self._active_tab = tab
+        if hasattr(self, "clean_btn"):
+            self.clean_btn.configure(state="disabled")
+        self.start_btn.configure(state="disabled")
+        self._append(f"[{tab.get('title', '')}] 발행 URL {len(targets)}개 404 확인을 시작합니다.", "info")
+        self.status.set("목록 정리 중...")
+        items = [
+            (str(acc.get("velog_id", "")), str(acc.get("published_url", "")).strip())
+            for acc in targets
+        ]
+        threading.Thread(target=self._run_clean_list, args=(items,), daemon=True).start()
+
+    def _run_clean_list(self, items: list[tuple[str, str]]) -> None:
+        dead: list[str] = []
+        ok = 0
+        fail = 0
+        total = len(items)
+        for index, (velog_id, url) in enumerate(items, start=1):
+            self._events.put((f"목록 정리 {index}/{total}: {velog_id}", "clean"))
+            try:
+                missing = _url_is_velog_404(url)
+            except Exception:  # noqa: BLE001
+                missing = None
+            if missing is True:
+                dead.append(velog_id)
+                self._events.put((f"{velog_id} → 404 (삭제 대상) {url}", "clean"))
+            elif missing is False:
+                ok += 1
+            else:
+                fail += 1
+                self._events.put((f"{velog_id} → 확인 실패 (유지) {url}", "clean"))
+        payload = json.dumps({"dead": dead, "ok": ok, "fail": fail}, ensure_ascii=False)
+        self._events.put((payload, "clean_done"))
+
+    def _finish_clean_list(self, payload: str) -> None:
+        dead: list[str] = []
+        ok = 0
+        fail = 0
+        try:
+            data = json.loads(payload or "{}")
+            dead = [str(x) for x in (data.get("dead") or []) if str(x).strip()]
+            ok = int(data.get("ok") or 0)
+            fail = int(data.get("fail") or 0)
+        except (TypeError, ValueError):
+            pass
+        tab = self._active_tab or self._current_tab()
+        removed = 0
+        if tab is not None and dead:
+            dead_set = {x.strip().lower() for x in dead}
+            before = len(tab["accounts"])
+            tab["accounts"] = [
+                acc for acc in tab["accounts"]
+                if str(acc.get("velog_id", "")).strip().lower() not in dead_set
+                or not str(acc.get("published_url", "")).strip()
+            ]
+            removed = before - len(tab["accounts"])
+            self._fill_tree(tab)
+            self._update_summary()
+            self._save_settings()
+        self._cleaning = False
+        if hasattr(self, "clean_btn"):
+            self.clean_btn.configure(state="normal")
+        if self._poster is None:
+            self.start_btn.configure(state="normal")
+        msg = f"목록 정리 완료 — 404 삭제 {removed}개, 정상 {ok}개, 확인 실패 {fail}개"
+        self._append(msg, "success" if removed else "info")
+        self.status.set(msg)
+        messagebox.showinfo("목록 정리", msg, parent=self)
 
     def _tick_gauges(self) -> None:
         removed = self._purge_expired_accounts()
-        cleared = self._refresh_cooldowns()
-        if removed or cleared:
+        if removed:
             for tab in self.tabs:
                 self._fill_tree(tab)
             self._save_settings()
-            if removed:
-                self.status.set(f"만료 계정 {removed}개를 목록에서 삭제했습니다.")
-            elif cleared:
-                self.status.set(f"쿨다운 종료 {cleared}개 — 다시 원고 배정 가능합니다.")
+            self.status.set(f"만료 계정 {removed}개를 목록에서 삭제했습니다.")
         for tab in self.tabs:
             tree = tab.get("tree")
             if tree is None:
@@ -1819,10 +2012,13 @@ class VelogApp(tk.Tk):
             self.progress_text.set("")
             return
         self.progress.configure(maximum=total, value=done)
-        self.progress_text.set(f"{done} / {total} 완료")
+        self.progress_text.set(f"{done} / {total} 진행")
 
     # -- 실행 / 중단 ------------------------------------------------------
     def _start(self) -> None:
+        if self._cleaning:
+            messagebox.showinfo("출간", "목록 정리가 끝난 뒤 시작해 주세요.", parent=self)
+            return
         tab = self._current_tab()
         if tab is None or not tab["accounts"]:
             messagebox.showwarning("계정 확인", "현재 탭에 계정을 하나 이상 등록해 주세요.", parent=self)
@@ -1830,8 +2026,7 @@ class VelogApp(tk.Tk):
         self._active_tab = tab
 
         removed = self._purge_expired_accounts()
-        cleared = self._refresh_cooldowns()
-        if removed or cleared:
+        if removed:
             self._fill_tree(tab)
             self._update_summary()
 
@@ -1862,9 +2057,8 @@ class VelogApp(tk.Tk):
                 messagebox.showinfo(
                     "발행 확인",
                     "지금 출간할 계정이 없습니다.\n"
-                    "· 원고가 배정된 대기 계정\n"
-                    "· 또는 12시간 쿨다운이 끝난 계정\n"
-                    "이 필요합니다.",
+                    "원고가 배정된 대기 계정이 필요합니다.\n"
+                    "(이미 발행 완료된 계정은 제외됩니다)",
                     parent=self,
                 )
             self._save_settings()
@@ -2062,6 +2256,8 @@ class VelogApp(tk.Tk):
                 if level == "failed":
                     velog_id, _, rest = message.partition("\t")
                     manuscript_path, _, reason = rest.partition("\t")
+                    self._run_done += 1
+                    self._set_progress(self._run_done, self._run_total)
                     self._mark_failed(velog_id, manuscript_path, reason)
                     continue
                 if level == "signup":
@@ -2070,6 +2266,13 @@ class VelogApp(tk.Tk):
                         self.signed_up_emails.add(email)
                         self._save_settings()
                         self._append(f"가입 이력 저장: {email}", "info")
+                    continue
+                if level == "clean":
+                    self._append(message, "info")
+                    self.status.set(message)
+                    continue
+                if level == "clean_done":
+                    self._finish_clean_list(message)
                     continue
                 self.status.set(message)
                 tag = "success" if level == "success" else ("error" if level == "error" else "info")
@@ -2182,6 +2385,13 @@ class VelogApp(tk.Tk):
                 f"{velog_id} 잠김·재가입 → 목록에서 삭제했습니다. (실패 원고는 폴더에 유지)",
                 "error",
             )
+        elif kind == "image":
+            target["manuscript_path"] = ""
+            tab["accounts"] = [a for a in tab["accounts"] if a is not target]
+            self._append(
+                f"{velog_id} 이미지 등록 실패 → 목록에서 삭제했습니다. (원고 파일은 폴더에 유지)",
+                "error",
+            )
         elif kind in {"login", "publish"}:
             try:
                 fails = int(str(target.get("fail_count", "0") or "0").strip() or "0")
@@ -2230,6 +2440,8 @@ class VelogApp(tk.Tk):
     def _set_running(self, running: bool) -> None:
         self.start_btn.configure(state="disabled" if running else "normal")
         self.stop_btn.configure(state="normal" if running else "disabled")
+        if hasattr(self, "clean_btn"):
+            self.clean_btn.configure(state="disabled" if (running or self._cleaning) else "normal")
         if running:
             self.status.set("출간 작업 진행 중...")
         else:
@@ -2682,7 +2894,6 @@ class VelogApp(tk.Tk):
         if not self.tabs:
             self.tabs.append({"title": "기본", "accounts": []})
         self._purge_expired_accounts()
-        self._refresh_cooldowns()
         self.profile_text.delete("1.0", "end")
         self.profile_text.insert("1.0", ", ".join(names))
         self._refresh_anchor_list()

@@ -24,18 +24,44 @@ from updater import (
 )
 
 
+def _work_area() -> tuple[int, int, int, int]:
+    try:
+        import ctypes
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        rect = RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            if width > 200 and height > 200:
+                return int(rect.left), int(rect.top), width, height
+    except Exception:  # noqa: BLE001
+        pass
+    return 0, 0, 1280, 720
+
+
 def _center_on_parent(window, parent) -> None:
     window.update_idletasks()
     parent.update_idletasks()
-    pw = max(parent.winfo_width(), parent.winfo_reqwidth())
-    ph = max(parent.winfo_height(), parent.winfo_reqheight())
+    ax, ay, aw, ah = _work_area()
+    pw = max(parent.winfo_width(), parent.winfo_reqwidth(), 1)
+    ph = max(parent.winfo_height(), parent.winfo_reqheight(), 1)
     px = parent.winfo_rootx()
     py = parent.winfo_rooty()
-    w = max(window.winfo_width(), window.winfo_reqwidth())
-    h = max(window.winfo_height(), window.winfo_reqheight())
+    w = min(max(window.winfo_width(), window.winfo_reqwidth(), 280), max(aw - 24, 280))
+    h = min(max(window.winfo_height(), window.winfo_reqheight(), 120), max(ah - 24, 120))
     x = px + max((pw - w) // 2, 0)
     y = py + max((ph - h) // 2, 0)
-    window.geometry(f"+{x}+{y}")
+    x = min(max(x, ax), ax + max(aw - w, 0))
+    y = min(max(y, ay), ay + max(ah - h, 0))
+    window.geometry(f"{w}x{h}+{x}+{y}")
 
 
 def _ask_update(root, title: str, message: str, *, kind: str) -> bool | None:
@@ -54,9 +80,11 @@ def _ask_update(root, title: str, message: str, *, kind: str) -> bool | None:
     frame = ttk.Frame(dialog, padding=16)
     frame.pack(fill="both", expand=True)
 
-    ttk.Label(frame, text=message, justify="left", wraplength=360).pack(anchor="w")
     btn_row = ttk.Frame(frame)
-    btn_row.pack(fill="x", pady=(16, 0))
+    btn_row.pack(side="bottom", fill="x", pady=(16, 0))
+    ttk.Label(frame, text=message, justify="left", wraplength=360).pack(
+        fill="both", expand=True, anchor="w",
+    )
 
     def close(value: bool | None) -> None:
         nonlocal result
@@ -157,7 +185,7 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
 
     dialog = tk.Toplevel(root)
     dialog.title("업데이트 중")
-    dialog.geometry("360x120")
+    dialog.minsize(320, 120)
     dialog.transient(root)
     dialog.grab_set()
     dialog.resizable(False, False)
