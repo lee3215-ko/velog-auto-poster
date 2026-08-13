@@ -57,6 +57,10 @@ class PostingError(RuntimeError):
     """사용자에게 그대로 보여줄 수 있는 명확한 오류."""
 
 
+class BrowserCheckFailed(PostingError):
+    """AdGuard가 현재 브라우저를 거부함. 다른 브라우저로 재시도."""
+
+
 def classify_failure(message: str) -> str:
     """실패 사유를 login / publish / locked / image / other 로 분류한다."""
     text = (message or "").strip()
@@ -278,15 +282,53 @@ def relocate_manuscript(manuscript_path: str, *, success: bool) -> str:
 
 def find_chrome() -> Path:
     """설치된 실제 Google Chrome 실행 파일을 찾는다."""
-    keys = ["LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"]
-    for key in keys:
+    for path in _browser_search_paths("Google/Chrome/Application/chrome.exe"):
+        return path
+    raise PostingError("Google Chrome을 찾지 못했습니다. Chrome을 설치해 주세요.")
+
+
+def _browser_search_paths(relative: str) -> list[Path]:
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for key in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
         base = os.environ.get(key)
         if not base:
             continue
-        candidate = Path(base) / "Google/Chrome/Application/chrome.exe"
-        if candidate.is_file():
-            return candidate
-    raise PostingError("Google Chrome을 찾지 못했습니다. Chrome을 설치해 주세요.")
+        candidate = Path(base) / relative
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if candidate.is_file() and resolved not in seen:
+            seen.add(resolved)
+            found.append(candidate)
+    return found
+
+
+def find_chromium_browsers() -> list[tuple[str, Path]]:
+    """CDP 연결 가능한 Chromium 계열 브라우저. Chrome → Edge → Brave 순."""
+    specs = (
+        ("Chrome", "Google/Chrome/Application/chrome.exe"),
+        ("Edge", "Microsoft/Edge/Application/msedge.exe"),
+        ("Brave", "BraveSoftware/Brave-Browser/Application/brave.exe"),
+        ("Chrome Beta", "Google/Chrome Beta/Application/chrome.exe"),
+        ("Chrome Canary", "Google/Chrome SxS/Application/chrome.exe"),
+        ("Vivaldi", "Vivaldi/Application/vivaldi.exe"),
+        ("Opera", "Programs/Opera/opera.exe"),
+    )
+    result: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for name, relative in specs:
+        for path in _browser_search_paths(relative):
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            result.append((name, path))
+    return result
 
 
 def _jitter(base: float, spread: float = 0.5) -> float:
@@ -385,6 +427,7 @@ class VelogPoster:
         self._temp_profile: Path | None = None
         self._endpoint: str | None = None
         self._handoff = False
+        self._browser_label = "Chrome"
         self._user_foreground_hwnd = 0
         # 업로드 실패 이미지 → 이후 N계정(10~20) 동안 보류
         self._image_hold: dict[str, int] = {}
@@ -552,6 +595,28 @@ class VelogPoster:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _adguard_browser_candidates(self, preferred: Path) -> list[tuple[str, Path]]:
+        found = find_chromium_browsers()
+        ordered: list[tuple[str, Path]] = []
+        seen: set[Path] = set()
+        try:
+            preferred_res = preferred.resolve()
+        except OSError:
+            preferred_res = preferred
+        name = next((n for n, p in found if p.resolve() == preferred_res), "Chrome")
+        ordered.append((name, preferred))
+        seen.add(preferred_res)
+        for name, path in found:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            ordered.append((name, path))
+        return ordered
+
     def _run_one_adguard(self, pw, chrome: Path, account: dict[str, str]) -> None:
         """AdGuard 임시메일 생성 → 벨로그 가입/로그인 → 작성 → 출간."""
         title, body, tags = read_manuscript(account["manuscript_path"])
@@ -565,13 +630,45 @@ class VelogPoster:
             if anchor_text and anchor_url:
                 body = f"{body.rstrip()}\n\n[{anchor_text}]({anchor_url})"
 
-        self._user_foreground_hwnd = self._capture_foreground_hwnd()
-        self._launch_incognito(pw, chrome)
-        self._restore_user_focus()
+        browsers = self._adguard_browser_candidates(chrome)
+        if len(browsers) > 1:
+            names = ", ".join(n for n, _ in browsers)
+            self.log(f"AdGuard 브라우저 후보: {names}", "info")
 
-        mail = self._first_page()
-        self._inject_stealth(mail)
-        email = self._adguard_create_address(pw, mail)
+        email = ""
+        last_blocked: BrowserCheckFailed | None = None
+        for index, (name, path) in enumerate(browsers):
+            if index > 0:
+                self.log(
+                    f"브라우저 확인 실패 → {name}으로 다시 엽니다.",
+                    "info",
+                )
+                self._teardown_account()
+                self._sleep(_jitter(1.2, 0.5))
+            try:
+                self._user_foreground_hwnd = self._capture_foreground_hwnd()
+                self._launch_incognito(pw, path, browser_name=name)
+                self._restore_user_focus()
+                mail = self._first_page()
+                self._inject_stealth(mail)
+                email = self._adguard_create_address(pw, mail)
+                break
+            except BrowserCheckFailed as exc:
+                last_blocked = exc
+                self.log(f"{name}: AdGuard가 이 브라우저를 거부했습니다.", "info")
+                continue
+            except PostingError as exc:
+                if self._stop.is_set() or "중단" in str(exc):
+                    raise
+                if index + 1 < len(browsers):
+                    self.log(f"{name} 실행/접속 실패 → 다음 브라우저로 시도합니다.", "info")
+                    continue
+                raise
+        else:
+            raise PostingError(
+                "AdGuard 브라우저 확인에 실패했습니다. "
+                "Edge 등 다른 브라우저를 설치한 뒤 다시 시도해 주세요.",
+            ) from last_blocked
         account["velog_id"] = email
         self._emit(email, "working")
         if self.on_account is not None:
@@ -624,17 +721,20 @@ class VelogPoster:
                 pass
 
     # -- Chrome 실행 / 연결 -----------------------------------------------
-    def _launch_incognito(self, pw, chrome: Path) -> None:
+    def _launch_incognito(self, pw, chrome: Path, *, browser_name: str = "Chrome") -> None:
         port = self._free_port()
         # 이미 실행 중인 사용자 Chrome과 충돌하지 않도록 전용 임시 프로필을 쓴다.
         # (전용 user-data-dir 가 없으면 새 chrome.exe 가 기존 인스턴스에 명령만
         #  넘기고 즉시 종료되어 디버깅 포트가 열리지 않는다.)
-        self._temp_profile = Path(tempfile.mkdtemp(prefix="velog-chrome-"))
+        self._browser_label = browser_name or "Chrome"
+        slug = re.sub(r"[^a-z0-9]+", "-", self._browser_label.lower()).strip("-") or "chrome"
+        self._temp_profile = Path(tempfile.mkdtemp(prefix=f"velog-{slug}-"))
+        private_flag = "--inprivate" if "msedge" in chrome.name.lower() else "--incognito"
         # 시크릿 모드 + 자동화 배너가 뜨지 않는 안전한 플래그만 사용.
         # --start-maximized 는 작업 창을 강제로 전면 최대화하므로 쓰지 않는다.
         command = [
             str(chrome),
-            "--incognito",
+            private_flag,
             f"--user-data-dir={self._temp_profile}",
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
@@ -646,11 +746,11 @@ class VelogPoster:
             "--disable-popup-blocking",
             "about:blank",
         ]
-        self.log("Chrome 시크릿 창을 여는 중...", "info")
+        self.log(f"{self._browser_label} 시크릿 창을 여는 중...", "info")
         try:
             self._process = subprocess.Popen(command, close_fds=True)
-        except OSError as exc:
-            raise PostingError("Chrome 시크릿 창을 실행하지 못했습니다.") from exc
+        except OSError as rest:
+            raise PostingError(f"{self._browser_label} 시크릿 창을 실행하지 못했습니다.") from rest
 
         endpoint = f"http://127.0.0.1:{port}"
         self._endpoint = endpoint  # 출간 단계에서 재연결할 때 사용
@@ -658,10 +758,10 @@ class VelogPoster:
         try:
             self._browser = pw.chromium.connect_over_cdp(endpoint, timeout=20_000)
         except Error as exc:
-            raise PostingError("Chrome에 연결하지 못했습니다.") from exc
+            raise PostingError(f"{self._browser_label}에 연결하지 못했습니다.") from exc
 
         if not self._browser.contexts:
-            raise PostingError("Chrome 컨텍스트를 찾지 못했습니다.")
+            raise PostingError(f"{self._browser_label} 컨텍스트를 찾지 못했습니다.")
         self._context = self._browser.contexts[0]
         # 이후 열리는 모든 페이지에도 stealth 적용
         self._context.add_init_script(STEALTH_SCRIPT)
@@ -686,14 +786,14 @@ class VelogPoster:
     def _wait_for_endpoint(self, endpoint: str) -> None:
         for _ in range(120):
             if self._process and self._process.poll() is not None:
-                raise PostingError("Chrome이 실행 직후 종료되었습니다.")
+                raise PostingError(f"{self._browser_label}이(가) 실행 직후 종료되었습니다.")
             try:
                 if requests.get(f"{endpoint}/json/version", timeout=0.5).ok:
                     return
             except requests.RequestException:
                 pass
             time.sleep(0.1)
-        raise PostingError("Chrome 연결 준비 시간이 초과되었습니다.")
+        raise PostingError(f"{self._browser_label} 연결 준비 시간이 초과되었습니다.")
 
     # -- 사람같은 입력 헬퍼 ------------------------------------------------
     def _sleep(self, seconds: float) -> None:
@@ -1023,11 +1123,13 @@ class VelogPoster:
         page = self._adguard_mail_page()
         self._adguard_dismiss_banners(page)
         root = self._adguard_scope(page)
+        self._adguard_raise_if_blocked(page, root)
 
         btn = None
         for _ in range(40):
             if self._stop.wait(0):
                 raise PostingError("사용자가 작업을 중단했습니다.")
+            self._adguard_raise_if_blocked(page, root)
             existing = self._adguard_read_email(root)
             if existing:
                 self.log(f"이미 생성된 AdGuard 주소: {existing}", "success")
@@ -1037,6 +1139,7 @@ class VelogPoster:
                 break
             self._sleep(0.5)
         if btn is None:
+            self._adguard_raise_if_blocked(page, root)
             raise PostingError("AdGuard '주소 생성' 버튼을 찾지 못했습니다.")
 
         self._sleep(_jitter(0.6, 0.3))
@@ -1046,11 +1149,55 @@ class VelogPoster:
         for _ in range(40):
             if self._stop.wait(1):
                 raise PostingError("사용자가 작업을 중단했습니다.")
+            self._adguard_raise_if_blocked(page, root)
             email = self._adguard_read_email(root)
             if email:
                 self.log(f"AdGuard 임시 메일 생성: {email}", "success")
                 return email
+        self._adguard_raise_if_blocked(page, root)
         raise PostingError("AdGuard 임시 메일 주소가 시간 내에 나타나지 않았습니다.")
+
+    def _adguard_raise_if_blocked(self, page: Page, root=None) -> None:
+        if self._adguard_browser_blocked(page, root):
+            raise BrowserCheckFailed(
+                "AdGuard 브라우저 확인 실패 — 다른 브라우저로 다시 엽니다.",
+            )
+
+    def _adguard_browser_blocked(self, page: Page, root=None) -> bool:
+        scopes = []
+        if root is not None:
+            scopes.append(root)
+        scopes.append(page)
+        for scope in scopes:
+            try:
+                loc = scope.locator(".error-screen, .error-screen__title")
+                if loc.count() > 0:
+                    try:
+                        if loc.first.is_visible():
+                            return True
+                    except Error:
+                        return True
+            except Error:
+                pass
+            try:
+                loc = scope.get_by_text("브라우저 확인 실패")
+                if loc.count() > 0:
+                    return True
+            except Error:
+                pass
+            try:
+                loc = scope.get_by_text("다른 브라우저에서 열어")
+                if loc.count() > 0:
+                    return True
+            except Error:
+                pass
+            try:
+                text = scope.locator("body").inner_text(timeout=1_500) or ""
+                if "브라우저 확인 실패" in text or "다른 브라우저에서 열어" in text:
+                    return True
+            except Error:
+                pass
+        return False
 
     def _adguard_find_create_button(self, root):
         for sel in _ADGUARD_CREATE_SELECTORS:
@@ -2161,6 +2308,7 @@ class VelogPoster:
         self._temp_profile = None
         self._endpoint = None
         self._handoff = False
+        self._browser_label = "Chrome"
 
     def _teardown_account(self) -> None:
         """현재 계정의 Chrome 창/프로세스/임시 프로필을 완전히 정리한다."""
