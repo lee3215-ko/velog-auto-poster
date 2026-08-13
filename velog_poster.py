@@ -306,15 +306,16 @@ def _browser_search_paths(relative: str) -> list[Path]:
 
 
 def find_chromium_browsers() -> list[tuple[str, Path]]:
-    """CDP 연결 가능한 Chromium 계열 브라우저. Chrome → Edge → Brave 순."""
+    """CDP 연결 가능한 Chromium 계열. Chrome과 Edge는 엔진이 같아 Opera를 사이에 둔다."""
     specs = (
         ("Chrome", "Google/Chrome/Application/chrome.exe"),
+        ("Opera", "Programs/Opera/opera.exe"),
+        ("Opera", "Programs/Opera/launcher.exe"),
         ("Edge", "Microsoft/Edge/Application/msedge.exe"),
         ("Brave", "BraveSoftware/Brave-Browser/Application/brave.exe"),
         ("Chrome Beta", "Google/Chrome Beta/Application/chrome.exe"),
         ("Chrome Canary", "Google/Chrome SxS/Application/chrome.exe"),
         ("Vivaldi", "Vivaldi/Application/vivaldi.exe"),
-        ("Opera", "Programs/Opera/opera.exe"),
     )
     result: list[tuple[str, Path]] = []
     seen: set[Path] = set()
@@ -442,6 +443,7 @@ class VelogPoster:
         self._recent_images: list[str] = []
         self._recent_image_limit = 8
         self._temp_upload_files: list[Path] = []
+        self._adguard_ext_dir: Path | None = None
 
     def log(self, message: str, level: str) -> None:
         """모든 로그에 현재 진행 중인 계정 번호를 붙여 내보낸다."""
@@ -631,52 +633,69 @@ class VelogPoster:
                 body = f"{body.rstrip()}\n\n[{anchor_text}]({anchor_url})"
 
         browsers = self._adguard_browser_candidates(chrome)
-        if len(browsers) > 1:
-            names = ", ".join(n for n, _ in browsers)
-            self.log(f"AdGuard 브라우저 후보: {names}", "info")
+        names = ", ".join(n for n, _ in browsers)
+        self.log(f"AdGuard 브라우저 후보: {names or 'Chrome'}", "info")
+        ext_dir = self._write_adguard_click_extension()
+        self._adguard_ext_dir = ext_dir
 
         email = ""
+        inbox_link = ""
         last_blocked: BrowserCheckFailed | None = None
-        for index, (name, path) in enumerate(browsers):
-            if index > 0:
-                self.log(
-                    f"브라우저 확인 실패 → {name}으로 다시 엽니다.",
-                    "info",
-                )
-                self._teardown_account()
-                self._sleep(_jitter(1.2, 0.5))
-            try:
-                self._user_foreground_hwnd = self._capture_foreground_hwnd()
-                self._launch_incognito(
-                    pw,
-                    path,
-                    browser_name=name,
-                    incognito=False,
-                    start_url=ADGUARD_TEMPMAIL_URL,
-                    connect_delay=_human_delay(8.0, 14.0),
-                )
-                self._restore_user_focus()
-                mail = self._first_page()
-                email = self._adguard_create_address(pw, mail)
-                break
-            except BrowserCheckFailed as exc:
-                last_blocked = exc
-                self.log(f"{name}: AdGuard가 이 브라우저를 거부했습니다.", "info")
-                continue
-            except PostingError as exc:
-                if self._stop.is_set() or "중단" in str(exc):
-                    raise
-                if index + 1 < len(browsers):
-                    self.log(f"{name} 실행/접속 실패 → 다음 브라우저로 시도합니다.", "info")
+        try:
+            for index, (name, path) in enumerate(browsers):
+                if index > 0:
+                    self.log(
+                        f"브라우저 확인 실패 → {name}으로 다시 엽니다.",
+                        "info",
+                    )
+                    self._teardown_account()
+                    self._adguard_ext_dir = ext_dir
+                    self._sleep(_jitter(1.2, 0.5))
+                try:
+                    self._user_foreground_hwnd = self._capture_foreground_hwnd()
+                    self._launch_incognito(
+                        pw,
+                        path,
+                        browser_name=name,
+                        incognito=False,
+                        start_url=ADGUARD_TEMPMAIL_URL,
+                        connect_delay=_human_delay(12.0, 18.0),
+                        extension_dir=ext_dir,
+                    )
+                    self._restore_user_focus()
+                    mail = self._first_page()
+                    email = self._adguard_create_address(pw, mail)
+                    break
+                except BrowserCheckFailed as exc:
+                    last_blocked = exc
+                    self.log(f"{name}: AdGuard가 이 브라우저를 거부했습니다.", "info")
                     continue
-                raise
-        else:
-            tried = ", ".join(n for n, _ in browsers) or "Chrome"
-            raise PostingError(
-                f"AdGuard 브라우저 확인에 실패했습니다. "
-                f"이미 설치된 {tried}로 시도했지만 통과하지 못했습니다. "
-                "브라우저를 따로 설치할 필요는 없습니다. 잠시 뒤 다시 시도해 주세요.",
-            ) from last_blocked
+                except PostingError as exc:
+                    if self._stop.is_set() or "중단" in str(exc):
+                        raise
+                    if index + 1 < len(browsers):
+                        self.log(f"{name} 실행/접속 실패 → 다음 브라우저로 시도합니다.", "info")
+                        continue
+                    raise
+            else:
+                self._teardown_account()
+                self.log("Chrome/Edge와 엔진이 다른 Firefox로 임시메일을 시도합니다.", "info")
+                try:
+                    email, inbox_link = self._adguard_via_firefox(pw)
+                    self._user_foreground_hwnd = self._capture_foreground_hwnd()
+                    self._launch_incognito(pw, chrome)
+                    self._restore_user_focus()
+                except (BrowserCheckFailed, PostingError, Error) as exc:
+                    tried = ", ".join(n for n, _ in browsers) or "Chrome"
+                    raise PostingError(
+                        f"AdGuard 브라우저 확인에 실패했습니다. "
+                        f"{tried}에 이어 Firefox로도 통과하지 못했습니다. "
+                        "잠시 뒤 다시 시도해 주세요.",
+                    ) from exc
+        finally:
+            shutil.rmtree(ext_dir, ignore_errors=True)
+            if self._adguard_ext_dir == ext_dir:
+                self._adguard_ext_dir = None
         account["velog_id"] = email
         self._emit(email, "working")
         if self.on_account is not None:
@@ -692,9 +711,13 @@ class VelogPoster:
         self._request_login(pw, velog, email)
 
         self._ensure_connected(pw)
-        mail = self._adguard_mail_page()
-        link = self._wait_adguard_velog_mail(mail)
-        velog = self._page_by_host("velog.io")
+        if inbox_link:
+            link = inbox_link
+            velog = self._page_by_host("velog.io")
+        else:
+            mail = self._adguard_mail_page()
+            link = self._wait_adguard_velog_mail(mail)
+            velog = self._page_by_host("velog.io")
         self._open_link(pw, velog, link)
 
         self._ensure_connected(pw)
@@ -738,6 +761,7 @@ class VelogPoster:
         incognito: bool = True,
         start_url: str = "about:blank",
         connect_delay: float = 0.0,
+        extension_dir: Path | None = None,
     ) -> None:
         port = self._free_port()
         # 이미 실행 중인 사용자 Chrome과 충돌하지 않도록 전용 임시 프로필을 쓴다.
@@ -761,6 +785,13 @@ class VelogPoster:
         ]
         if incognito:
             command.insert(1, "--inprivate" if "msedge" in chrome.name.lower() else "--incognito")
+        if extension_dir is not None:
+            ext = str(extension_dir)
+            command[1:1] = [
+                f"--load-extension={ext}",
+                f"--disable-extensions-except={ext}",
+                "--disable-features=DisableLoadExtensionCommandLineSwitch",
+            ]
         mode = "시크릿 창" if incognito else "창"
         self.log(f"{self._browser_label} {mode}을 여는 중...", "info")
         try:
@@ -954,9 +985,20 @@ class VelogPoster:
                 needle = host
         except Exception:  # noqa: BLE001
             pass
-        self.log("Cloudflare 사람 확인 감지 → 연결을 끊어 자동 우회합니다...", "info")
         if not self._endpoint:
-            return
+            self.log("Cloudflare 사람 확인 감지 → 사라질 때까지 기다립니다...", "info")
+            for _ in range(40):
+                if self._stop.wait(0):
+                    raise PostingError("사용자가 작업을 중단했습니다.")
+                self._sleep(4)
+                try:
+                    if not self._is_interstitial(page):
+                        self.log("Cloudflare 통과 확인 → 작업을 계속합니다.", "info")
+                        return
+                except Error:
+                    return
+            raise PostingError("Cloudflare 인증을 시간 내에 통과하지 못했습니다.")
+        self.log("Cloudflare 사람 확인 감지 → 연결을 끊어 자동 우회합니다...", "info")
         self._disconnect_only()
         for _ in range(40):  # 최대 약 200초
             if self._stop.wait(0):
@@ -1137,7 +1179,7 @@ class VelogPoster:
         already = "tempmail.adguard.com" in (page.url or "").lower()
         if already:
             self.log("AdGuard 화면 확인 중...", "info")
-            self._wait("브라우저 확인 이후 화면을 읽는 중...", _jitter(1.5, 0.8))
+            self._wait("주소가 생겼는지 확인하는 중...", _jitter(2.0, 1.0))
         else:
             self.log("AdGuard 임시 메일에 접속하는 중...", "info")
             self._goto(page, ADGUARD_TEMPMAIL_URL)
@@ -1152,37 +1194,213 @@ class VelogPoster:
             root = self._adguard_scope(page)
         self._adguard_raise_if_blocked(page, root)
 
-        btn = None
-        for _ in range(40):
-            if self._stop.wait(0):
-                raise PostingError("사용자가 작업을 중단했습니다.")
-            self._adguard_raise_if_blocked(page, root)
-            existing = self._adguard_read_email(root)
-            if existing:
-                self.log(f"이미 생성된 AdGuard 주소: {existing}", "success")
-                return existing
-            btn = self._adguard_find_create_button(root)
-            if btn is not None:
-                break
-            self._sleep(0.5)
+        email = self._adguard_wait_email(root, seconds=12)
+        if email:
+            self.log(f"AdGuard 임시 메일 생성: {email}", "success")
+            return email
+
+        btn = self._adguard_find_create_button(root)
         if btn is None:
             self._adguard_raise_if_blocked(page, root)
             raise PostingError("AdGuard '주소 생성' 버튼을 찾지 못했습니다.")
 
-        self._sleep(_jitter(0.6, 0.3))
-        self._stable_click(btn)
-        self.log("주소 생성 버튼을 눌렀습니다. 메일 주소를 기다리는 중...", "info")
-
-        for _ in range(40):
-            if self._stop.wait(1):
-                raise PostingError("사용자가 작업을 중단했습니다.")
-            self._adguard_raise_if_blocked(page, root)
-            email = self._adguard_read_email(root)
-            if email:
-                self.log(f"AdGuard 임시 메일 생성: {email}", "success")
-                return email
+        point = self._element_screen_point(btn)
+        self.log("자동화 클릭 대신 화면 클릭으로 주소를 만듭니다...", "info")
+        if self._process is not None:
+            self._focus_pid_window(self._process.pid)
+        self._disconnect_only()
+        self._sleep(_jitter(0.8, 0.3))
+        if point:
+            self._os_click(point[0], point[1])
+        self._sleep(_human_delay(3.5, 6.0))
+        self._ensure_connected(pw)
+        try:
+            page = self._adguard_mail_page()
+        except PostingError:
+            page = self._first_page()
+        root = self._adguard_scope(page)
+        self._adguard_raise_if_blocked(page, root)
+        email = self._adguard_wait_email(root, seconds=20)
+        if email:
+            self.log(f"AdGuard 임시 메일 생성: {email}", "success")
+            return email
         self._adguard_raise_if_blocked(page, root)
         raise PostingError("AdGuard 임시 메일 주소가 시간 내에 나타나지 않았습니다.")
+
+    def _adguard_wait_email(self, root, *, seconds: float) -> str:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            email = self._adguard_read_email(root)
+            if email:
+                return email
+            self._sleep(0.5)
+        return self._adguard_read_email(root)
+
+    def _write_adguard_click_extension(self) -> Path:
+        root = Path(tempfile.mkdtemp(prefix="velog-ag-ext-"))
+        (root / "manifest.json").write_text(
+            '{"manifest_version":3,"name":"ag-click","version":"1.0",'
+            '"content_scripts":[{"matches":["*://tempmail.adguard.com/*","*://adguard.com/*"],'
+            '"js":["click.js"],"run_at":"document_idle","all_frames":true}]}',
+            encoding="utf-8",
+        )
+        (root / "click.js").write_text(
+            """
+(function () {
+  let clicked = false;
+  function visible(el) {
+    const r = el.getBoundingClientRect();
+    return r.width > 8 && r.height > 8;
+  }
+  function tick() {
+    if (document.querySelector(".error-screen")) return;
+    const copy = document.querySelector(".address__copy-text");
+    if (copy && /@/.test(copy.textContent || "")) return;
+    const byClass = document.querySelector("button.address__get-address-btn");
+    const buttons = [...document.querySelectorAll("button")];
+    const btn = (byClass && visible(byClass) ? byClass : null) || buttons.find((b) => {
+      const t = (b.textContent || "").replace(/\\s+/g, " ").trim();
+      if (!visible(b) || /변경|change|복사|copy/i.test(t)) return false;
+      return /주소\\s*생성|Get address|Create address/i.test(t);
+    });
+    if (btn && !clicked) {
+      clicked = true;
+      btn.click();
+    }
+  }
+  tick();
+  setInterval(tick, 700);
+})();
+""".strip(),
+            encoding="utf-8",
+        )
+        return root
+
+    def _element_screen_point(self, locator) -> tuple[float, float] | None:
+        try:
+            point = locator.evaluate(
+                """el => {
+                    const r = el.getBoundingClientRect();
+                    const chrome = Math.max(0, window.outerHeight - window.innerHeight);
+                    return [
+                        window.screenX + r.left + r.width / 2,
+                        window.screenY + chrome + r.top + r.height / 2
+                    ];
+                }"""
+            )
+            if isinstance(point, (list, tuple)) and len(point) == 2:
+                return float(point[0]), float(point[1])
+        except Error:
+            pass
+        try:
+            box = locator.bounding_box()
+        except Error:
+            box = None
+        if not box:
+            return None
+        return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+    def _focus_pid_window(self, pid: int) -> None:
+        if sys.platform != "win32" or pid <= 0:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            found: list[int] = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            def _enum(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                proc = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc))
+                if int(proc.value) == int(pid):
+                    found.append(int(hwnd))
+                return True
+
+            user32.EnumWindows(_enum, 0)
+            if found:
+                user32.SetForegroundWindow(found[0])
+                self._sleep(0.2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _adguard_via_firefox(self, pw) -> tuple[str, str]:
+        """Firefox(다른 엔진)에서 주소 생성·인증메일까지 받은 뒤 링크만 넘긴다."""
+        try:
+            browser = pw.firefox.launch(headless=False)
+        except Exception as exc:  # noqa: BLE001
+            raise BrowserCheckFailed(f"Firefox를 실행하지 못했습니다: {exc}") from exc
+        prev_browser, prev_context = self._browser, self._context
+        try:
+            context = browser.new_context(viewport={"width": 1500, "height": 1000})
+            self._browser = browser
+            self._context = context
+            page = context.new_page()
+            self.log("Firefox에서 AdGuard 임시메일에 접속하는 중...", "info")
+            page.goto(ADGUARD_TEMPMAIL_URL, wait_until="domcontentloaded", timeout=45_000)
+            self._wait("Firefox AdGuard 화면 대기...", _jitter(3.0, 1.2))
+            email = self._adguard_create_on_page(page)
+            self.log(f"Firefox AdGuard 주소: {email}", "success")
+            velog = context.new_page()
+            self._request_login(pw, velog, email)
+            try:
+                page.bring_to_front()
+            except Error:
+                pass
+            link = self._wait_adguard_velog_mail(page)
+            return email, link
+        finally:
+            self._browser = prev_browser
+            self._context = prev_context
+            try:
+                browser.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _adguard_create_on_page(self, page: Page) -> str:
+        """Playwright가 직접 띄운 브라우저(Firefox 등)에서 주소를 만든다."""
+        self._adguard_dismiss_banners(page)
+        root = self._adguard_scope(page)
+        if self._adguard_browser_blocked(page, root):
+            raise BrowserCheckFailed("AdGuard 브라우저 확인 실패 (Firefox)")
+        email = self._adguard_wait_email(root, seconds=12)
+        if email:
+            return email
+        btn = self._adguard_find_create_button(root)
+        if btn is None:
+            raise PostingError("AdGuard '주소 생성' 버튼을 찾지 못했습니다.")
+        self._stable_click(btn)
+        self.log("Firefox에서 주소 생성 버튼을 눌렀습니다.", "info")
+        email = self._adguard_wait_email(root, seconds=20)
+        if email:
+            return email
+        if self._adguard_browser_blocked(page, root):
+            raise BrowserCheckFailed("AdGuard 브라우저 확인 실패 (Firefox)")
+        raise PostingError("AdGuard 임시 메일 주소가 시간 내에 나타나지 않았습니다.")
+
+    def _os_click(self, x: float, y: float) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            try:
+                user32.SetProcessDPIAware()
+            except Exception:  # noqa: BLE001
+                pass
+            user32.SetCursorPos(int(round(x)), int(round(y)))
+            time.sleep(0.12)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            time.sleep(0.05)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _adguard_raise_if_blocked(self, page: Page, root=None) -> None:
         if self._adguard_browser_blocked(page, root):
@@ -1217,33 +1435,14 @@ class VelogPoster:
         scopes.append(page)
         for scope in scopes:
             try:
-                loc = scope.locator(".error-screen, .error-screen__title")
-                if loc.count() > 0:
-                    try:
-                        if loc.first.is_visible():
-                            return True
-                    except Error:
-                        return True
-            except Error:
-                pass
-            try:
-                loc = scope.get_by_text("브라우저 확인 실패")
-                if loc.count() > 0:
+                loc = scope.locator(".error-screen")
+                if loc.count() == 0 or not loc.first.is_visible():
+                    continue
+                text = (loc.first.inner_text(timeout=1_500) or "")
+                if "브라우저 확인" in text or "다른 브라우저에서 열어" in text:
                     return True
             except Error:
-                pass
-            try:
-                loc = scope.get_by_text("다른 브라우저에서 열어")
-                if loc.count() > 0:
-                    return True
-            except Error:
-                pass
-            try:
-                text = scope.locator("body").inner_text(timeout=1_500) or ""
-                if "브라우저 확인 실패" in text or "다른 브라우저에서 열어" in text:
-                    return True
-            except Error:
-                pass
+                continue
         return False
 
     def _adguard_find_create_button(self, root):
