@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.40",
-    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/514057880",
-    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.40/VelogPoster.zip",
-    "notes":  "일자별 기록 성공 목록에서 404 URL 제외, 성공 URL 404 확인 추가. Guerrilla 출간 탭 포함.",
+    "version":  "1.0.41",
+    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.41/VelogPoster.zip",
+    "notes":  "네이버 회원가입 탭·다중등록, 설정을 AppData에 저장해 빌드 시 기록 보존",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/514057880",
-                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.40/VelogPoster.zip",
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.41/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ],
-    "asset_id":  514057880,
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/514057880"
+                      ]
 }

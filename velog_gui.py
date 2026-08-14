@@ -15,6 +15,7 @@ import multiprocessing
 import queue
 import random
 import re
+import shutil
 import sys
 import threading
 import tkinter as tk
@@ -25,15 +26,17 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from paths import APP_VERSION, EXE_NAME, UPDATE_VERSION_URL
+from paths import APP_VERSION, EXE_NAME, SETTINGS_PATH, UPDATE_VERSION_URL
 from tempmail_generator import TempMailGenerator, normalize_email_domain, normalize_email_domains
 from update_ui import schedule_update_check
 from velog_poster import (
     ADGUARD_TEMPMAIL_URL,
     DEFAULT_PROFILE_NAMES,
     GUERRILLA_TEMPMAIL_URL,
+    NAVER_MAIL_INBOX,
     PostingError,
     VelogPoster,
+    naver_email_from_id,
     normalize_url,
     parse_tempmail_address,
     read_manuscript,
@@ -47,7 +50,22 @@ BASE_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-SETTINGS_PATH = BASE_DIR / "velog_settings.json"
+# 예전 버전: exe/소스 옆 설정 → AppData 로 이전
+_LEGACY_SETTINGS_PATH = BASE_DIR / "velog_settings.json"
+
+
+def _migrate_legacy_settings() -> None:
+    """exe/소스 옆 설정을 AppData로 한 번만 옮긴다."""
+    if SETTINGS_PATH.is_file():
+        return
+    if not _LEGACY_SETTINGS_PATH.is_file():
+        return
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(_LEGACY_SETTINGS_PATH, SETTINGS_PATH)
+    except OSError:
+        pass
+
 
 BG = "#eef1f6"
 CARD = "#ffffff"
@@ -301,6 +319,17 @@ class VelogApp(tk.Tk):
         )
         self.gm_progress_text = tk.StringVar(value="")
 
+        self.naver_accounts: list[dict[str, str]] = []
+        self.nv_id = tk.StringVar()
+        self.nv_pw = tk.StringVar()
+        self.nv_count = tk.IntVar(value=1)
+        self.nv_loop_until_stop = tk.BooleanVar(value=False)
+        self.nv_status = tk.StringVar(
+            value="대기 중 — 네이버 계정을 등록하고 출간을 시작하세요.",
+        )
+        self.nv_progress_text = tk.StringVar(value="")
+        self.nv_account_summary = tk.StringVar(value="등록 계정 0개")
+
         self._build_style()
         self._build_ui()
         self._bind_shortcuts()
@@ -405,6 +434,7 @@ class VelogApp(tk.Tk):
             ("tempmail", "임시 메일 생성"),
             ("adguard", "AdGuard 출간"),
             ("guerrilla", "Guerrilla 출간"),
+            ("naver", "네이버 회원가입"),
             ("log", "실행 로그"),
         )
         for index, (key, label) in enumerate(items):
@@ -517,17 +547,20 @@ class VelogApp(tk.Tk):
         tempmail_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         adguard_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         guerrilla_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
+        naver_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         log_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         self._main_views["posting"] = posting_frame
         self._main_views["tempmail"] = tempmail_frame
         self._main_views["adguard"] = adguard_frame
         self._main_views["guerrilla"] = guerrilla_frame
+        self._main_views["naver"] = naver_frame
         self._main_views["log"] = log_frame
 
         self._build_posting_tab(posting_frame)
         self._build_tempmail_tab(tempmail_frame)
         self._build_adguard_tab(adguard_frame)
         self._build_guerrilla_tab(guerrilla_frame)
+        self._build_naver_tab(naver_frame)
         self._build_log_tab(log_frame)
         self._switch_main_view("posting")
 
@@ -902,6 +935,398 @@ class VelogApp(tk.Tk):
             style="Hint.TLabel",
             justify="left",
         ).pack(anchor="w", pady=(8, 0))
+
+    def _build_naver_tab(self, root: ttk.Frame) -> None:
+        header = ttk.Frame(root, style="Bg.TFrame")
+        header.pack(side="top", fill="x", pady=(0, 8))
+        ttk.Label(header, text="네이버 메일로 벨로그 회원가입", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="등록한 네이버 계정으로 메일 로그인 → 벨로그 가입 → 원고 작성 → 출간까지 진행합니다.",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        bottom = ttk.Frame(root, style="Bg.TFrame")
+        bottom.pack(side="bottom", fill="x", pady=(8, 0))
+        prog_row = ttk.Frame(bottom, style="Bg.TFrame")
+        prog_row.pack(fill="x", pady=(0, 6))
+        self.nv_progress = ttk.Progressbar(
+            prog_row, mode="determinate", style="green.Horizontal.TProgressbar",
+        )
+        self.nv_progress.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ttk.Label(prog_row, textvariable=self.nv_progress_text, style="Sub.TLabel").pack(side="right")
+
+        action_row = ttk.Frame(bottom, style="Bg.TFrame")
+        action_row.pack(fill="x")
+        action_row.columnconfigure(0, weight=3)
+        action_row.columnconfigure(1, weight=1)
+        self.nv_start_btn = ttk.Button(
+            action_row, text="▶  출간 시작", style="Primary.TButton", command=self._start_naver,
+        )
+        self.nv_start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.nv_stop_btn = ttk.Button(
+            action_row, text="■  중단", style="Danger.TButton",
+            command=self._stop, state="disabled",
+        )
+        self.nv_stop_btn.grid(row=0, column=1, sticky="ew")
+        ttk.Label(bottom, textvariable=self.nv_status, style="Status.TLabel").pack(
+            fill="x", pady=(8, 0),
+        )
+
+        body = ttk.Panedwindow(root, orient="horizontal")
+        body.pack(fill="both", expand=True)
+
+        left = ttk.Frame(body, style="Bg.TFrame")
+        right = ttk.Frame(body, style="Bg.TFrame")
+        body.add(left, weight=1)
+        body.add(right, weight=1)
+
+        reg = self._section(left, "네이버 계정 등록", "아이디·비밀번호는 이 PC 설정 파일에만 저장됩니다.")
+        reg.columnconfigure(1, weight=1)
+        ttk.Label(reg, text="아이디", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(reg, textvariable=self.nv_id, font=(FONT, 10)).grid(row=0, column=1, sticky="ew")
+        ttk.Label(reg, text="비밀번호", style="Field.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0),
+        )
+        ttk.Entry(reg, textvariable=self.nv_pw, show="•", font=(FONT, 10)).grid(
+            row=1, column=1, sticky="ew", pady=(8, 0),
+        )
+        ttk.Label(
+            reg, text="@ 없이 아이디만 입력해도 @naver.com 으로 사용합니다.",
+            style="Hint.TLabel",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        btn_row = ttk.Frame(reg, style="Card.TFrame")
+        btn_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(btn_row, text="계정 추가", style="Pick.TButton", command=self._add_naver_account).pack(
+            side="left", padx=(0, 6),
+        )
+        ttk.Button(btn_row, text="다중등록", style="Pick.TButton", command=self._open_naver_bulk_dialog).pack(
+            side="left", padx=(0, 6),
+        )
+        ttk.Button(btn_row, text="선택 삭제", style="Ghost.TButton", command=self._delete_naver_accounts).pack(
+            side="left", padx=(0, 6),
+        )
+        ttk.Button(
+            btn_row, text="사용완료 초기화", style="Ghost.TButton", command=self._reset_naver_used,
+        ).pack(side="left")
+
+        list_sec = self._section(left, "등록된 네이버 계정", "")
+        ttk.Label(list_sec, textvariable=self.nv_account_summary, style="Sub.TLabel").pack(
+            anchor="w", pady=(0, 6),
+        )
+        tree_wrap = ttk.Frame(list_sec, style="CardBorder.TFrame")
+        tree_wrap.pack(fill="both", expand=True)
+        tree_inner = ttk.Frame(tree_wrap, style="Card.TFrame", padding=4)
+        tree_inner.pack(fill="both", expand=True, padx=1, pady=1)
+        tree_inner.rowconfigure(0, weight=1)
+        tree_inner.columnconfigure(0, weight=1)
+        self.nv_tree = ttk.Treeview(
+            tree_inner,
+            columns=("id", "email", "status"),
+            show="headings",
+            selectmode="extended",
+            height=10,
+        )
+        self.nv_tree.heading("id", text="아이디")
+        self.nv_tree.heading("email", text="이메일")
+        self.nv_tree.heading("status", text="상태")
+        self.nv_tree.column("id", width=120, stretch=False)
+        self.nv_tree.column("email", width=180, stretch=True)
+        self.nv_tree.column("status", width=90, stretch=False, anchor="center")
+        self.nv_tree.tag_configure("used", background="#ffe3e3", foreground="#c92a2a")
+        self.nv_tree.tag_configure("ready", background="#dcfce7", foreground="#166534")
+        self.nv_tree.grid(row=0, column=0, sticky="nsew")
+        nv_sb = ttk.Scrollbar(tree_inner, orient="vertical", command=self.nv_tree.yview)
+        nv_sb.grid(row=0, column=1, sticky="ns")
+        self.nv_tree.configure(yscrollcommand=nv_sb.set)
+
+        run = self._section(
+            right,
+            "출간 설정",
+            "원고 폴더·이미지·앵커·사이트 URL은 「벨로그 포스팅」 탭 설정을 그대로 사용합니다.",
+        )
+        run.columnconfigure(1, weight=1)
+        ttk.Label(run, text="출간 개수", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Spinbox(run, from_=1, to=100, textvariable=self.nv_count, width=8, font=(FONT, 10)).grid(
+            row=0, column=1, sticky="w",
+        )
+        ttk.Label(
+            run, text="미사용 네이버 계정 수와 남은 원고 중 적은 쪽만큼 진행합니다.",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            run, text="중단할 때까지 남은 원고·계정을 모두 출간 (개수 무시)",
+            variable=self.nv_loop_until_stop,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        info = ttk.Frame(right, style="CardBorder.TFrame")
+        info.pack(fill="both", expand=True, pady=(10, 0))
+        card = ttk.Frame(info, style="Card.TFrame", padding=(16, 14))
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+        ttk.Label(card, text="진행 순서", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(
+            card,
+            text=(
+                "1. 등록된 미사용 네이버 계정으로 로그인\n"
+                "2. 캡챠/추가 인증이 뜨면 브라우저에서 직접 완료\n"
+                "3. 네이버 메일함에서 벨로그 인증 메일 확인\n"
+                "4. 벨로그 회원가입 → 원고 작성 → 출간\n"
+                "5. 성공한 네이버 계정은「사용완료」로 표시"
+            ),
+            style="Hint.TLabel",
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+        self._refresh_naver_tree()
+
+    def _refresh_naver_tree(self) -> None:
+        if not hasattr(self, "nv_tree"):
+            return
+        self.nv_tree.delete(*self.nv_tree.get_children())
+        ready = 0
+        for index, acc in enumerate(self.naver_accounts):
+            used = str(acc.get("used", "")).strip().lower() in {"1", "true", "yes"}
+            if not used:
+                ready += 1
+            status = "사용완료" if used else "대기"
+            tags = ("used",) if used else ("ready",)
+            self.nv_tree.insert(
+                "", "end", iid=str(index), tags=tags,
+                values=(acc.get("naver_id", ""), acc.get("email", ""), status),
+            )
+        self.nv_account_summary.set(
+            f"등록 계정 {len(self.naver_accounts)}개 · 미사용 {ready}개"
+        )
+
+    def _register_naver_account(self, raw_id: str, pw: str) -> tuple[str, str]:
+        """네이버 계정 1건 등록. 성공 시 ('ok', email), 실패 시 ('dup'|'bad'|'empty', 메시지)."""
+        raw_id = (raw_id or "").strip()
+        pw = pw or ""
+        if not raw_id or not pw.strip():
+            return "empty", "아이디와 비밀번호가 비어 있습니다."
+        try:
+            email = naver_email_from_id(raw_id)
+        except PostingError as exc:
+            return "bad", str(exc)
+        naver_id = raw_id.split("@", 1)[0].strip() if "@" in raw_id else raw_id
+        for acc in self.naver_accounts:
+            if str(acc.get("email", "")).strip().lower() == email.lower():
+                return "dup", email
+        self.naver_accounts.append({
+            "naver_id": naver_id,
+            "naver_pw": pw,
+            "email": email,
+            "used": "",
+            "used_at": "",
+        })
+        return "ok", email
+
+    def _add_naver_account(self) -> None:
+        status, detail = self._register_naver_account(self.nv_id.get(), self.nv_pw.get())
+        if status == "empty":
+            messagebox.showwarning("네이버 계정", "아이디와 비밀번호를 입력해 주세요.", parent=self)
+            return
+        if status == "bad":
+            messagebox.showwarning("네이버 계정", detail, parent=self)
+            return
+        if status == "dup":
+            messagebox.showinfo("네이버 계정", "이미 등록된 계정입니다.", parent=self)
+            return
+        self.nv_id.set("")
+        self.nv_pw.set("")
+        self._refresh_naver_tree()
+        self._save_settings()
+        self._append(f"네이버 계정 등록: {detail}", "info")
+
+    def _open_naver_bulk_dialog(self) -> None:
+        """아이디·비밀번호를 각각 여러 줄로 붙여 넣고, 같은 줄 번호끼리 짝지어 등록한다."""
+        win = tk.Toplevel(self)
+        win.title("네이버 계정 다중등록")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.grab_set()
+        _, _, aw, ah = _work_area()
+        win.minsize(min(560, max(aw - 80, 420)), min(420, max(ah - 80, 320)))
+        _place_window(win, 720, 520, self)
+
+        wrap = ttk.Frame(win, style="Bg.TFrame", padding=16)
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text="네이버 계정 다중등록", style="Title.TLabel").pack(side="top", anchor="w")
+        ttk.Label(
+            wrap,
+            text="왼쪽 아이디 · 오른쪽 비밀번호를 한 줄씩 입력합니다. 1번째끼리, 2번째끼리 순서대로 짝지어 등록됩니다.",
+            style="Sub.TLabel",
+        ).pack(side="top", anchor="w", pady=(4, 10))
+
+        btns = ttk.Frame(wrap, style="Bg.TFrame")
+        btns.pack(side="bottom", fill="x", pady=(12, 0))
+        ttk.Button(btns, text="취소", style="Ghost.TButton", command=win.destroy).pack(side="right")
+        register_btn = ttk.Button(btns, text="등록하기", style="Primary.TButton")
+        register_btn.pack(side="right", padx=(0, 8))
+
+        panes = ttk.Frame(wrap, style="Bg.TFrame")
+        panes.pack(fill="both", expand=True)
+        panes.columnconfigure(0, weight=1)
+        panes.columnconfigure(1, weight=1)
+        panes.rowconfigure(1, weight=1)
+
+        ttk.Label(panes, text="아이디 (한 줄에 하나)", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8),
+        )
+        ttk.Label(panes, text="비밀번호 (한 줄에 하나)", style="Section.TLabel").grid(
+            row=0, column=1, sticky="w",
+        )
+
+        id_wrap = ttk.Frame(panes, style="CardBorder.TFrame")
+        id_wrap.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        id_inner = ttk.Frame(id_wrap, style="Card.TFrame", padding=4)
+        id_inner.pack(fill="both", expand=True, padx=1, pady=1)
+        id_inner.rowconfigure(0, weight=1)
+        id_inner.columnconfigure(0, weight=1)
+        id_txt = tk.Text(
+            id_inner, font=("Consolas", 10), relief="flat", wrap="none",
+            highlightthickness=0,
+        )
+        id_txt.grid(row=0, column=0, sticky="nsew")
+        id_sb = ttk.Scrollbar(id_inner, orient="vertical", command=id_txt.yview)
+        id_sb.grid(row=0, column=1, sticky="ns")
+        id_txt.configure(yscrollcommand=id_sb.set)
+
+        pw_wrap = ttk.Frame(panes, style="CardBorder.TFrame")
+        pw_wrap.grid(row=1, column=1, sticky="nsew")
+        pw_inner = ttk.Frame(pw_wrap, style="Card.TFrame", padding=4)
+        pw_inner.pack(fill="both", expand=True, padx=1, pady=1)
+        pw_inner.rowconfigure(0, weight=1)
+        pw_inner.columnconfigure(0, weight=1)
+        pw_txt = tk.Text(
+            pw_inner, font=("Consolas", 10), relief="flat", wrap="none",
+            highlightthickness=0,
+        )
+        pw_txt.grid(row=0, column=0, sticky="nsew")
+        pw_sb = ttk.Scrollbar(pw_inner, orient="vertical", command=pw_txt.yview)
+        pw_sb.grid(row=0, column=1, sticky="ns")
+        pw_txt.configure(yscrollcommand=pw_sb.set)
+
+        ttk.Label(
+            wrap,
+            text="예: 왼쪽 3줄 · 오른쪽 3줄 → 계정 3개. 줄 수가 다르면 짧은 쪽에 맞춰 등록하고 나머지는 건너뜁니다.",
+            style="Hint.TLabel",
+        ).pack(side="top", anchor="w", pady=(8, 0))
+
+        def _lines(widget: tk.Text) -> list[str]:
+            raw = widget.get("1.0", "end")
+            return [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+        def do_register() -> None:
+            ids = _lines(id_txt)
+            pws = pw_txt.get("1.0", "end").splitlines()
+            # 비밀번호는 공백만 있는 줄도 자리 맞춤용으로 유지하되, 끝 빈 줄은 제거
+            while pws and not pws[-1].strip():
+                pws.pop()
+            pws = [ln.rstrip("\r") for ln in pws]
+            if not ids:
+                messagebox.showwarning("다중등록", "아이디를 한 줄 이상 입력해 주세요.", parent=win)
+                return
+            if not any(p.strip() for p in pws):
+                messagebox.showwarning("다중등록", "비밀번호를 한 줄 이상 입력해 주세요.", parent=win)
+                return
+            pair_n = min(len(ids), len(pws))
+            if len(ids) != len(pws):
+                if not messagebox.askyesno(
+                    "줄 수 불일치",
+                    f"아이디 {len(ids)}줄 · 비밀번호 {len(pws)}줄입니다.\n"
+                    f"앞에서부터 {pair_n}쌍만 등록할까요?",
+                    parent=win,
+                ):
+                    return
+            added = 0
+            dup = 0
+            bad = 0
+            empty = 0
+            for index in range(pair_n):
+                status, detail = self._register_naver_account(ids[index], pws[index])
+                if status == "ok":
+                    added += 1
+                    self._append(f"네이버 계정 등록: {detail}", "info")
+                elif status == "dup":
+                    dup += 1
+                elif status == "empty":
+                    empty += 1
+                else:
+                    bad += 1
+            self._refresh_naver_tree()
+            self._save_settings()
+            parts = [f"{added}개 등록"]
+            if dup:
+                parts.append(f"중복 {dup}개")
+            if empty:
+                parts.append(f"빈칸 {empty}개")
+            if bad:
+                parts.append(f"형식오류 {bad}개")
+            if len(ids) != len(pws):
+                parts.append(f"미매칭 건너뜀 {abs(len(ids) - len(pws))}줄")
+            messagebox.showinfo("다중등록", ", ".join(parts) + " 완료.", parent=win)
+            win.destroy()
+
+        register_btn.configure(command=do_register)
+        id_txt.focus_set()
+
+    def _delete_naver_accounts(self) -> None:
+        if not hasattr(self, "nv_tree"):
+            return
+        sel = list(self.nv_tree.selection())
+        if not sel:
+            messagebox.showinfo("네이버 계정", "삭제할 계정을 선택해 주세요.", parent=self)
+            return
+        indexes = sorted({int(i) for i in sel}, reverse=True)
+        for idx in indexes:
+            if 0 <= idx < len(self.naver_accounts):
+                self.naver_accounts.pop(idx)
+        self._refresh_naver_tree()
+        self._save_settings()
+
+    def _reset_naver_used(self) -> None:
+        if not self.naver_accounts:
+            return
+        if not messagebox.askyesno(
+            "사용완료 초기화",
+            "모든 네이버 계정의「사용완료」표시를 지울까요?",
+            parent=self,
+        ):
+            return
+        for acc in self.naver_accounts:
+            acc["used"] = ""
+            acc["used_at"] = ""
+        self._refresh_naver_tree()
+        self._save_settings()
+
+    def _unused_naver_accounts(self) -> list[dict[str, str]]:
+        return [
+            acc for acc in self.naver_accounts
+            if str(acc.get("used", "")).strip().lower() not in {"1", "true", "yes"}
+            and str(acc.get("naver_id", "")).strip()
+            and str(acc.get("naver_pw", "")).strip()
+        ]
+
+    def _mark_naver_account_used(self, email: str) -> None:
+        target = (email or "").strip().lower()
+        if not target:
+            return
+        changed = False
+        for acc in self.naver_accounts:
+            if str(acc.get("email", "")).strip().lower() == target:
+                acc["used"] = "1"
+                acc["used_at"] = datetime.now().isoformat(timespec="seconds")
+                changed = True
+                break
+            nid = str(acc.get("naver_id", "")).strip().lower()
+            if nid and target in {nid, f"{nid}@naver.com"}:
+                acc["used"] = "1"
+                acc["used_at"] = datetime.now().isoformat(timespec="seconds")
+                changed = True
+                break
+        if changed:
+            self._refresh_naver_tree()
+            self._save_settings()
 
     def _build_inputs(self, parent: ttk.Frame) -> None:
         # 이미지 · 사이트 URL (접기/펴기)
@@ -2681,6 +3106,9 @@ class VelogApp(tk.Tk):
             if hasattr(self, "gm_progress"):
                 self.gm_progress.configure(value=0, maximum=100)
                 self.gm_progress_text.set("")
+            if hasattr(self, "nv_progress"):
+                self.nv_progress.configure(value=0, maximum=100)
+                self.nv_progress_text.set("")
             return
         self.progress.configure(maximum=total, value=done)
         self.progress_text.set(f"{done} / {total} 진행")
@@ -2690,6 +3118,9 @@ class VelogApp(tk.Tk):
         if hasattr(self, "gm_progress"):
             self.gm_progress.configure(maximum=total, value=done)
             self.gm_progress_text.set(f"{done} / {total} 진행")
+        if hasattr(self, "nv_progress"):
+            self.nv_progress.configure(maximum=total, value=done)
+            self.nv_progress_text.set(f"{done} / {total} 진행")
 
     # -- 실행 / 중단 ------------------------------------------------------
     def _start(self) -> None:
@@ -2722,7 +3153,9 @@ class VelogApp(tk.Tk):
             a for a in tab["accounts"]
             if str(a.get("manuscript_path", "")).strip()
             and self._is_eligible_for_assign(a)
-            and str(a.get("mail_provider", "")).strip().lower() not in {"adguard", "guerrilla"}
+            and str(a.get("mail_provider", "")).strip().lower() not in {
+                "adguard", "guerrilla", "naver",
+            }
         ]
         if not pending:
             if folder and not self._list_available_manuscripts(folder):
@@ -2951,6 +3384,103 @@ class VelogApp(tk.Tk):
         self._worker = threading.Thread(target=self._run, args=(jobs,), daemon=True)
         self._worker.start()
 
+    def _start_naver(self) -> None:
+        if self._cleaning or self._poster is not None or self._tm_worker is not None:
+            messagebox.showinfo("출간", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
+            return
+        unused = self._unused_naver_accounts()
+        if not unused:
+            messagebox.showwarning(
+                "네이버 계정",
+                "미사용 네이버 계정이 없습니다.\n"
+                "아이디·비밀번호를 등록하거나「사용완료 초기화」를 해 주세요.",
+                parent=self,
+            )
+            return
+        folder = self.manuscript_folder.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning(
+                "원고 폴더",
+                "「벨로그 포스팅」 탭에서 원고 폴더를 먼저 지정해 주세요.",
+                parent=self,
+            )
+            return
+        files = self._list_available_manuscripts(folder)
+        if not files:
+            messagebox.showinfo(
+                "원고 없음",
+                "출간할 원고가 없습니다.\n"
+                "원고 폴더에 파일을 넣거나, 이미 배정된 원고는 제외됩니다.",
+                parent=self,
+            )
+            return
+        loop = bool(self.nv_loop_until_stop.get())
+        try:
+            count = int(self.nv_count.get())
+        except (tk.TclError, ValueError):
+            count = 1
+        pair_n = min(len(files), len(unused))
+        if not loop:
+            pair_n = min(pair_n, max(1, min(count, 100)))
+        files = files[:pair_n]
+        unused = unused[:pair_n]
+        image_folder = self.image_folder.get().strip()
+        try:
+            if image_folder:
+                self._check_image_folder(image_folder)
+            for path in files:
+                read_manuscript(str(path))
+        except PostingError as exc:
+            messagebox.showwarning("등록 정보 확인", str(exc), parent=self)
+            return
+
+        if not self.tabs:
+            self.tabs.append({"title": "기본", "accounts": []})
+            self._rebuild_tabs()
+        tab_index = self._ask_account_tab()
+        if tab_index is None:
+            return
+        self._active_tab = self.tabs[tab_index]
+        tab_title = self._active_tab["title"]
+
+        jobs = []
+        for path, naver in zip(files, unused):
+            email = str(naver.get("email") or "").strip() or naver_email_from_id(
+                str(naver.get("naver_id") or ""),
+            )
+            jobs.append({
+                "velog_id": email,
+                "inbox_url": NAVER_MAIL_INBOX,
+                "manuscript_path": str(path),
+                "mail_provider": "naver",
+                "naver_id": str(naver.get("naver_id") or "").strip(),
+                "naver_pw": str(naver.get("naver_pw") or ""),
+                "image_folder": image_folder,
+                "profile_names": self._parse_profile_names(),
+                "anchors": [dict(a) for a in self.anchors],
+                "homepages": list(self.homepages),
+            })
+        self._run_total = len(jobs)
+        self._run_done = 0
+        self._set_progress(0, self._run_total)
+        self._set_running(True)
+        self._switch_main_view("log")
+        self._append(
+            f"네이버 회원가입 출간 시작 — 「{tab_title}」 {len(jobs)}건 "
+            "(네이버 로그인 → 메일 인증 → 가입 → 작성 → 출간)",
+            "info",
+        )
+        self._poster = VelogPoster(
+            self._post_event,
+            self._on_result,
+            self._on_failed,
+            signed_up_emails=set(self.signed_up_emails),
+            on_signup=self._on_signup,
+            on_account=lambda email, path: self._on_provider_account(email, path, "naver"),
+        )
+        self._worker = threading.Thread(target=self._run, args=(jobs,), daemon=True)
+        self._worker.start()
+
     def _ensure_listed_account(
         self,
         velog_id: str,
@@ -2961,8 +3491,14 @@ class VelogApp(tk.Tk):
         tab = self._active_tab or self._current_tab()
         if tab is None or not (velog_id or "").strip():
             return
-        inbox = GUERRILLA_TEMPMAIL_URL if provider == "guerrilla" else ADGUARD_TEMPMAIL_URL
-        label = "Guerrilla" if provider == "guerrilla" else "AdGuard"
+        inbox = ADGUARD_TEMPMAIL_URL
+        label = "AdGuard"
+        if provider == "guerrilla":
+            inbox = GUERRILLA_TEMPMAIL_URL
+            label = "Guerrilla"
+        elif provider == "naver":
+            inbox = NAVER_MAIL_INBOX
+            label = "네이버"
         for acc in tab["accounts"]:
             if acc.get("velog_id") == velog_id:
                 if manuscript_path:
@@ -3112,6 +3648,8 @@ class VelogApp(tk.Tk):
                 self.ag_status.set("중단하는 중...")
             if hasattr(self, "gm_status"):
                 self.gm_status.set("중단하는 중...")
+            if hasattr(self, "nv_status"):
+                self.nv_status.set("중단하는 중...")
             self._append("중단을 요청했습니다.", "info")
             self._poster.stop()
             self.stop_btn.configure(state="disabled")
@@ -3119,6 +3657,8 @@ class VelogApp(tk.Tk):
                 self.ag_stop_btn.configure(state="disabled")
             if hasattr(self, "gm_stop_btn"):
                 self.gm_stop_btn.configure(state="disabled")
+            if hasattr(self, "nv_stop_btn"):
+                self.nv_stop_btn.configure(state="disabled")
 
     def _post_event(self, message: str, level: str) -> None:
         self._events.put((message, level))
@@ -3252,6 +3792,8 @@ class VelogApp(tk.Tk):
                 "sharklasers.com", "guerrillamail", "grr.la", "pokemail.net", "spam4.me",
             )):
                 provider = "guerrilla"
+            elif "@naver." in low:
+                provider = "naver"
             self._ensure_listed_account(velog_id, "", provider=provider)
             for acc in accounts:
                 if acc.get("velog_id") == velog_id:
@@ -3276,6 +3818,7 @@ class VelogApp(tk.Tk):
         self._relocate_manuscript(target, success=True)
         self._fill_tree(tab)
         self._update_summary()
+        self._mark_naver_account_used(velog_id)
         self._save_settings()
         self._append(f"{velog_id} 발행됨: {url}", "success")
 
@@ -3366,6 +3909,9 @@ class VelogApp(tk.Tk):
         if hasattr(self, "gm_start_btn"):
             self.gm_start_btn.configure(state="disabled" if running else "normal")
             self.gm_stop_btn.configure(state="normal" if running else "disabled")
+        if hasattr(self, "nv_start_btn"):
+            self.nv_start_btn.configure(state="disabled" if running else "normal")
+            self.nv_stop_btn.configure(state="normal" if running else "disabled")
         if hasattr(self, "tm_start_btn"):
             self.tm_start_btn.configure(state="disabled" if running else "normal")
         if hasattr(self, "clean_btn"):
@@ -3376,6 +3922,8 @@ class VelogApp(tk.Tk):
                 self.ag_status.set("출간 작업 진행 중...")
             if hasattr(self, "gm_status"):
                 self.gm_status.set("출간 작업 진행 중...")
+            if hasattr(self, "nv_status"):
+                self.nv_status.set("출간 작업 진행 중...")
         else:
             self.working_id.set("")
             done_text = "중단됨" if self.status.get().endswith("중단하는 중...") else "작업이 완료되었습니다."
@@ -3384,6 +3932,8 @@ class VelogApp(tk.Tk):
                 self.ag_status.set(done_text)
             if hasattr(self, "gm_status"):
                 self.gm_status.set(done_text)
+            if hasattr(self, "nv_status"):
+                self.nv_status.set(done_text)
 
     def _append(self, message: str, tag: str = "") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -3591,6 +4141,8 @@ class VelogApp(tk.Tk):
             self.ag_start_btn.configure(state="disabled" if running else "normal")
         if hasattr(self, "gm_start_btn"):
             self.gm_start_btn.configure(state="disabled" if running else "normal")
+        if hasattr(self, "nv_start_btn"):
+            self.nv_start_btn.configure(state="disabled" if running else "normal")
         if running:
             self.tm_status.set("임시 메일 생성 중...")
         else:
@@ -3813,6 +4365,7 @@ class VelogApp(tk.Tk):
 
     def _load_settings(self) -> None:
         names = list(DEFAULT_PROFILE_NAMES)
+        _migrate_legacy_settings()
         try:
             data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             self.image_folder.set(str(data.get("image_folder", "")))
@@ -3922,6 +4475,28 @@ class VelogApp(tk.Tk):
                         })
                     restored[day_key] = {"successes": successes, "cleaned_404": cleaned}
                 self.daily_history = restored
+            raw_naver = data.get("naver_accounts", [])
+            if isinstance(raw_naver, list):
+                restored_nv: list[dict[str, str]] = []
+                for row in raw_naver:
+                    if not isinstance(row, dict):
+                        continue
+                    nid = str(row.get("naver_id", "")).strip()
+                    npw = str(row.get("naver_pw", ""))
+                    if not nid or not npw:
+                        continue
+                    try:
+                        email = str(row.get("email", "")).strip() or naver_email_from_id(nid)
+                    except PostingError:
+                        continue
+                    restored_nv.append({
+                        "naver_id": nid.split("@", 1)[0] if "@" in nid else nid,
+                        "naver_pw": npw,
+                        "email": email,
+                        "used": str(row.get("used", "")),
+                        "used_at": str(row.get("used_at", "")),
+                    })
+                self.naver_accounts = restored_nv
         except (OSError, ValueError):
             pass
         if not self.tabs:
@@ -3933,6 +4508,7 @@ class VelogApp(tk.Tk):
         self._refresh_anchor_list()
         self._refresh_homepage_list()
         self._rebuild_tabs()
+        self._refresh_naver_tree()
         if hasattr(self, "tm_tree"):
             self._refresh_tm_tree()
         if hasattr(self, "tm_domain_list"):
@@ -3956,6 +4532,7 @@ class VelogApp(tk.Tk):
                         "generated_emails": self.generated_emails,
                         "signed_up_emails": sorted(self.signed_up_emails),
                         "daily_history": self.daily_history,
+                        "naver_accounts": self.naver_accounts,
                     },
                     ensure_ascii=False, indent=2,
                 ),

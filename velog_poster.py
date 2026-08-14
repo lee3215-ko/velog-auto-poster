@@ -76,7 +76,7 @@ def classify_failure(message: str) -> str:
         return "image"
     login_keys = (
         "로그인", "인증 메일", "인증 링크", "TempMail", "가입 인증",
-        "새 글 작성 버튼", "Cloudflare 인증", "AdGuard",
+        "새 글 작성 버튼", "Cloudflare 인증", "AdGuard", "네이버", "Guerrilla",
     )
     publish_keys = ("출간", "게시글")
     for key in login_keys:
@@ -157,6 +157,22 @@ def extract_velog_link(body: str) -> str:
 
 ADGUARD_TEMPMAIL_URL = "https://tempmail.adguard.com/?_locale=ko"
 GUERRILLA_TEMPMAIL_URL = "https://www.guerrillamail.com/"
+NAVER_LOGIN_URL = (
+    "https://nid.naver.com/nidlogin.login?mode=form&url=https://mail.naver.com/v2/folders/0"
+)
+NAVER_MAIL_INBOX = "https://mail.naver.com/v2/folders/0"
+NAVER_MAIL_HOME = "https://mail.naver.com"
+
+
+def naver_email_from_id(naver_id: str) -> str:
+    raw = (naver_id or "").strip()
+    if not raw:
+        raise PostingError("네이버 아이디를 입력해 주세요.")
+    if "@" in raw:
+        return raw.lower()
+    return f"{raw}@naver.com"
+
+
 GUERRILLA_DOMAINS = (
     "sharklasers.com",
     "guerrillamail.info",
@@ -556,6 +572,9 @@ class VelogPoster:
         if provider == "guerrilla":
             self._run_one_guerrilla(pw, chrome, account)
             return
+        if provider == "naver":
+            self._run_one_naver(pw, chrome, account)
+            return
         velog_id = account["velog_id"].strip()
         inbox_url = normalize_url(account["inbox_url"])
         title, body, tags = read_manuscript(account["manuscript_path"])
@@ -807,6 +826,86 @@ class VelogPoster:
         self._ensure_connected(pw)
         mail = self._guerrilla_mail_page()
         link = self._wait_guerrilla_velog_mail(mail)
+        velog = self._page_by_host("velog.io")
+        self._open_link(pw, velog, link)
+
+        self._ensure_connected(pw)
+        velog = self._page_by_host("velog.io")
+        is_signup, profile_name = self._handle_signup_if_needed(pw, velog, account)
+        self._ensure_connected(pw)
+        self._restore_user_focus()
+        velog = self._page_by_host("velog.io")
+        if not is_signup:
+            self.log("로그인 중.. (기존 계정)", "info")
+        elif profile_name:
+            self._set_blog_title(velog, profile_name)
+
+        image_link = random.choice(homepages) if (image_folder and homepages) else ""
+        target = self._write_post(
+            self._page_by_host("velog.io"),
+            title,
+            body,
+            tags=tags,
+            image_folder=image_folder,
+            image_link=image_link,
+        )
+        self._restore_user_focus()
+
+        url = self._publish(pw, target)
+        if not url or not self._is_post_url(url):
+            raise PostingError("출간에 실패했습니다. 게시글 주소를 확인하지 못했습니다.")
+        if self.on_result is not None:
+            try:
+                self.on_result(email, url)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _run_one_naver(self, pw, chrome: Path, account: dict[str, str]) -> None:
+        """네이버 메일 로그인 → 벨로그 가입/로그인 → 작성 → 출간."""
+        title, body, tags = read_manuscript(account["manuscript_path"])
+        image_folder = (account.get("image_folder") or "").strip()
+        homepages = [str(u).strip() for u in (account.get("homepages") or []) if str(u).strip()]
+        anchors = account.get("anchors") or []
+        if anchors:
+            a = random.choice(anchors)
+            anchor_text = (a.get("anchor") or "").strip()
+            anchor_url = (a.get("url") or "").strip()
+            if anchor_text and anchor_url:
+                body = f"{body.rstrip()}\n\n[{anchor_text}]({anchor_url})"
+
+        naver_id = str(account.get("naver_id") or "").strip()
+        naver_pw = str(account.get("naver_pw") or "")
+        email = naver_email_from_id(str(account.get("velog_id") or naver_id))
+        if not naver_id or not naver_pw:
+            raise PostingError("네이버 아이디·비밀번호가 필요합니다.")
+
+        account["velog_id"] = email
+        account["inbox_url"] = NAVER_MAIL_INBOX
+        self._emit(email, "working")
+        if self.on_account is not None:
+            try:
+                self.on_account(email, str(account.get("manuscript_path") or ""))
+            except Exception:  # noqa: BLE001
+                pass
+
+        self._user_foreground_hwnd = self._capture_foreground_hwnd()
+        self._launch_incognito(pw, chrome, start_url=NAVER_LOGIN_URL)
+        self._restore_user_focus()
+
+        mail = self._first_page()
+        self._inject_stealth(mail)
+        self._naver_login(pw, mail, naver_id, naver_pw)
+        self._naver_open_inbox(pw, mail)
+
+        self._ensure_connected(pw)
+        assert self._context is not None
+        velog = self._context.new_page()
+        self._inject_stealth(velog)
+        self._request_login(pw, velog, email)
+
+        self._ensure_connected(pw)
+        mail = self._naver_mail_page()
+        link = self._wait_naver_velog_mail(mail)
         velog = self._page_by_host("velog.io")
         self._open_link(pw, velog, link)
 
@@ -1812,6 +1911,264 @@ class VelogPoster:
                 text = loc.first.inner_text(timeout=2_000) or ""
                 if text.strip():
                     chunks.append(text)
+            except Error:
+                continue
+        for chunk in chunks:
+            try:
+                return extract_velog_link(chunk)
+            except PostingError:
+                continue
+        raise PostingError("인증 메일에서 벨로그 인증 링크를 찾지 못했습니다.")
+
+    # -- 네이버 메일 ----------------------------------------------------
+    def _naver_mail_page(self) -> Page:
+        for host in ("mail.naver.com", "nid.naver.com", "naver.com"):
+            try:
+                return self._page_by_host(host)
+            except PostingError:
+                continue
+        return self._first_page()
+
+    def _naver_fill_credentials(self, page: Page, naver_id: str, naver_pw: str) -> None:
+        def fill(selectors: list[str], value: str) -> bool:
+            for sel in selectors:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() == 0 or not loc.first.is_visible():
+                        continue
+                    loc.first.click(timeout=5_000)
+                    self._sleep(0.15)
+                    page.keyboard.press("Control+A")
+                    page.keyboard.press("Backspace")
+                    self._type_like_human(page, value)
+                    return True
+                except Error:
+                    continue
+            return bool(page.evaluate(
+                """(sels, val) => {
+                    for (const s of sels) {
+                      const el = document.querySelector(s);
+                      if (!el) continue;
+                      el.focus();
+                      const setter = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value')?.set;
+                      if (setter) setter.call(el, val);
+                      else el.value = val;
+                      el.dispatchEvent(new Event('input', { bubbles: true }));
+                      el.dispatchEvent(new Event('change', { bubbles: true }));
+                      return true;
+                    }
+                    return false;
+                }""",
+                selectors,
+                value,
+            ))
+
+        if not fill(["#id", 'input[name="id"]', 'input[autocomplete="username"]'], naver_id):
+            raise PostingError("네이버 아이디 입력칸을 찾지 못했습니다.")
+        self._sleep(_jitter(0.35, 0.2))
+        if not fill(["#pw", 'input[name="pw"]', 'input[type="password"]'], naver_pw):
+            raise PostingError("네이버 비밀번호 입력칸을 찾지 못했습니다.")
+
+    def _naver_turn_off_ip_security(self, page: Page) -> None:
+        try:
+            page.evaluate(
+                """() => {
+                    const candidates = [
+                      document.querySelector('#switch'),
+                      document.querySelector('.ip_check .switch_on'),
+                      document.querySelector('.ip_check span[role="checkbox"]'),
+                      ...Array.from(document.querySelectorAll(
+                        '.ip_check .switch, .ip_check [role="checkbox"], .switch_on'
+                      )),
+                    ].filter(Boolean);
+                    for (const el of candidates) {
+                      const wrap = el.closest?.('.ip_check') || el.parentElement;
+                      const text = ((wrap?.innerText || el.innerText || '') + '').replace(/\\s+/g, '');
+                      const on = el.classList?.contains('switch_on')
+                        || el.getAttribute?.('aria-checked') === 'true'
+                        || /IP보안.*ON|보안.*ON/i.test(text);
+                      if (on) { el.click(); return true; }
+                    }
+                    return false;
+                }"""
+            )
+        except Error:
+            pass
+
+    def _naver_still_on_login(self, page: Page) -> bool:
+        try:
+            return bool(page.evaluate(
+                """() => {
+                    const id = document.querySelector('input#id, input[name="id"]');
+                    const pw = document.querySelector(
+                      'input#pw, input[name="pw"], input[type="password"]#pw'
+                    );
+                    const idVis = !!(id && id.offsetParent !== null && (id.type || 'text') !== 'hidden');
+                    const pwVis = !!(pw && pw.offsetParent !== null);
+                    return idVis && pwVis;
+                }"""
+            ))
+        except Error:
+            return "nid.naver.com" in (page.url or "").lower()
+
+    def _naver_login(self, pw, page: Page, naver_id: str, naver_pw: str) -> None:
+        self.log(f"네이버 로그인 중... ({naver_id})", "info")
+        if "nid.naver.com" not in (page.url or "").lower():
+            self._goto(page, NAVER_LOGIN_URL)
+        self._wait("네이버 로그인 화면 준비 중...", _jitter(2.0, 0.8))
+        self._naver_turn_off_ip_security(page)
+        self._sleep(0.4)
+        self._naver_fill_credentials(page, naver_id, naver_pw)
+        self._sleep(_jitter(0.4, 0.25))
+        try:
+            page.keyboard.press("Enter")
+        except Error:
+            btn = page.locator('#log\\.login, button[type="submit"], .btn_login')
+            if btn.count() > 0:
+                btn.first.click(timeout=5_000)
+
+        self.log("캡챠·추가 인증이 뜨면 브라우저에서 직접 완료해 주세요.", "info")
+        for i in range(90):  # 최대 약 3분
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            self._sleep(2)
+            try:
+                page = self._naver_mail_page()
+            except PostingError:
+                page = self._first_page()
+            if not self._naver_still_on_login(page):
+                self.log("네이버 로그인 완료", "success")
+                self._sleep(_jitter(1.2, 0.5))
+                return
+            if i in {10, 20, 40}:
+                self.log("아직 로그인 화면입니다. 캡챠/2단계 인증을 확인해 주세요.", "info")
+        raise PostingError("네이버 로그인 시간 초과 (캡챠·2단계 인증 확인 필요)")
+
+    def _naver_open_inbox(self, pw, page: Page) -> None:
+        self.log("네이버 메일함으로 이동하는 중...", "info")
+        self._ensure_connected(pw)
+        page = self._naver_mail_page()
+        try:
+            self._goto(page, NAVER_MAIL_INBOX)
+        except Error:
+            self._goto(page, NAVER_MAIL_HOME)
+        self._wait("메일함 로딩 중...", _jitter(3.5, 1.0))
+        page = self._naver_mail_page()
+        if self._naver_still_on_login(page):
+            raise PostingError("네이버 메일함 진입에 실패했습니다. 로그인 상태를 확인해 주세요.")
+
+    def _wait_naver_velog_mail(self, page: Page) -> str:
+        self.log("네이버 메일함에서 벨로그 인증 메일을 기다리는 중...", "info")
+        last_refresh = 0
+        for round_i in range(36):
+            if self._stop.wait(5):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            try:
+                page = self._naver_mail_page()
+                hit = page.evaluate(
+                    """() => {
+                        const keys = ['velog', 'verify@velog', '벨로그'];
+                        const rowSels = [
+                          '[class*="mail_list"] li',
+                          '[class*="MailList"] [class*="item"]',
+                          '[class*="mail_item"]',
+                          '[role="row"]',
+                          'ul.mail_list li',
+                          'li[class*="mail"]',
+                          'a.mail_title_link',
+                          '.mail_title',
+                        ];
+                        const seen = new Set();
+                        const candidates = [];
+                        for (const sel of rowSels) {
+                          for (const el of document.querySelectorAll(sel)) {
+                            if (seen.has(el)) continue;
+                            seen.add(el);
+                            const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                            const low = t.toLowerCase();
+                            if (!keys.some(k => low.includes(k.toLowerCase()))) continue;
+                            if (t.length > 240) continue;
+                            const r = el.getBoundingClientRect();
+                            if (r.width < 40 || r.height < 12 || r.height > 140 || r.top < 0) continue;
+                            candidates.push({
+                              x: r.left + Math.min(r.width * 0.45, 220),
+                              y: r.top + r.height / 2,
+                              text: t.slice(0, 140),
+                              area: r.width * r.height,
+                            });
+                          }
+                        }
+                        if (!candidates.length) return null;
+                        candidates.sort((a, b) => a.area - b.area);
+                        return candidates[0];
+                    }"""
+                )
+                if hit and isinstance(hit, dict):
+                    self.log(f"인증 메일 확인: {hit.get('text', '')[:80]}", "info")
+                    page.mouse.click(float(hit["x"]), float(hit["y"]))
+                    self._sleep(_jitter(2.0, 0.6))
+                    return self._naver_extract_link(page)
+            except Error:
+                pass
+            if round_i - last_refresh >= 2:
+                last_refresh = round_i
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=20_000)
+                    self._sleep(2.0)
+                except Error:
+                    try:
+                        self._goto(page, NAVER_MAIL_INBOX)
+                    except Error:
+                        pass
+        raise PostingError("3분 안에 네이버 메일함에 벨로그 인증 메일이 도착하지 않았습니다.")
+
+    def _naver_extract_link(self, page: Page) -> str:
+        chunks: list[str] = []
+        try:
+            html_body = page.evaluate(
+                """() => {
+                    const parts = [];
+                    const push = (t) => { if (t && String(t).trim()) parts.push(String(t)); };
+                    push(document.body?.innerHTML || '');
+                    push(document.body?.innerText || '');
+                    for (const td of document.querySelectorAll('td, .mail_view, [class*="mail_view"], [class*="ReadMail"], [class*="mail_read"]')) {
+                      push(td.innerHTML || '');
+                      push(td.innerText || '');
+                    }
+                    for (const frame of Array.from(document.querySelectorAll('iframe'))) {
+                      try {
+                        const doc = frame.contentDocument;
+                        if (!doc) continue;
+                        push(doc.body?.innerHTML || '');
+                        push(doc.body?.innerText || '');
+                      } catch (e) {}
+                    }
+                    return parts.join('\\n');
+                }"""
+            ) or ""
+            if html_body.strip():
+                chunks.append(html_body)
+        except Error:
+            pass
+        for sel in ("body", ".mail_view", "[class*='mail_view']", "[class*='ReadMail']"):
+            try:
+                loc = page.locator(sel)
+                if loc.count() == 0:
+                    continue
+                html_body = loc.first.inner_html(timeout=2_000) or ""
+                if html_body.strip():
+                    chunks.append(html_body)
+                text = loc.first.inner_text(timeout=2_000) or ""
+                if text.strip():
+                    chunks.append(text)
+            except Error:
+                continue
+        for frame in page.frames:
+            try:
+                content = frame.content()
+                if content and content.strip():
+                    chunks.append(content)
             except Error:
                 continue
         for chunk in chunks:
