@@ -603,8 +603,7 @@ class VelogPoster:
         self._request_login(pw, page, velog_id)
 
         link = self._wait_for_verification(page, inbox_url, prev_uuid)
-        self._open_link(pw, page, link)
-        page = self._first_page()  # cloudflare 우회로 재연결됐을 수 있음
+        page = self._relaunch_clean_for_signup(pw, chrome, link)
         is_signup, profile_name = self._handle_signup_if_needed(pw, page, account)
         # 가입 단계에서 CDP 를 끊었다가 다시 쓰므로, 이후 작업 전에 반드시 재연결한다.
         self._ensure_connected(pw)
@@ -750,15 +749,10 @@ class VelogPoster:
         self._ensure_connected(pw)
         if inbox_link:
             link = inbox_link
-            velog = self._page_by_host("velog.io")
         else:
             mail = self._adguard_mail_page()
             link = self._wait_adguard_velog_mail(mail)
-            velog = self._page_by_host("velog.io")
-        self._open_link(pw, velog, link)
-
-        self._ensure_connected(pw)
-        velog = self._page_by_host("velog.io")
+        velog = self._relaunch_clean_for_signup(pw, chrome, link)
         is_signup, profile_name = self._handle_signup_if_needed(pw, velog, account)
         self._ensure_connected(pw)
         self._restore_user_focus()
@@ -826,11 +820,7 @@ class VelogPoster:
         self._ensure_connected(pw)
         mail = self._guerrilla_mail_page()
         link = self._wait_guerrilla_velog_mail(mail)
-        velog = self._page_by_host("velog.io")
-        self._open_link(pw, velog, link)
-
-        self._ensure_connected(pw)
-        velog = self._page_by_host("velog.io")
+        velog = self._relaunch_clean_for_signup(pw, chrome, link)
         is_signup, profile_name = self._handle_signup_if_needed(pw, velog, account)
         self._ensure_connected(pw)
         self._restore_user_focus()
@@ -906,11 +896,7 @@ class VelogPoster:
         self._ensure_connected(pw)
         mail = self._naver_mail_page()
         link = self._wait_naver_velog_mail(mail)
-        velog = self._page_by_host("velog.io")
-        self._open_link(pw, velog, link)
-
-        self._ensure_connected(pw)
-        velog = self._page_by_host("velog.io")
+        velog = self._relaunch_clean_for_signup(pw, chrome, link)
         is_signup, profile_name = self._handle_signup_if_needed(pw, velog, account)
         self._ensure_connected(pw)
         self._restore_user_focus()
@@ -970,6 +956,15 @@ class VelogPoster:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
+            "--disable-sync",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-client-side-phishing-detection",
+            "--disable-features=Translate,MediaRouter,OptimizationHints,ChromeWhatsNewUI",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--disk-cache-size=1",
+            "--media-cache-size=1",
             start_url or "about:blank",
         ]
         if incognito:
@@ -1004,6 +999,91 @@ class VelogPoster:
         self._context = self._browser.contexts[0]
         # 이후 열리는 모든 페이지에도 stealth 적용
         self._context.add_init_script(STEALTH_SCRIPT)
+        self._purge_browser_data()
+
+    def _purge_browser_data(self) -> None:
+        """쿠키·캐시·사이트 저장소를 비운다 (이전 로그인 흔적 제거)."""
+        if self._context is None:
+            return
+        try:
+            self._context.clear_cookies()
+        except Error:
+            pass
+        page = None
+        try:
+            pages = [p for p in self._context.pages if not p.is_closed()]
+            page = pages[0] if pages else self._context.new_page()
+            session = self._context.new_cdp_session(page)
+            for method, params in (
+                ("Network.clearBrowserCookies", None),
+                ("Network.clearBrowserCache", None),
+                ("Storage.clearDataForOrigin", {
+                    "origin": "https://velog.io",
+                    "storageTypes": "all",
+                }),
+                ("Storage.clearDataForOrigin", {
+                    "origin": "https://www.velog.io",
+                    "storageTypes": "all",
+                }),
+            ):
+                try:
+                    if params is None:
+                        session.send(method)
+                    else:
+                        session.send(method, params)
+                except Error:
+                    continue
+            try:
+                session.detach()
+            except Error:
+                pass
+        except Error:
+            pass
+        if page is not None:
+            try:
+                page.evaluate(
+                    """async () => {
+                        try { localStorage.clear(); } catch (e) {}
+                        try { sessionStorage.clear(); } catch (e) {}
+                        try {
+                          if (window.indexedDB && indexedDB.databases) {
+                            const dbs = await indexedDB.databases();
+                            for (const db of dbs || []) {
+                              if (db && db.name) indexedDB.deleteDatabase(db.name);
+                            }
+                          }
+                        } catch (e) {}
+                        try {
+                          if (window.caches && caches.keys) {
+                            const keys = await caches.keys();
+                            await Promise.all(keys.map((k) => caches.delete(k)));
+                          }
+                        } catch (e) {}
+                    }"""
+                )
+            except Error:
+                pass
+
+    def _relaunch_clean_for_signup(self, pw, chrome: Path, link: str) -> Page:
+        """메일 인증 링크를 확보한 뒤, 브라우저를 완전 종료·삭제하고 깨끗한 창에서 가입을 연다."""
+        self.log(
+            "벨로그 가입 전 브라우저를 완전 초기화합니다 (창 종료·캐시·쿠키·임시 프로필 삭제)...",
+            "info",
+        )
+        self._user_foreground_hwnd = self._capture_foreground_hwnd()
+        self._teardown_account()
+        self._sleep(_jitter(1.8, 0.7))
+        self._launch_incognito(pw, chrome, start_url="about:blank")
+        self._restore_user_focus()
+        self._purge_browser_data()
+        page = self._first_page()
+        self._inject_stealth(page)
+        self._open_link(pw, page, link)
+        self._ensure_connected(pw)
+        try:
+            return self._page_by_host("velog.io")
+        except PostingError:
+            return self._first_page()
 
     def _first_page(self) -> Page:
         assert self._context is not None
@@ -3201,9 +3281,27 @@ class VelogPoster:
                     process.kill()
                 except OSError:
                     pass
+            # Windows: 디버그 Chrome 자식 프로세스까지 정리
+            if sys.platform == "win32":
+                try:
+                    pid = int(getattr(process, "pid", 0) or 0)
+                    if pid > 0:
+                        subprocess.run(
+                            ["taskkill", "/PID", str(pid), "/T", "/F"],
+                            capture_output=True,
+                            timeout=8,
+                            check=False,
+                        )
+                except (OSError, subprocess.TimeoutExpired, ValueError):
+                    pass
         if profile is not None:
-            for _ in range(10):
+            for _ in range(15):
                 shutil.rmtree(profile, ignore_errors=True)
                 if not profile.exists():
                     break
-                time.sleep(0.3)
+                time.sleep(0.35)
+            # 남은 캐시 폴더가 있으면 한 번 더 강제 삭제
+            if profile.exists():
+                for child in ("Cache", "Code Cache", "GPUCache", "Service Worker", "Cookies", "Local Storage", "Session Storage", "Network"):
+                    shutil.rmtree(profile / child, ignore_errors=True)
+                shutil.rmtree(profile, ignore_errors=True)
