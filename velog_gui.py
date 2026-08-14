@@ -31,6 +31,7 @@ from update_ui import schedule_update_check
 from velog_poster import (
     ADGUARD_TEMPMAIL_URL,
     DEFAULT_PROFILE_NAMES,
+    GUERRILLA_TEMPMAIL_URL,
     PostingError,
     VelogPoster,
     normalize_url,
@@ -293,6 +294,13 @@ class VelogApp(tk.Tk):
         )
         self.ag_progress_text = tk.StringVar(value="")
 
+        self.gm_count = tk.IntVar(value=1)
+        self.gm_loop_until_stop = tk.BooleanVar(value=False)
+        self.gm_status = tk.StringVar(
+            value="대기 중 — 원고 폴더를 지정한 뒤 [출간 시작]을 누르세요.",
+        )
+        self.gm_progress_text = tk.StringVar(value="")
+
         self._build_style()
         self._build_ui()
         self._bind_shortcuts()
@@ -396,6 +404,7 @@ class VelogApp(tk.Tk):
             ("posting", "벨로그 포스팅"),
             ("tempmail", "임시 메일 생성"),
             ("adguard", "AdGuard 출간"),
+            ("guerrilla", "Guerrilla 출간"),
             ("log", "실행 로그"),
         )
         for index, (key, label) in enumerate(items):
@@ -507,15 +516,18 @@ class VelogApp(tk.Tk):
         posting_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         tempmail_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         adguard_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
+        guerrilla_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         log_frame = ttk.Frame(content, style="Bg.TFrame", padding=(12, 8))
         self._main_views["posting"] = posting_frame
         self._main_views["tempmail"] = tempmail_frame
         self._main_views["adguard"] = adguard_frame
+        self._main_views["guerrilla"] = guerrilla_frame
         self._main_views["log"] = log_frame
 
         self._build_posting_tab(posting_frame)
         self._build_tempmail_tab(tempmail_frame)
         self._build_adguard_tab(adguard_frame)
+        self._build_guerrilla_tab(guerrilla_frame)
         self._build_log_tab(log_frame)
         self._switch_main_view("posting")
 
@@ -812,6 +824,80 @@ class VelogApp(tk.Tk):
                 "3. 받은편지함의 벨로그 인증 메일을 열어 가입\n"
                 "4. 이미지 첨부 → 원고 작성 → 출간\n"
                 "5. 성공한 계정은 선택한 탭 목록에 발행 완료로 추가"
+            ),
+            style="Hint.TLabel",
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+
+    def _build_guerrilla_tab(self, root: ttk.Frame) -> None:
+        header = ttk.Frame(root, style="Bg.TFrame")
+        header.pack(side="top", fill="x", pady=(0, 8))
+        ttk.Label(header, text="Guerrilla Mail 임시메일 출간", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="도메인을 무작위로 고른 뒤 임시메일로 벨로그 가입 → 원고 작성 → 출간까지 한 계정씩 진행합니다.",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        bottom = ttk.Frame(root, style="Bg.TFrame")
+        bottom.pack(side="bottom", fill="x", pady=(8, 0))
+        prog_row = ttk.Frame(bottom, style="Bg.TFrame")
+        prog_row.pack(fill="x", pady=(0, 6))
+        self.gm_progress = ttk.Progressbar(
+            prog_row, mode="determinate", style="green.Horizontal.TProgressbar",
+        )
+        self.gm_progress.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ttk.Label(prog_row, textvariable=self.gm_progress_text, style="Sub.TLabel").pack(side="right")
+
+        action_row = ttk.Frame(bottom, style="Bg.TFrame")
+        action_row.pack(fill="x")
+        action_row.columnconfigure(0, weight=3)
+        action_row.columnconfigure(1, weight=1)
+        self.gm_start_btn = ttk.Button(
+            action_row, text="▶  출간 시작", style="Primary.TButton", command=self._start_guerrilla,
+        )
+        self.gm_start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.gm_stop_btn = ttk.Button(
+            action_row, text="■  중단", style="Danger.TButton",
+            command=self._stop, state="disabled",
+        )
+        self.gm_stop_btn.grid(row=0, column=1, sticky="ew")
+        ttk.Label(bottom, textvariable=self.gm_status, style="Status.TLabel").pack(
+            fill="x", pady=(8, 0),
+        )
+
+        body = self._section(
+            root,
+            "출간 설정",
+            "원고 폴더·이미지·앵커·사이트 URL은 「벨로그 포스팅」 탭 설정을 그대로 사용합니다.",
+        )
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="출간 개수", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Spinbox(body, from_=1, to=100, textvariable=self.gm_count, width=8, font=(FONT, 10)).grid(
+            row=0, column=1, sticky="w",
+        )
+        ttk.Label(
+            body, text="원고 폴더에서 아직 배정되지 않은 파일 수만큼 진행합니다.",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            body, text="중단할 때까지 남은 원고를 모두 출간 (개수 무시)",
+            variable=self.gm_loop_until_stop,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        info = ttk.Frame(root, style="CardBorder.TFrame")
+        info.pack(fill="both", expand=True, pady=(0, 0))
+        card = ttk.Frame(info, style="Card.TFrame", padding=(16, 14))
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+        ttk.Label(card, text="진행 순서", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(
+            card,
+            text=(
+                "1. 시크릿 Chrome으로 guerrillamail.com 접속\n"
+                "2. 도메인(sharklasers.com 등)을 무작위로 선택\n"
+                "3. 표시된 임시메일로 벨로그 로그인 요청\n"
+                "4. 받은편지함의 벨로그 인증 메일을 열어 가입\n"
+                "5. 이미지 첨부 → 원고 작성 → 출간"
             ),
             style="Hint.TLabel",
             justify="left",
@@ -1917,6 +2003,9 @@ class VelogApp(tk.Tk):
                 str(row.get("velog_id", "")).strip().lower() == vid.lower()
                 and str(row.get("url", "")).strip() == link
             ):
+                # 이미 404로 표시된 기록은 다시 살리지 않는다
+                if row.get("dead"):
+                    return
                 row["tab"] = tab_title or row.get("tab", "")
                 row["published_at"] = at
                 row["inbox_url"] = inbox_url or row.get("inbox_url", "")
@@ -1929,7 +2018,51 @@ class VelogApp(tk.Tk):
             "published_at": at,
             "inbox_url": inbox_url,
             "manuscript": manuscript,
+            "dead": False,
         })
+
+    def _mark_history_success_dead(self, velog_id: str, url: str) -> int:
+        """일자별 성공 기록에서 해당 URL을 404(무효)로 표시한다."""
+        vid = (velog_id or "").strip().lower()
+        link = (url or "").strip()
+        if not vid and not link:
+            return 0
+        marked = 0
+        for bucket in self.daily_history.values():
+            for row in bucket.get("successes") or []:
+                row_url = str(row.get("url", "")).strip()
+                row_id = str(row.get("velog_id", "")).strip().lower()
+                if link:
+                    match = row_url == link
+                else:
+                    match = bool(vid) and row_id == vid
+                if match:
+                    if not row.get("dead"):
+                        marked += 1
+                    row["dead"] = True
+        return marked
+
+    def _reconcile_history_dead(self) -> None:
+        """404 정리 목록에 있는 URL은 성공 목록에서도 무효로 맞춘다."""
+        dead_urls: set[str] = set()
+        for bucket in self.daily_history.values():
+            for row in bucket.get("cleaned_404") or []:
+                url = str(row.get("url", "")).strip()
+                if url:
+                    dead_urls.add(url)
+        if not dead_urls:
+            return
+        for bucket in self.daily_history.values():
+            for row in bucket.get("successes") or []:
+                if str(row.get("url", "")).strip() in dead_urls:
+                    row["dead"] = True
+
+    @staticmethod
+    def _live_success_rows(bucket: dict) -> list[dict]:
+        return [
+            row for row in (bucket.get("successes") or [])
+            if isinstance(row, dict) and not row.get("dead")
+        ]
 
     def _record_cleaned_404_account(
         self,
@@ -1944,19 +2077,28 @@ class VelogApp(tk.Tk):
         if not vid:
             return
         now = datetime.now()
-        bucket = self._history_bucket(self._history_day_key(now))
-        # 정리 전에 성공 기록도 남긴다 (과거 성공분이 기록에 없을 수 있음)
-        if str(url or "").strip():
+        link = str(url or "").strip()
+        # 성공 기록에 없으면 남긴 뒤 404로 표시한다 (성공 목록에서는 숨김)
+        if link:
             self._record_success_account(
                 velog_id=vid,
-                url=url,
+                url=link,
                 tab_title=tab_title,
                 published_at=published_at,
                 inbox_url=inbox_url,
             )
+            self._mark_history_success_dead(vid, link)
+        bucket = self._history_bucket(self._history_day_key(now))
+        for row in bucket["cleaned_404"]:
+            if (
+                str(row.get("velog_id", "")).strip().lower() == vid.lower()
+                and str(row.get("url", "")).strip() == link
+            ):
+                row["cleaned_at"] = now.isoformat(timespec="seconds")
+                return
         bucket["cleaned_404"].append({
             "velog_id": vid,
-            "url": str(url or "").strip(),
+            "url": link,
             "tab": tab_title,
             "published_at": published_at,
             "inbox_url": inbox_url,
@@ -1982,6 +2124,7 @@ class VelogApp(tk.Tk):
                     inbox_url=str(acc.get("inbox_url", "")),
                     manuscript=manuscript,
                 )
+        self._reconcile_history_dead()
 
     def _show_daily_history(self) -> None:
         """일자별 성공 계정 · 404 정리 개수 기록을 보여 준다."""
@@ -1999,7 +2142,7 @@ class VelogApp(tk.Tk):
         win.title("일자별 기록")
         win.configure(bg=BG)
         win.transient(self)
-        _place_window(win, 1080, 620, self)
+        _place_window(win, 1080, 640, self)
 
         wrap = ttk.Frame(win, style="Bg.TFrame", padding=14)
         wrap.pack(fill="both", expand=True)
@@ -2008,7 +2151,7 @@ class VelogApp(tk.Tk):
 
         ttk.Label(
             wrap,
-            text="목록에서 삭제돼도 날짜별 성공·404 정리 기록은 남습니다.",
+            text="성공 목록에는 유효한 URL만 표시합니다. 404가 된 글은 아래 정리 목록으로 옮깁니다.",
             style="Sub.TLabel",
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
@@ -2018,7 +2161,7 @@ class VelogApp(tk.Tk):
         left_inner.pack(fill="both", expand=True, padx=1, pady=1)
         ttk.Label(left_inner, text="날짜", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
         day_list = tk.Listbox(
-            left_inner, width=28, height=22, font=(FONT, 9),
+            left_inner, width=34, height=22, font=(FONT, 9),
             relief="solid", borderwidth=1, activestyle="none",
             highlightthickness=0, exportselection=False,
         )
@@ -2033,7 +2176,7 @@ class VelogApp(tk.Tk):
         ttk.Label(right, textvariable=summary_var, style="Title.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 4),
         )
-        ttk.Label(right, text="성공 계정", style="Section.TLabel").grid(
+        ttk.Label(right, text="성공 계정 (유효 URL)", style="Section.TLabel").grid(
             row=1, column=0, sticky="w", pady=(4, 4),
         )
 
@@ -2077,17 +2220,30 @@ class VelogApp(tk.Tk):
         btn_row = ttk.Frame(wrap, style="Bg.TFrame")
         btn_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Button(btn_row, text="닫기", style="Ghost.TButton", command=win.destroy).pack(side="right")
+        check_btn = ttk.Button(btn_row, text="성공 URL 404 확인", style="Pick.TButton")
+        check_btn.pack(side="right", padx=(0, 8))
 
         day_labels: list[str] = []
-        for day in days:
-            bucket = self.daily_history.get(day) or {}
-            ok_n = len(bucket.get("successes") or [])
-            dead_n = len(bucket.get("cleaned_404") or [])
-            label = f"{day}  ·  성공 {ok_n}  ·  404정리 {dead_n}"
-            day_labels.append(day)
-            day_list.insert("end", label)
-
         current_rows: list[dict] = []
+        result_q: queue.Queue = queue.Queue()
+
+        def refill_days(select_day: str | None = None) -> None:
+            day_list.delete(0, "end")
+            day_labels.clear()
+            for day in days:
+                bucket = self.daily_history.get(day) or {}
+                ok_n = len(self._live_success_rows(bucket))
+                dead_n = len(bucket.get("cleaned_404") or [])
+                day_labels.append(day)
+                day_list.insert("end", f"{day}  ·  유효성공 {ok_n}  ·  404정리 {dead_n}")
+            if not day_labels:
+                return
+            idx = 0
+            if select_day and select_day in day_labels:
+                idx = day_labels.index(select_day)
+            day_list.selection_clear(0, "end")
+            day_list.selection_set(idx)
+            day_list.activate(idx)
 
         def refresh_day(_event=None) -> None:
             sel = day_list.curselection()
@@ -2095,9 +2251,11 @@ class VelogApp(tk.Tk):
                 return
             day = day_labels[sel[0]]
             bucket = self.daily_history.get(day) or {}
-            successes = list(bucket.get("successes") or [])
+            successes = self._live_success_rows(bucket)
             cleaned = list(bucket.get("cleaned_404") or [])
-            summary_var.set(f"{day}  —  성공 {len(successes)}개  ·  404 정리 {len(cleaned)}개")
+            summary_var.set(
+                f"{day}  —  유효 성공 {len(successes)}개  ·  404 정리 {len(cleaned)}개"
+            )
             tree.delete(*tree.get_children())
             current_rows.clear()
             for index, row in enumerate(successes):
@@ -2140,9 +2298,110 @@ class VelogApp(tk.Tk):
                     webbrowser.open(url)
             return "break"
 
+        def poll_check() -> None:
+            try:
+                payload = result_q.get_nowait()
+            except queue.Empty:
+                if win.winfo_exists():
+                    win.after(200, poll_check)
+                return
+            check_btn.configure(state="normal")
+            dead: list[dict] = []
+            ok = 0
+            fail = 0
+            day_key = ""
+            try:
+                data = json.loads(payload or "{}")
+                dead = [x for x in (data.get("dead") or []) if isinstance(x, dict)]
+                ok = int(data.get("ok") or 0)
+                fail = int(data.get("fail") or 0)
+                day_key = str(data.get("day") or "")
+            except (TypeError, ValueError):
+                pass
+            for row in dead:
+                self._record_cleaned_404_account(
+                    velog_id=str(row.get("velog_id", "")),
+                    url=str(row.get("url", "")),
+                    tab_title=str(row.get("tab", "")),
+                    published_at=str(row.get("published_at", "")),
+                    inbox_url=str(row.get("inbox_url", "")),
+                )
+            self._save_settings()
+            if day_key:
+                refill_days(day_key)
+                refresh_day()
+            msg = (
+                f"{day_key or '선택일'} 404 확인 완료 — "
+                f"404 이동 {len(dead)}개, 정상 {ok}개, 확인 실패 {fail}개"
+            )
+            self._append(msg, "success" if dead else "info")
+            if win.winfo_exists():
+                messagebox.showinfo("404 확인", msg, parent=win)
+
+        def check_404() -> None:
+            sel = day_list.curselection()
+            if not sel:
+                messagebox.showinfo("404 확인", "날짜를 먼저 선택해 주세요.", parent=win)
+                return
+            day = day_labels[sel[0]]
+            bucket = self.daily_history.get(day) or {}
+            targets = self._live_success_rows(bucket)
+            if not targets:
+                messagebox.showinfo("404 확인", "확인할 유효 성공 URL이 없습니다.", parent=win)
+                return
+            if not messagebox.askyesno(
+                "404 확인",
+                f"{day} 성공 URL {len(targets)}개를 확인합니다.\n"
+                "404이면 성공 목록에서 빼고 404 정리 기록으로 옮깁니다.\n\n계속할까요?",
+                parent=win,
+            ):
+                return
+            check_btn.configure(state="disabled")
+
+            def work() -> None:
+                dead_rows: list[dict] = []
+                ok_n = 0
+                fail_n = 0
+                for index, row in enumerate(targets, start=1):
+                    url = str(row.get("url", "")).strip()
+                    vid = str(row.get("velog_id", "")).strip()
+                    self._events.put((f"기록 404 확인 {index}/{len(targets)}: {vid}", "clean"))
+                    try:
+                        missing = _url_is_velog_404(url)
+                    except Exception:  # noqa: BLE001
+                        missing = None
+                    if missing is True:
+                        dead_rows.append(row)
+                    elif missing is False:
+                        ok_n += 1
+                    else:
+                        fail_n += 1
+                result_q.put(json.dumps(
+                    {
+                        "day": day,
+                        "dead": [
+                            {
+                                "velog_id": str(r.get("velog_id", "")),
+                                "url": str(r.get("url", "")),
+                                "tab": str(r.get("tab", "")),
+                                "published_at": str(r.get("published_at", "")),
+                                "inbox_url": str(r.get("inbox_url", "")),
+                            }
+                            for r in dead_rows
+                        ],
+                        "ok": ok_n,
+                        "fail": fail_n,
+                    },
+                    ensure_ascii=False,
+                ))
+
+            threading.Thread(target=work, daemon=True).start()
+            win.after(200, poll_check)
+
         day_list.bind("<<ListboxSelect>>", refresh_day)
         tree.bind("<Double-1>", open_url)
-        day_list.selection_set(0)
+        check_btn.configure(command=check_404)
+        refill_days()
         refresh_day()
         self._save_settings()
 
@@ -2419,12 +2678,18 @@ class VelogApp(tk.Tk):
             if hasattr(self, "ag_progress"):
                 self.ag_progress.configure(value=0, maximum=100)
                 self.ag_progress_text.set("")
+            if hasattr(self, "gm_progress"):
+                self.gm_progress.configure(value=0, maximum=100)
+                self.gm_progress_text.set("")
             return
         self.progress.configure(maximum=total, value=done)
         self.progress_text.set(f"{done} / {total} 진행")
         if hasattr(self, "ag_progress"):
             self.ag_progress.configure(maximum=total, value=done)
             self.ag_progress_text.set(f"{done} / {total} 진행")
+        if hasattr(self, "gm_progress"):
+            self.gm_progress.configure(maximum=total, value=done)
+            self.gm_progress_text.set(f"{done} / {total} 진행")
 
     # -- 실행 / 중단 ------------------------------------------------------
     def _start(self) -> None:
@@ -2457,7 +2722,7 @@ class VelogApp(tk.Tk):
             a for a in tab["accounts"]
             if str(a.get("manuscript_path", "")).strip()
             and self._is_eligible_for_assign(a)
-            and str(a.get("mail_provider", "")).strip().lower() != "adguard"
+            and str(a.get("mail_provider", "")).strip().lower() not in {"adguard", "guerrilla"}
         ]
         if not pending:
             if folder and not self._list_available_manuscripts(folder):
@@ -2506,7 +2771,7 @@ class VelogApp(tk.Tk):
             self._on_failed,
             signed_up_emails=set(self.signed_up_emails),
             on_signup=self._on_signup,
-            on_account=self._on_adguard_account,
+            on_account=self._on_provider_account,
         )
         profile_names = self._parse_profile_names()
         anchors = [dict(a) for a in self.anchors]
@@ -2600,7 +2865,88 @@ class VelogApp(tk.Tk):
             self._on_failed,
             signed_up_emails=set(self.signed_up_emails),
             on_signup=self._on_signup,
-            on_account=self._on_adguard_account,
+            on_account=lambda email, path: self._on_provider_account(email, path, "adguard"),
+        )
+        self._worker = threading.Thread(target=self._run, args=(jobs,), daemon=True)
+        self._worker.start()
+
+    def _start_guerrilla(self) -> None:
+        if self._cleaning or self._poster is not None or self._tm_worker is not None:
+            messagebox.showinfo("출간", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
+            return
+        folder = self.manuscript_folder.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning(
+                "원고 폴더",
+                "「벨로그 포스팅」 탭에서 원고 폴더를 먼저 지정해 주세요.",
+                parent=self,
+            )
+            return
+        files = self._list_available_manuscripts(folder)
+        if not files:
+            messagebox.showinfo(
+                "원고 없음",
+                "출간할 원고가 없습니다.\n"
+                "원고 폴더에 파일을 넣거나, 이미 배정된 원고는 제외됩니다.",
+                parent=self,
+            )
+            return
+        loop = bool(self.gm_loop_until_stop.get())
+        try:
+            count = int(self.gm_count.get())
+        except (tk.TclError, ValueError):
+            count = 1
+        if not loop:
+            files = files[: max(1, min(count, 100))]
+        image_folder = self.image_folder.get().strip()
+        try:
+            if image_folder:
+                self._check_image_folder(image_folder)
+            for path in files:
+                read_manuscript(str(path))
+        except PostingError as exc:
+            messagebox.showwarning("등록 정보 확인", str(exc), parent=self)
+            return
+
+        if not self.tabs:
+            self.tabs.append({"title": "기본", "accounts": []})
+            self._rebuild_tabs()
+        tab_index = self._ask_account_tab()
+        if tab_index is None:
+            return
+        self._active_tab = self.tabs[tab_index]
+        tab_title = self._active_tab["title"]
+
+        jobs = [
+            {
+                "velog_id": "",
+                "inbox_url": GUERRILLA_TEMPMAIL_URL,
+                "manuscript_path": str(path),
+                "mail_provider": "guerrilla",
+                "image_folder": image_folder,
+                "profile_names": self._parse_profile_names(),
+                "anchors": [dict(a) for a in self.anchors],
+                "homepages": list(self.homepages),
+            }
+            for path in files
+        ]
+        self._run_total = len(jobs)
+        self._run_done = 0
+        self._set_progress(0, self._run_total)
+        self._set_running(True)
+        self._switch_main_view("log")
+        self._append(
+            f"Guerrilla Mail 출간 시작 — 「{tab_title}」 {len(jobs)}건 "
+            "(도메인 랜덤 선택 → 가입 → 작성 → 출간)",
+            "info",
+        )
+        self._poster = VelogPoster(
+            self._post_event,
+            self._on_result,
+            self._on_failed,
+            signed_up_emails=set(self.signed_up_emails),
+            on_signup=self._on_signup,
+            on_account=lambda email, path: self._on_provider_account(email, path, "guerrilla"),
         )
         self._worker = threading.Thread(target=self._run, args=(jobs,), daemon=True)
         self._worker.start()
@@ -2615,17 +2961,20 @@ class VelogApp(tk.Tk):
         tab = self._active_tab or self._current_tab()
         if tab is None or not (velog_id or "").strip():
             return
+        inbox = GUERRILLA_TEMPMAIL_URL if provider == "guerrilla" else ADGUARD_TEMPMAIL_URL
+        label = "Guerrilla" if provider == "guerrilla" else "AdGuard"
         for acc in tab["accounts"]:
             if acc.get("velog_id") == velog_id:
                 if manuscript_path:
                     acc["manuscript_path"] = manuscript_path
                 acc["mail_provider"] = provider
+                acc["inbox_url"] = inbox
                 self._fill_tree(tab)
                 self._save_settings()
                 return
         tab["accounts"].append({
             "velog_id": velog_id.strip(),
-            "inbox_url": ADGUARD_TEMPMAIL_URL,
+            "inbox_url": inbox,
             "manuscript_path": manuscript_path,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "mail_mismatch": "",
@@ -2634,7 +2983,7 @@ class VelogApp(tk.Tk):
         self._fill_tree(tab)
         self._update_summary()
         self._save_settings()
-        self._append(f"AdGuard 계정 등록: {velog_id}", "info")
+        self._append(f"{label} 계정 등록: {velog_id}", "info")
 
     def _on_result(self, velog_id: str, url: str) -> None:
         self._events.put((f"{velog_id}\t{url}", "result"))
@@ -2645,8 +2994,11 @@ class VelogApp(tk.Tk):
     def _on_signup(self, email: str) -> None:
         self._events.put((str(email or "").strip().lower(), "signup"))
 
+    def _on_provider_account(self, email: str, manuscript_path: str, provider: str = "adguard") -> None:
+        self._events.put((f"{email}\t{manuscript_path}\t{provider}", "account"))
+
     def _on_adguard_account(self, email: str, manuscript_path: str) -> None:
-        self._events.put((f"{email}\t{manuscript_path}", "account"))
+        self._on_provider_account(email, manuscript_path, "adguard")
 
     def _add_anchor(self) -> None:
         text = self.anchor_text.get().strip()
@@ -2758,11 +3110,15 @@ class VelogApp(tk.Tk):
             self.status.set("중단하는 중...")
             if hasattr(self, "ag_status"):
                 self.ag_status.set("중단하는 중...")
+            if hasattr(self, "gm_status"):
+                self.gm_status.set("중단하는 중...")
             self._append("중단을 요청했습니다.", "info")
             self._poster.stop()
             self.stop_btn.configure(state="disabled")
             if hasattr(self, "ag_stop_btn"):
                 self.ag_stop_btn.configure(state="disabled")
+            if hasattr(self, "gm_stop_btn"):
+                self.gm_stop_btn.configure(state="disabled")
 
     def _post_event(self, message: str, level: str) -> None:
         self._events.put((message, level))
@@ -2795,8 +3151,11 @@ class VelogApp(tk.Tk):
                     self._mark_failed(velog_id, manuscript_path, reason)
                     continue
                 if level == "account":
-                    email, _, path = message.partition("\t")
-                    self._ensure_listed_account(email, path, provider="adguard")
+                    email, _, rest = message.partition("\t")
+                    path, _, provider = rest.partition("\t")
+                    self._ensure_listed_account(
+                        email, path, provider=(provider or "adguard").strip() or "adguard",
+                    )
                     continue
                 if level == "signup":
                     email = (message or "").strip().lower()
@@ -2887,7 +3246,13 @@ class VelogApp(tk.Tk):
                     target = acc
                     break
         if target is None:
-            self._ensure_listed_account(velog_id, "", provider="adguard")
+            provider = "adguard"
+            low = (velog_id or "").lower()
+            if any(d in low for d in (
+                "sharklasers.com", "guerrillamail", "grr.la", "pokemail.net", "spam4.me",
+            )):
+                provider = "guerrilla"
+            self._ensure_listed_account(velog_id, "", provider=provider)
             for acc in accounts:
                 if acc.get("velog_id") == velog_id:
                     target = acc
@@ -2998,6 +3363,9 @@ class VelogApp(tk.Tk):
         if hasattr(self, "ag_start_btn"):
             self.ag_start_btn.configure(state="disabled" if running else "normal")
             self.ag_stop_btn.configure(state="normal" if running else "disabled")
+        if hasattr(self, "gm_start_btn"):
+            self.gm_start_btn.configure(state="disabled" if running else "normal")
+            self.gm_stop_btn.configure(state="normal" if running else "disabled")
         if hasattr(self, "tm_start_btn"):
             self.tm_start_btn.configure(state="disabled" if running else "normal")
         if hasattr(self, "clean_btn"):
@@ -3006,12 +3374,16 @@ class VelogApp(tk.Tk):
             self.status.set("출간 작업 진행 중...")
             if hasattr(self, "ag_status"):
                 self.ag_status.set("출간 작업 진행 중...")
+            if hasattr(self, "gm_status"):
+                self.gm_status.set("출간 작업 진행 중...")
         else:
             self.working_id.set("")
             done_text = "중단됨" if self.status.get().endswith("중단하는 중...") else "작업이 완료되었습니다."
             self.status.set(done_text)
             if hasattr(self, "ag_status"):
                 self.ag_status.set(done_text)
+            if hasattr(self, "gm_status"):
+                self.gm_status.set(done_text)
 
     def _append(self, message: str, tag: str = "") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -3217,6 +3589,8 @@ class VelogApp(tk.Tk):
             self.start_btn.configure(state="disabled" if running else "normal")
         if hasattr(self, "ag_start_btn"):
             self.ag_start_btn.configure(state="disabled" if running else "normal")
+        if hasattr(self, "gm_start_btn"):
+            self.gm_start_btn.configure(state="disabled" if running else "normal")
         if running:
             self.tm_status.set("임시 메일 생성 중...")
         else:
@@ -3529,6 +3903,7 @@ class VelogApp(tk.Tk):
                             "published_at": str(row.get("published_at", "")),
                             "inbox_url": str(row.get("inbox_url", "")),
                             "manuscript": str(row.get("manuscript", "")),
+                            "dead": bool(row.get("dead")),
                         })
                     cleaned = []
                     for row in bucket.get("cleaned_404") or []:

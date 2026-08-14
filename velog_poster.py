@@ -156,6 +156,20 @@ def extract_velog_link(body: str) -> str:
 
 
 ADGUARD_TEMPMAIL_URL = "https://tempmail.adguard.com/?_locale=ko"
+GUERRILLA_TEMPMAIL_URL = "https://www.guerrillamail.com/"
+GUERRILLA_DOMAINS = (
+    "sharklasers.com",
+    "guerrillamail.info",
+    "grr.la",
+    "guerrillamail.biz",
+    "guerrillamail.com",
+    "guerrillamail.de",
+    "guerrillamail.net",
+    "guerrillamail.org",
+    "guerrillamailblock.com",
+    "pokemail.net",
+    "spam4.me",
+)
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _ADGUARD_CREATE_SELECTORS = (
     "button.address__get-address-btn",
@@ -535,8 +549,12 @@ class VelogPoster:
 
     def _run_one(self, pw, chrome: Path, account: dict[str, str]) -> None:
         """한 계정의 전체 흐름을 수행한다."""
-        if str(account.get("mail_provider") or "").strip().lower() == "adguard":
+        provider = str(account.get("mail_provider") or "").strip().lower()
+        if provider == "adguard":
             self._run_one_adguard(pw, chrome, account)
+            return
+        if provider == "guerrilla":
+            self._run_one_guerrilla(pw, chrome, account)
             return
         velog_id = account["velog_id"].strip()
         inbox_url = normalize_url(account["inbox_url"])
@@ -718,6 +736,78 @@ class VelogPoster:
             mail = self._adguard_mail_page()
             link = self._wait_adguard_velog_mail(mail)
             velog = self._page_by_host("velog.io")
+        self._open_link(pw, velog, link)
+
+        self._ensure_connected(pw)
+        velog = self._page_by_host("velog.io")
+        is_signup, profile_name = self._handle_signup_if_needed(pw, velog, account)
+        self._ensure_connected(pw)
+        self._restore_user_focus()
+        velog = self._page_by_host("velog.io")
+        if not is_signup:
+            self.log("로그인 중.. (기존 계정)", "info")
+        elif profile_name:
+            self._set_blog_title(velog, profile_name)
+
+        image_link = random.choice(homepages) if (image_folder and homepages) else ""
+        target = self._write_post(
+            self._page_by_host("velog.io"),
+            title,
+            body,
+            tags=tags,
+            image_folder=image_folder,
+            image_link=image_link,
+        )
+        self._restore_user_focus()
+
+        url = self._publish(pw, target)
+        if not url or not self._is_post_url(url):
+            raise PostingError("출간에 실패했습니다. 게시글 주소를 확인하지 못했습니다.")
+        if self.on_result is not None:
+            try:
+                self.on_result(email, url)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _run_one_guerrilla(self, pw, chrome: Path, account: dict[str, str]) -> None:
+        """Guerrilla Mail 임시메일 → 벨로그 가입/로그인 → 작성 → 출간."""
+        title, body, tags = read_manuscript(account["manuscript_path"])
+        image_folder = (account.get("image_folder") or "").strip()
+        homepages = [str(u).strip() for u in (account.get("homepages") or []) if str(u).strip()]
+        anchors = account.get("anchors") or []
+        if anchors:
+            a = random.choice(anchors)
+            anchor_text = (a.get("anchor") or "").strip()
+            anchor_url = (a.get("url") or "").strip()
+            if anchor_text and anchor_url:
+                body = f"{body.rstrip()}\n\n[{anchor_text}]({anchor_url})"
+
+        self._user_foreground_hwnd = self._capture_foreground_hwnd()
+        self._launch_incognito(pw, chrome)
+        self._restore_user_focus()
+
+        mail = self._first_page()
+        self._inject_stealth(mail)
+        email = self._guerrilla_prepare_address(pw, mail)
+        account["velog_id"] = email
+        account["inbox_url"] = GUERRILLA_TEMPMAIL_URL
+        self._emit(email, "working")
+        if self.on_account is not None:
+            try:
+                self.on_account(email, str(account.get("manuscript_path") or ""))
+            except Exception:  # noqa: BLE001
+                pass
+
+        self._ensure_connected(pw)
+        assert self._context is not None
+        velog = self._context.new_page()
+        self._inject_stealth(velog)
+        self._request_login(pw, velog, email)
+
+        self._ensure_connected(pw)
+        mail = self._guerrilla_mail_page()
+        link = self._wait_guerrilla_velog_mail(mail)
+        velog = self._page_by_host("velog.io")
         self._open_link(pw, velog, link)
 
         self._ensure_connected(pw)
@@ -981,6 +1071,8 @@ class VelogPoster:
             host = (urlparse(page.url).netloc or "").lower()
             if "adguard.com" in host:
                 needle = "adguard.com"
+            elif "guerrillamail" in host or "sharklasers" in host or "grr.la" in host:
+                needle = host
             elif host:
                 needle = host
         except Exception:  # noqa: BLE001
@@ -1561,6 +1653,172 @@ class VelogPoster:
                 return extract_velog_link(frame.content())
         except Error:
             pass
+        raise PostingError("인증 메일에서 벨로그 인증 링크를 찾지 못했습니다.")
+
+    # -- Guerrilla Mail 임시 메일 ----------------------------------------
+    def _guerrilla_mail_page(self) -> Page:
+        for host in ("guerrillamail.com", "sharklasers.com", "grr.la", "pokemail.net", "spam4.me"):
+            try:
+                return self._page_by_host(host)
+            except PostingError:
+                continue
+        return self._first_page()
+
+    def _guerrilla_prepare_address(self, pw, page: Page) -> str:
+        self.log("Guerrilla Mail에 접속하는 중...", "info")
+        self._goto(page, GUERRILLA_TEMPMAIL_URL)
+        self._wait("Guerrilla Mail 화면이 준비되기를 기다리는 중...", _jitter(3.0, 1.2))
+        self._wait_if_cloudflare(pw, page)
+        self._ensure_connected(pw)
+        page = self._guerrilla_mail_page()
+        self._guerrilla_dismiss_banners(page)
+
+        domain = self._guerrilla_pick_domain(page)
+        self.log(f"도메인 선택: @{domain}", "info")
+        self._guerrilla_select_domain(page, domain)
+        self._sleep(_jitter(1.2, 0.5))
+
+        email = ""
+        for _ in range(30):
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            email = self._guerrilla_read_email(page)
+            if email and email.lower().endswith(f"@{domain.lower()}"):
+                break
+            if email and "@" in email:
+                # 도메인 반영이 조금 늦을 수 있음 — 계속 대기
+                pass
+            self._sleep(0.5)
+        if not email:
+            raise PostingError("Guerrilla Mail 주소를 읽지 못했습니다.")
+        self.log(f"Guerrilla Mail 주소: {email}", "success")
+        return email
+
+    def _guerrilla_pick_domain(self, page: Page) -> str:
+        values: list[str] = []
+        try:
+            select = page.locator("#gm-host-select")
+            select.first.wait_for(state="visible", timeout=15_000)
+            options = select.locator("option")
+            for i in range(options.count()):
+                val = (options.nth(i).get_attribute("value") or "").strip()
+                if val:
+                    values.append(val)
+        except (Error, PWTimeoutError):
+            values = []
+        if not values:
+            values = list(GUERRILLA_DOMAINS)
+        return random.choice(values)
+
+    def _guerrilla_select_domain(self, page: Page, domain: str) -> None:
+        select = page.locator("#gm-host-select")
+        try:
+            select.first.wait_for(state="visible", timeout=15_000)
+            select.select_option(domain)
+        except (Error, PWTimeoutError) as exc:
+            raise PostingError(f"Guerrilla Mail 도메인 선택 실패: {domain}") from exc
+        # 주소 위젯이 선택한 도메인으로 바뀔 때까지 대기
+        for _ in range(20):
+            if self._stop.wait(0.4):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            email = self._guerrilla_read_email(page)
+            if email and email.lower().endswith(f"@{domain.lower()}"):
+                return
+        # 반영이 느려도 진행 — 최종 읽기에서 확인
+
+    @staticmethod
+    def _guerrilla_read_email(page: Page) -> str:
+        selectors = (
+            "#email-widget",
+            "span#email-widget",
+            "#email-widget.outline",
+        )
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if loc.count() == 0:
+                    continue
+                text = (loc.first.inner_text(timeout=2_000) or "").strip()
+                match = _EMAIL_RE.search(text)
+                if match:
+                    return match.group(0)
+            except Error:
+                continue
+        return ""
+
+    def _guerrilla_dismiss_banners(self, page: Page) -> None:
+        for name in ("Accept", "I agree", "동의", "수락", "확인", "Close", "닫기"):
+            try:
+                loc = page.get_by_role("button", name=name)
+                if loc.count() > 0 and loc.first.is_visible():
+                    loc.first.click(timeout=2_000)
+                    self._sleep(0.3)
+                    return
+            except Error:
+                continue
+
+    def _wait_guerrilla_velog_mail(self, page: Page) -> str:
+        self.log("Guerrilla Mail 받은편지함에서 벨로그 인증 메일을 기다리는 중...", "info")
+        for _ in range(36):
+            if self._stop.wait(5):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            try:
+                # 새 메일 반영을 위해 목록을 다시 읽는다
+                rows = page.locator("#email_list tr.mail_row, #email_list tr")
+                for index in range(rows.count()):
+                    row = rows.nth(index)
+                    try:
+                        sender = (row.locator("td.td2").inner_text() or "").strip()
+                        subject = (row.locator("td.td3").inner_text() or "").strip()
+                    except Error:
+                        continue
+                    blob = f"{sender} {subject}".lower()
+                    if "guerrillamail.com" in blob and "welcome" in blob:
+                        continue
+                    if "no-reply@guerrillamail" in blob and "welcome" in blob:
+                        continue
+                    if "velog" not in blob and "verify@" not in blob:
+                        continue
+                    self.log(f"인증 메일 확인: {sender} / {subject[:80]}", "info")
+                    self._stable_click(row)
+                    self._sleep(_jitter(1.6, 0.6))
+                    return self._guerrilla_extract_link(page)
+            except Error:
+                pass
+            # 가끔 새로고침 버튼이 있으면 눌러 본다
+            try:
+                refresh = page.locator("#refresh_button, a#refresh_button")
+                if refresh.count() > 0 and refresh.first.is_visible():
+                    refresh.first.click(timeout=2_000)
+            except Error:
+                pass
+        raise PostingError("3분 안에 Guerrilla Mail 받은편지함에 벨로그 인증 메일이 도착하지 않았습니다.")
+
+    def _guerrilla_extract_link(self, page: Page) -> str:
+        display = page.locator("#display_email, #email_body, .email_body, #mail-display")
+        try:
+            display.first.wait_for(state="visible", timeout=15_000)
+        except (Error, PWTimeoutError):
+            pass
+        chunks: list[str] = []
+        for sel in ("#display_email", "#email_body", ".email_body", "body"):
+            try:
+                loc = page.locator(sel)
+                if loc.count() == 0:
+                    continue
+                html_body = loc.first.inner_html(timeout=3_000) or ""
+                if html_body.strip():
+                    chunks.append(html_body)
+                text = loc.first.inner_text(timeout=2_000) or ""
+                if text.strip():
+                    chunks.append(text)
+            except Error:
+                continue
+        for chunk in chunks:
+            try:
+                return extract_velog_link(chunk)
+            except PostingError:
+                continue
         raise PostingError("인증 메일에서 벨로그 인증 링크를 찾지 못했습니다.")
 
     # -- 신규 계정 회원가입 ----------------------------------------------
