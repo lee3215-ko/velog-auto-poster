@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.38",
-    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/512856464",
-    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.38/VelogPoster.zip",
-    "notes":  "AdGuard 확인 실패 시 자동화 클릭 대신 확장/화면 클릭을 쓰고, 설치된 Opera가 있으면 사용하며 마지막에 Firefox로 메일을 시도합니다. Opera가 없는 PC는 건너뜁니다.",
+    "version":  "1.0.39",
+    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.39/VelogPoster.zip",
+    "notes":  "목록정리로 삭제돼도 일자별 기록이 남습니다. 성공 계정과 404 정리 개수를 「일자별 기록」에서 확인할 수 있습니다.",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/512856464",
-                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.38/VelogPoster.zip",
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.39/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ],
-    "asset_id":  512856464,
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/512856464"
+                      ]
 }

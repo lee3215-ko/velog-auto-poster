@@ -262,6 +262,9 @@ class VelogApp(tk.Tk):
         self.nb_wrap: ttk.Frame | None = None
         self.anchors: list[dict[str, str]] = []
         self.homepages: list[str] = []
+        # 일자별 기록: 성공 계정 / 404 정리 계정
+        # {"YYYY-MM-DD": {"successes": [...], "cleaned_404": [...]}}
+        self.daily_history: dict[str, dict] = {}
         self._events: queue.Queue[tuple[str, str]] = queue.Queue()
         self._poster: VelogPoster | None = None
         self._worker: threading.Thread | None = None
@@ -1114,6 +1117,7 @@ class VelogApp(tk.Tk):
             ("탭 삭제", self._delete_tab),
             ("원고 일괄 지정", self._bulk_assign_manuscripts),
             ("성공 목록 보기", self._show_published_list),
+            ("일자별 기록", self._show_daily_history),
         ):
             ttk.Button(btns, text=text, style="Pick.TButton", command=cmd).pack(
                 side="left", padx=(0, 6), pady=(0, 4),
@@ -1878,6 +1882,270 @@ class VelogApp(tk.Tk):
             assigned += 1
         return assigned
 
+    def _history_day_key(self, when: datetime | None = None) -> str:
+        return (when or datetime.now()).strftime("%Y-%m-%d")
+
+    def _history_bucket(self, day: str | None = None) -> dict:
+        key = day or self._history_day_key()
+        bucket = self.daily_history.get(key)
+        if not isinstance(bucket, dict):
+            bucket = {"successes": [], "cleaned_404": []}
+            self.daily_history[key] = bucket
+        bucket.setdefault("successes", [])
+        bucket.setdefault("cleaned_404", [])
+        return bucket
+
+    def _record_success_account(
+        self,
+        *,
+        velog_id: str,
+        url: str,
+        tab_title: str = "",
+        published_at: str = "",
+        inbox_url: str = "",
+        manuscript: str = "",
+    ) -> None:
+        vid = (velog_id or "").strip()
+        link = (url or "").strip()
+        if not vid or not link:
+            return
+        at = (published_at or "").strip() or datetime.now().isoformat(timespec="seconds")
+        day = self._history_day_key(self._parse_time(at) or datetime.now())
+        bucket = self._history_bucket(day)
+        for row in bucket["successes"]:
+            if (
+                str(row.get("velog_id", "")).strip().lower() == vid.lower()
+                and str(row.get("url", "")).strip() == link
+            ):
+                row["tab"] = tab_title or row.get("tab", "")
+                row["published_at"] = at
+                row["inbox_url"] = inbox_url or row.get("inbox_url", "")
+                row["manuscript"] = manuscript or row.get("manuscript", "")
+                return
+        bucket["successes"].append({
+            "velog_id": vid,
+            "url": link,
+            "tab": tab_title,
+            "published_at": at,
+            "inbox_url": inbox_url,
+            "manuscript": manuscript,
+        })
+
+    def _record_cleaned_404_account(
+        self,
+        *,
+        velog_id: str,
+        url: str,
+        tab_title: str = "",
+        published_at: str = "",
+        inbox_url: str = "",
+    ) -> None:
+        vid = (velog_id or "").strip()
+        if not vid:
+            return
+        now = datetime.now()
+        bucket = self._history_bucket(self._history_day_key(now))
+        # 정리 전에 성공 기록도 남긴다 (과거 성공분이 기록에 없을 수 있음)
+        if str(url or "").strip():
+            self._record_success_account(
+                velog_id=vid,
+                url=url,
+                tab_title=tab_title,
+                published_at=published_at,
+                inbox_url=inbox_url,
+            )
+        bucket["cleaned_404"].append({
+            "velog_id": vid,
+            "url": str(url or "").strip(),
+            "tab": tab_title,
+            "published_at": published_at,
+            "inbox_url": inbox_url,
+            "cleaned_at": now.isoformat(timespec="seconds"),
+        })
+
+    def _backfill_history_from_accounts(self) -> None:
+        """현재 목록의 발행 성공 계정을 일자별 기록에 반영한다."""
+        for tab in self.tabs:
+            title = str(tab.get("title", ""))
+            for acc in tab.get("accounts", []):
+                url = str(acc.get("published_url", "")).strip()
+                if not url:
+                    continue
+                manuscript = ""
+                if acc.get("manuscript_path"):
+                    manuscript = Path(acc["manuscript_path"]).name
+                self._record_success_account(
+                    velog_id=str(acc.get("velog_id", "")),
+                    url=url,
+                    tab_title=title,
+                    published_at=str(acc.get("published_at", "")),
+                    inbox_url=str(acc.get("inbox_url", "")),
+                    manuscript=manuscript,
+                )
+
+    def _show_daily_history(self) -> None:
+        """일자별 성공 계정 · 404 정리 개수 기록을 보여 준다."""
+        self._backfill_history_from_accounts()
+        days = sorted(self.daily_history.keys(), reverse=True)
+        if not days:
+            messagebox.showinfo(
+                "일자별 기록",
+                "아직 기록이 없습니다.\n출간 성공하거나 목록정리(404)를 하면 여기에 남습니다.",
+                parent=self,
+            )
+            return
+
+        win = tk.Toplevel(self)
+        win.title("일자별 기록")
+        win.configure(bg=BG)
+        win.transient(self)
+        _place_window(win, 1080, 620, self)
+
+        wrap = ttk.Frame(win, style="Bg.TFrame", padding=14)
+        wrap.pack(fill="both", expand=True)
+        wrap.columnconfigure(1, weight=1)
+        wrap.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            wrap,
+            text="목록에서 삭제돼도 날짜별 성공·404 정리 기록은 남습니다.",
+            style="Sub.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        left = ttk.Frame(wrap, style="CardBorder.TFrame")
+        left.grid(row=1, column=0, sticky="nsw", padx=(0, 10))
+        left_inner = ttk.Frame(left, style="Card.TFrame", padding=8)
+        left_inner.pack(fill="both", expand=True, padx=1, pady=1)
+        ttk.Label(left_inner, text="날짜", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+        day_list = tk.Listbox(
+            left_inner, width=28, height=22, font=(FONT, 9),
+            relief="solid", borderwidth=1, activestyle="none",
+            highlightthickness=0, exportselection=False,
+        )
+        day_list.pack(fill="y", expand=True)
+
+        right = ttk.Frame(wrap, style="Bg.TFrame")
+        right.grid(row=1, column=1, sticky="nsew")
+        right.rowconfigure(2, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        summary_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=summary_var, style="Title.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 4),
+        )
+        ttk.Label(right, text="성공 계정", style="Section.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(4, 4),
+        )
+
+        tree_wrap = ttk.Frame(right, style="CardBorder.TFrame")
+        tree_wrap.grid(row=2, column=0, sticky="nsew")
+        tree_inner = ttk.Frame(tree_wrap, style="Card.TFrame", padding=6)
+        tree_inner.pack(fill="both", expand=True, padx=1, pady=1)
+        tree_inner.rowconfigure(0, weight=1)
+        tree_inner.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(
+            tree_inner,
+            columns=("no", "tab", "id", "published_at", "url"),
+            show="headings",
+            selectmode="extended",
+        )
+        tree.heading("no", text="#")
+        tree.heading("tab", text="탭")
+        tree.heading("id", text="아이디")
+        tree.heading("published_at", text="발행 시각")
+        tree.heading("url", text="발행 URL")
+        tree.column("no", width=40, stretch=False, anchor="center")
+        tree.column("tab", width=90, stretch=False)
+        tree.column("id", width=180, stretch=False)
+        tree.column("published_at", width=140, stretch=False)
+        tree.column("url", width=320, stretch=True)
+        tree.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(tree_inner, orient="vertical", command=tree.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=sb.set)
+
+        clean_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=clean_var, style="Sub.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(8, 0),
+        )
+        clean_list = tk.Listbox(
+            right, height=5, font=(FONT, 9), relief="solid", borderwidth=1,
+            activestyle="none", highlightthickness=0,
+        )
+        clean_list.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+
+        btn_row = ttk.Frame(wrap, style="Bg.TFrame")
+        btn_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(btn_row, text="닫기", style="Ghost.TButton", command=win.destroy).pack(side="right")
+
+        day_labels: list[str] = []
+        for day in days:
+            bucket = self.daily_history.get(day) or {}
+            ok_n = len(bucket.get("successes") or [])
+            dead_n = len(bucket.get("cleaned_404") or [])
+            label = f"{day}  ·  성공 {ok_n}  ·  404정리 {dead_n}"
+            day_labels.append(day)
+            day_list.insert("end", label)
+
+        current_rows: list[dict] = []
+
+        def refresh_day(_event=None) -> None:
+            sel = day_list.curselection()
+            if not sel:
+                return
+            day = day_labels[sel[0]]
+            bucket = self.daily_history.get(day) or {}
+            successes = list(bucket.get("successes") or [])
+            cleaned = list(bucket.get("cleaned_404") or [])
+            summary_var.set(f"{day}  —  성공 {len(successes)}개  ·  404 정리 {len(cleaned)}개")
+            tree.delete(*tree.get_children())
+            current_rows.clear()
+            for index, row in enumerate(successes):
+                current_rows.append(row)
+                at = str(row.get("published_at", ""))
+                parsed = self._parse_time(at)
+                at_disp = parsed.strftime("%Y-%m-%d %H:%M") if parsed is not None else at
+                tree.insert(
+                    "", "end",
+                    values=(
+                        index + 1,
+                        row.get("tab", ""),
+                        row.get("velog_id", ""),
+                        at_disp,
+                        row.get("url", ""),
+                    ),
+                )
+            clean_var.set(f"404로 정리된 계정 {len(cleaned)}개")
+            clean_list.delete(0, "end")
+            for row in cleaned:
+                when = str(row.get("cleaned_at", ""))
+                parsed = self._parse_time(when)
+                when_disp = parsed.strftime("%H:%M") if parsed is not None else when
+                clean_list.insert(
+                    "end",
+                    f"{when_disp}  {row.get('velog_id', '')}  {row.get('url', '')}",
+                )
+
+        def open_url(event=None) -> str:
+            sel = tree.selection()
+            if not sel:
+                return "break"
+            try:
+                idx = int(tree.index(sel[0]))
+            except Exception:
+                return "break"
+            if 0 <= idx < len(current_rows):
+                url = str(current_rows[idx].get("url", "")).strip()
+                if url:
+                    webbrowser.open(url)
+            return "break"
+
+        day_list.bind("<<ListboxSelect>>", refresh_day)
+        tree.bind("<Double-1>", open_url)
+        day_list.selection_set(0)
+        refresh_day()
+        self._save_settings()
+
     def _show_published_list(self) -> None:
         """버튼을 누른 시점의 발행 성공 계정을 새 창에 보여 준다."""
         rows: list[dict[str, str]] = []
@@ -2082,11 +2350,22 @@ class VelogApp(tk.Tk):
         if tab is not None and dead:
             dead_set = {x.strip().lower() for x in dead}
             before = len(tab["accounts"])
-            tab["accounts"] = [
-                acc for acc in tab["accounts"]
-                if str(acc.get("velog_id", "")).strip().lower() not in dead_set
-                or not str(acc.get("published_url", "")).strip()
-            ]
+            survivors: list[dict] = []
+            tab_title = str(tab.get("title", ""))
+            for acc in tab["accounts"]:
+                vid = str(acc.get("velog_id", "")).strip()
+                url = str(acc.get("published_url", "")).strip()
+                if vid.lower() in dead_set and url:
+                    self._record_cleaned_404_account(
+                        velog_id=vid,
+                        url=url,
+                        tab_title=tab_title,
+                        published_at=str(acc.get("published_at", "")),
+                        inbox_url=str(acc.get("inbox_url", "")),
+                    )
+                    continue
+                survivors.append(acc)
+            tab["accounts"] = survivors
             removed = before - len(tab["accounts"])
             self._fill_tree(tab)
             self._update_summary()
@@ -2096,7 +2375,13 @@ class VelogApp(tk.Tk):
             self.clean_btn.configure(state="normal")
         if self._poster is None:
             self.start_btn.configure(state="normal")
-        msg = f"목록 정리 완료 — 404 삭제 {removed}개, 정상 {ok}개, 확인 실패 {fail}개"
+        day = self._history_day_key()
+        bucket = self._history_bucket(day)
+        success_n = len(bucket.get("successes") or [])
+        msg = (
+            f"목록 정리 완료 — 404 삭제 {removed}개, 정상 {ok}개, 확인 실패 {fail}개"
+            f"  (오늘 기록: 성공 {success_n} · 404정리 {len(bucket.get('cleaned_404') or [])})"
+        )
         self._append(msg, "success" if removed else "info")
         self.status.set(msg)
         messagebox.showinfo("목록 정리", msg, parent=self)
@@ -2612,6 +2897,17 @@ class VelogApp(tk.Tk):
         target["published_url"] = url
         target["published_at"] = datetime.now().isoformat(timespec="seconds")
         target["fail_count"] = "0"
+        manuscript = ""
+        if target.get("manuscript_path"):
+            manuscript = Path(target["manuscript_path"]).name
+        self._record_success_account(
+            velog_id=velog_id,
+            url=url,
+            tab_title=str(tab.get("title", "")),
+            published_at=target["published_at"],
+            inbox_url=str(target.get("inbox_url", "")),
+            manuscript=manuscript,
+        )
         self._relocate_manuscript(target, success=True)
         self._fill_tree(tab)
         self._update_summary()
@@ -3209,11 +3505,54 @@ class VelogApp(tk.Tk):
                     for e in signed
                     if str(e).strip()
                 }
+            raw_history = data.get("daily_history", {})
+            if isinstance(raw_history, dict):
+                restored: dict[str, dict] = {}
+                for day, bucket in raw_history.items():
+                    if not isinstance(bucket, dict):
+                        continue
+                    day_key = str(day).strip()
+                    if not day_key:
+                        continue
+                    successes = []
+                    for row in bucket.get("successes") or []:
+                        if not isinstance(row, dict):
+                            continue
+                        vid = str(row.get("velog_id", "")).strip()
+                        url = str(row.get("url", "")).strip()
+                        if not vid or not url:
+                            continue
+                        successes.append({
+                            "velog_id": vid,
+                            "url": url,
+                            "tab": str(row.get("tab", "")),
+                            "published_at": str(row.get("published_at", "")),
+                            "inbox_url": str(row.get("inbox_url", "")),
+                            "manuscript": str(row.get("manuscript", "")),
+                        })
+                    cleaned = []
+                    for row in bucket.get("cleaned_404") or []:
+                        if not isinstance(row, dict):
+                            continue
+                        vid = str(row.get("velog_id", "")).strip()
+                        if not vid:
+                            continue
+                        cleaned.append({
+                            "velog_id": vid,
+                            "url": str(row.get("url", "")),
+                            "tab": str(row.get("tab", "")),
+                            "published_at": str(row.get("published_at", "")),
+                            "inbox_url": str(row.get("inbox_url", "")),
+                            "cleaned_at": str(row.get("cleaned_at", "")),
+                        })
+                    restored[day_key] = {"successes": successes, "cleaned_404": cleaned}
+                self.daily_history = restored
         except (OSError, ValueError):
             pass
         if not self.tabs:
             self.tabs.append({"title": "기본", "accounts": []})
         self._purge_expired_accounts()
+        self._backfill_history_from_accounts()
         self.profile_text.delete("1.0", "end")
         self.profile_text.insert("1.0", ", ".join(names))
         self._refresh_anchor_list()
@@ -3241,6 +3580,7 @@ class VelogApp(tk.Tk):
                         "tabs": tabs,
                         "generated_emails": self.generated_emails,
                         "signed_up_emails": sorted(self.signed_up_emails),
+                        "daily_history": self.daily_history,
                     },
                     ensure_ascii=False, indent=2,
                 ),
