@@ -1,10 +1,10 @@
 {
-    "version":  "1.0.43",
+    "version":  "1.0.44",
     "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
-    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.43/VelogPoster.zip",
-    "notes":  "AdGuard 출간 후 비공개 감시·재공개(최대/간격 설정), 네이버 캡챠 후 비밀번호 재입력, 설정 페이지 프로필 이미지 업로드",
+    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.44/VelogPoster.zip",
+    "notes":  "AdGuard 비공개 재공개 Cloudflare 수정, 감시 중 CDP 해제, 수정하기 미활성 시 성공 오인 방지",
     "download_urls":  [
-                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.43/VelogPoster.zip",
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.44/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
                       ]
 }

@@ -3475,7 +3475,11 @@ class VelogPoster:
         max_min: int = 20,
         interval_min: int = 5,
     ) -> None:
-        """출간 후 Chrome을 유지한 채 발행 URL을 감시하고, 비공개면 재공개한다."""
+        """출간 후 Chrome을 유지한 채 발행 URL을 감시하고, 비공개면 재공개한다.
+
+        장시간 CDP 연결은 봇으로 잡히므로, 대기 중에는 연결을 끊고
+        새로고침·상태 확인 때만 잠깐 붙었다가 바로 끊는다.
+        """
         max_min = max(1, min(180, int(max_min or 20)))
         interval_min = max(1, min(60, int(interval_min or 5)))
         if interval_min > max_min:
@@ -3487,77 +3491,103 @@ class VelogPoster:
             f"발행 URL 비공개 감시 시작 (최대 {max_min}분, {interval_min}분마다 새로고침)",
             "info",
         )
-        self._ensure_connected(pw)
-        page = self._open_published_post(pw, post_url)
-        if page is None:
-            self.log("발행 URL 탭을 열지 못해 비공개 감시를 건너뜁니다.", "info")
-            return
+        # 첫 확인만 연결 → 즉시 끊고 대기 (Chrome 창/탭은 유지)
+        private = self._peek_post_private(pw, post_url, reload=False)
+        if private is True:
+            self.log("비공개가 감지되었습니다. 전체 공개로 복구합니다...", "info")
+            if self._republic_private_post(pw, post_url):
+                self.log("비공개 → 전체 공개 복구 완료", "success")
+                return
+            self.log("재공개 시도가 끝나지 않았습니다. 감시를 이어갑니다.", "info")
+        elif private is False:
+            self.log("현재는 비공개가 아닙니다. 주기적으로 다시 확인합니다.", "info")
+        else:
+            self.log("발행 URL을 열지 못했습니다. 잠시 후 다시 시도합니다.", "info")
 
-        # 첫 확인은 즉시, 이후 간격마다 새로고침
-        first = True
         while time.monotonic() < deadline:
             if self._stop.wait(0):
                 raise PostingError("사용자가 작업을 중단했습니다.")
-            if not first:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                wait_s = min(interval_s, left)
-                self._wait(
-                    f"다음 새로고침까지 대기 ({wait_s / 60:.1f}분)...",
-                    wait_s,
-                )
-                if self._stop.wait(0):
-                    raise PostingError("사용자가 작업을 중단했습니다.")
-                self._ensure_connected(pw)
-                page = self._open_published_post(pw, post_url)
-                if page is None:
-                    self.log("발행 URL 탭을 다시 열지 못했습니다. 감시 종료.", "info")
-                    return
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            wait_s = min(interval_s, left)
+            # 대기 중 CDP 없음 — 일반 브라우저처럼 페이지가 열려만 있게 둔다
+            if self._browser is not None:
+                self._disconnect_only()
+            self._wait(
+                f"다음 새로고침까지 대기 ({wait_s / 60:.1f}분)...",
+                wait_s,
+            )
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+
+            private = self._peek_post_private(pw, post_url, reload=True)
+            if private is True:
+                self.log("비공개가 감지되었습니다. 전체 공개로 복구합니다...", "info")
                 try:
-                    page.reload(wait_until="domcontentloaded", timeout=60_000)
-                except Error:
-                    try:
-                        self._goto(page, post_url)
-                    except Error as exc:
-                        self.log(f"새로고침 실패: {exc}", "info")
-                        first = False
-                        continue
-                self._sleep(_jitter(2.0, 0.8))
-            first = False
-
-            try:
-                page = self._page_by_host("velog.io")
-            except PostingError:
-                page = self._open_published_post(pw, post_url)
-                if page is None:
-                    continue
-
-            if not self._post_shows_private(page):
+                    if self._republic_private_post(pw, post_url):
+                        self.log("비공개 → 전체 공개 복구 완료", "success")
+                        return
+                    self.log("재공개 시도가 끝나지 않았습니다. 감시를 이어갑니다.", "info")
+                except PostingError as exc:
+                    if self._stop.is_set() or "중단" in str(exc):
+                        raise
+                    self.log(f"재공개 실패(감시 계속): {exc}", "info")
+                except Error as exc:
+                    self.log(f"재공개 중 오류(감시 계속): {exc}", "info")
+            elif private is False:
                 remaining = max(0, deadline - time.monotonic())
                 self.log(
                     f"비공개 아님 — 계속 감시합니다 (남은 {remaining / 60:.1f}분)",
                     "info",
                 )
-                continue
 
-            self.log("비공개가 감지되었습니다. 전체 공개로 복구합니다...", "info")
-            try:
-                if self._republic_private_post(pw, page, post_url):
-                    self.log("비공개 → 전체 공개 복구 완료", "success")
-                    return
-                self.log("재공개 시도가 끝나지 않았습니다. 감시를 이어갑니다.", "info")
-            except PostingError as exc:
-                if self._stop.is_set() or "중단" in str(exc):
-                    raise
-                self.log(f"재공개 실패(감시 계속): {exc}", "info")
-            except Error as exc:
-                self.log(f"재공개 중 오류(감시 계속): {exc}", "info")
-
+        if self._browser is not None:
+            self._disconnect_only()
         self.log(
             f"비공개 감시 시간({max_min}분)이 지났습니다. 다음 계정으로 진행합니다.",
             "info",
         )
+
+    def _peek_post_private(
+        self, pw, post_url: str, *, reload: bool
+    ) -> bool | None:
+        """잠깐 CDP로 연결해 비공개 여부만 보고 바로 끊는다. None=확인 실패."""
+        if not self._endpoint:
+            return None
+        browser = None
+        try:
+            browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=10_000)
+            page = self._find_velog_page(browser)
+            if page is None and browser.contexts:
+                pages = [p for p in browser.contexts[0].pages if not p.is_closed()]
+                page = pages[-1] if pages else None
+            if page is None:
+                return None
+            url = page.url or ""
+            if reload or not self._is_post_url(url) or post_url not in url:
+                try:
+                    if reload and self._is_post_url(url) and post_url in url:
+                        page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    else:
+                        page.goto(post_url, wait_until="domcontentloaded", timeout=60_000)
+                except Error:
+                    try:
+                        page.goto(post_url, wait_until="domcontentloaded", timeout=60_000)
+                    except Error:
+                        return None
+                self._sleep(_jitter(1.5, 0.5))
+            return self._post_shows_private(page)
+        except Error:
+            return None
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Error:
+                    pass
+            self._browser = None
+            self._context = None
 
     def _open_published_post(self, pw, post_url: str) -> Page | None:
         """발행 URL 탭을 찾아 열고 페이지를 반환한다."""
@@ -3588,7 +3618,6 @@ class VelogPoster:
             return bool(page.evaluate(
                 r"""() => {
                     const text = (document.body && document.body.innerText || '').slice(0, 8000);
-                    // 소유자 액션(수정/삭제)과 함께 비공개 배지가 있을 때
                     const hasOwner =
                       /통계/.test(text) && /수정/.test(text) && /삭제/.test(text);
                     if (!hasOwner) return false;
@@ -3601,23 +3630,58 @@ class VelogPoster:
                         }
                       }
                     }
-                    return /비공개/.test(text) && hasOwner;
+                    return false;
                 }"""
             ))
         except Error:
             return False
 
-    def _republic_private_post(self, pw, page: Page, post_url: str) -> bool:
-        """비공개 글: 수정 → 수정하기 → 전체 공개 → 수정하기 → 비공개 해제 확인."""
-        self._ensure_connected(pw)
+    def _publish_panel_cloudflare_failed(self, page: Page) -> bool:
+        """출간/수정 패널 Cloudflare '확인 실패' 여부."""
         try:
-            page = self._page_by_host("velog.io")
-        except PostingError:
-            page = self._open_published_post(pw, post_url)
-            if page is None:
-                return False
+            return bool(page.evaluate(
+                r"""() => {
+                    const t = (document.body && document.body.innerText || '').slice(0, 6000);
+                    return /확인\s*실패|Verification\s*failed|실패한?\s*인증|Turnstile/i.test(t);
+                }"""
+            ))
+        except Error:
+            return False
 
-        # 1) 게시글 「수정」
+    def _is_publish_button_ready(self, page: Page) -> bool:
+        """data-testid=publish 가 보이고 활성화됐는지."""
+        try:
+            return bool(page.evaluate(
+                """() => {
+                    const btn = document.querySelector('button[data-testid="publish"]');
+                    if (!btn) return false;
+                    const style = window.getComputedStyle(btn);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    if (btn.disabled) return false;
+                    if (/disabled/i.test(btn.className || '')) return false;
+                    if (btn.getAttribute('aria-disabled') === 'true') return false;
+                    const rect = btn.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                }"""
+            ))
+        except Error:
+            return False
+
+    def _republic_private_post(self, pw, post_url: str) -> bool:
+        """비공개 글 재공개. Cloudflare 통과를 위해 패널은 CDP 끊은 뒤 연다.
+
+        성공 조건: 활성화된 수정하기를 실제로 누른 뒤, 게시글 URL에서 비공개가 사라진 것.
+        수정(/write) 화면에 머문 채로는 절대 성공으로 보지 않는다.
+        """
+        if not self._endpoint:
+            return False
+
+        # 1) 잠깐 연결: 게시글 → 수정 진입까지만
+        self._ensure_connected(pw)
+        page = self._open_published_post(pw, post_url)
+        if page is None:
+            return False
+
         clicked = False
         for loc in (
             page.locator("button").filter(has_text=re.compile(r"^수정$")),
@@ -3639,109 +3703,201 @@ class VelogPoster:
             raise PostingError("비공개 글의 수정 버튼을 찾지 못했습니다.")
         self._sleep(_jitter(2.5, 0.8))
 
-        # 2) 에디터 상단 「수정하기」(임시저장 옆)
-        top_edit = None
-        for loc in (
-            page.locator("button.sc-jrQzAO:has-text('수정하기')"),
-            page.locator("button:has-text('수정하기')").filter(
-                has_not=page.locator("[data-testid='publish']"),
-            ),
-            page.get_by_role("button", name="수정하기"),
-        ):
+        # 에디터(/write) 도착 확인
+        on_write = False
+        for _ in range(20):
             try:
-                n = loc.count()
-                for i in range(n):
-                    cand = loc.nth(i)
-                    if not cand.is_visible():
-                        continue
-                    # publish 패널의 수정하기는 아직 아님
-                    try:
-                        testid = cand.get_attribute("data-testid") or ""
-                    except Error:
-                        testid = ""
-                    if testid == "publish":
-                        continue
-                    top_edit = cand
-                    break
-                if top_edit is not None:
-                    break
-            except Error:
-                continue
-        if top_edit is None:
-            raise PostingError("에디터의 수정하기 버튼을 찾지 못했습니다.")
-        try:
-            top_edit.scroll_into_view_if_needed(timeout=5_000)
-        except Error:
-            pass
-        top_edit.click(timeout=15_000)
-        self._sleep(_jitter(1.5, 0.5))
-
-        # 3) 「전체 공개」
-        public_btn = None
-        for loc in (
-            page.locator("button:has(.description:has-text('전체 공개'))"),
-            page.locator("button").filter(has_text=re.compile(r"전체\s*공개")),
-            page.get_by_role("button", name=re.compile(r"전체\s*공개")),
-        ):
-            try:
-                if loc.count() > 0 and loc.first.is_visible():
-                    public_btn = loc.first
-                    break
-            except Error:
-                continue
-        if public_btn is None:
-            raise PostingError("전체 공개 버튼을 찾지 못했습니다.")
-        public_btn.click(timeout=10_000)
-        self._sleep(_jitter(0.8, 0.3))
-
-        # 4) data-testid=publish 「수정하기」
-        publish = page.locator('button[data-testid="publish"]')
-        try:
-            publish.first.wait_for(state="visible", timeout=15_000)
-        except Error as exc:
-            raise PostingError("출간 패널의 수정하기 버튼을 찾지 못했습니다.") from exc
-        for _ in range(30):
-            if self._stop.wait(0):
-                raise PostingError("사용자가 작업을 중단했습니다.")
-            try:
-                if publish.count() > 0 and publish.first.is_visible() and not publish.first.is_disabled():
-                    publish.first.click(timeout=15_000)
+                if "/write" in (page.url or ""):
+                    on_write = True
                     break
             except Error:
                 pass
-            self._sleep(1)
-        else:
-            raise PostingError("출간 패널의 수정하기 버튼이 활성화되지 않았습니다.")
+            self._sleep(0.4)
+        if not on_write:
+            raise PostingError("글 수정 화면으로 이동하지 못했습니다.")
 
-        self.log("전체 공개로 재출간했습니다. 비공개 해제 확인 중...", "info")
-        # 5) 게시글 URL로 돌아와 비공개 UI 사라짐 확인
+        self.log(
+            "수정 화면 진입 — Cloudflare 통과를 위해 자동화 연결을 끊은 뒤 출간 패널을 엽니다...",
+            "info",
+        )
+        self._disconnect_only()
+
+        panel_opened = False
+        public_selected = False
+        clicked_publish = False
+
+        for _ in range(120):  # 약 6분
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            browser = None
+            try:
+                browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
+                page = self._find_velog_page(browser)
+                if page is None:
+                    continue
+
+                url = page.url or ""
+                # 게시글 URL로 돌아왔고 비공개가 아니면 — 단, 수정하기를 누른 뒤에만 성공
+                if clicked_publish and self._is_post_url(url):
+                    if self._has_publish_fail_toast(page):
+                        raise self._publish_fail_error()
+                    if not self._post_shows_private(page):
+                        self.log("재출간 후 게시글에서 비공개가 해제된 것을 확인했습니다.", "success")
+                        return True
+
+                if self._has_publish_fail_toast(page):
+                    raise self._publish_fail_error()
+
+                if self._publish_panel_cloudflare_failed(page):
+                    self.log(
+                        "Cloudflare 확인 실패 — 연결을 끊고 패널을 다시 열어 재시도합니다...",
+                        "info",
+                    )
+                    # 패널 닫고 다시: cancel 또는 페이지 유지 후 다음 루프에서 재오픈
+                    try:
+                        cancel = page.locator('button[data-testid="cancelPublish"]')
+                        if cancel.count() > 0 and cancel.first.is_visible():
+                            cancel.first.click(timeout=5_000)
+                    except Error:
+                        pass
+                    panel_opened = False
+                    public_selected = False
+                    continue
+
+                final = page.locator('button[data-testid="publish"]')
+                final_visible = False
+                try:
+                    final_visible = final.count() > 0 and final.first.is_visible()
+                except Error:
+                    final_visible = False
+
+                if not final_visible:
+                    # 출간 패널 열기: 에디터 상단 「수정하기」(publish 아님)
+                    top = None
+                    for loc in (
+                        page.locator("button:has-text('수정하기')"),
+                        page.get_by_role("button", name="수정하기"),
+                    ):
+                        try:
+                            n = loc.count()
+                            for i in range(n):
+                                cand = loc.nth(i)
+                                if not cand.is_visible():
+                                    continue
+                                testid = cand.get_attribute("data-testid") or ""
+                                if testid == "publish":
+                                    continue
+                                top = cand
+                                break
+                            if top is not None:
+                                break
+                        except Error:
+                            continue
+                    if top is not None:
+                        if not panel_opened:
+                            self.log("출간 패널을 여는 중...", "info")
+                        self._sleep(_jitter(0.4, 0.3))
+                        top.click(timeout=15_000)
+                        panel_opened = True
+                    # 클릭 직후 finally에서 CDP 해제 → Turnstile 통과 유도
+                else:
+                    # 패널 열림: 전체 공개 선택
+                    if not public_selected:
+                        for loc in (
+                            page.locator("button:has(.description:has-text('전체 공개'))"),
+                            page.locator("button").filter(has_text=re.compile(r"전체\s*공개")),
+                        ):
+                            try:
+                                if loc.count() > 0 and loc.first.is_visible():
+                                    loc.first.click(timeout=8_000)
+                                    public_selected = True
+                                    self.log("전체 공개를 선택했습니다.", "info")
+                                    break
+                            except Error:
+                                continue
+
+                    if self._is_publish_button_ready(page) and not clicked_publish:
+                        self.log("인증 통과 확인 → 수정하기(재출간)를 누릅니다.", "info")
+                        self._sleep(_jitter(0.4, 0.3))
+                        final.first.click(timeout=15_000)
+                        clicked_publish = True
+                    elif not self._is_publish_button_ready(page):
+                        # 버튼이 비활성 = Cloudflare 미통과. 성공으로 절대 처리하지 않음
+                        pass
+            except PostingError:
+                raise
+            except (Error, PWTimeoutError):
+                pass
+            finally:
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Error:
+                        pass
+                self._browser = None
+                self._context = None
+
+            if clicked_publish:
+                # 게시글 URL + 비공개 해제까지 확인
+                if self._confirm_republic_public(pw, post_url):
+                    return True
+                # 클릭은 했지만 아직 비공개/수정화면이면 계속 폴링
+            self._sleep(3)
+
+        if not clicked_publish:
+            self.log(
+                "수정하기 버튼이 활성화되지 않았습니다 (Cloudflare 미통과). "
+                "성공으로 처리하지 않고 감시를 이어갑니다.",
+                "info",
+            )
+            return False
+        self.log("재출간 클릭 후 비공개 해제를 확인하지 못했습니다.", "info")
+        return False
+
+    def _confirm_republic_public(self, pw, post_url: str) -> bool:
+        """재출간 클릭 뒤: 게시글 URL에서 비공개가 사라졌는지 확인."""
+        self.log("재출간 후 비공개 해제 확인 중...", "info")
         for _ in range(40):
             if self._stop.wait(1.5):
                 raise PostingError("사용자가 작업을 중단했습니다.")
-            self._ensure_connected(pw)
+            browser = None
             try:
-                page = self._page_by_host("velog.io")
-            except PostingError:
-                page = self._open_published_post(pw, post_url)
+                browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
+                page = self._find_velog_page(browser)
                 if page is None:
                     continue
-            url = page.url or ""
-            if not self._is_post_url(url):
-                try:
-                    self._goto(page, post_url)
-                    self._sleep(_jitter(1.5, 0.5))
-                except Error:
+                if self._has_publish_fail_toast(page):
+                    raise self._publish_fail_error()
+                url = page.url or ""
+                # /write 에 남아 있으면 아직 실패/진행 중 — 성공 아님
+                if "/write" in url:
                     continue
-            if not self._post_shows_private(page):
-                # 좋아요 버튼 등 공개 뷰 힌트
-                try:
-                    like = page.locator('[data-testid="like-btn"]')
-                    if like.count() > 0 and like.first.is_visible():
-                        return True
-                except Error:
-                    pass
+                if not self._is_post_url(url):
+                    try:
+                        page.goto(post_url, wait_until="domcontentloaded", timeout=60_000)
+                        self._sleep(1.2)
+                    except Error:
+                        continue
+                    url = page.url or ""
+                if not self._is_post_url(url):
+                    continue
+                if self._post_shows_private(page):
+                    continue
+                # 게시글 + 비공개 없음 = 성공
                 return True
-        return not self._post_shows_private(page)
+            except PostingError:
+                raise
+            except (Error, PWTimeoutError):
+                pass
+            finally:
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Error:
+                        pass
+                self._browser = None
+                self._context = None
+        return False
 
     @staticmethod
     def _is_post_url(url: str) -> bool:
