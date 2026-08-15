@@ -437,6 +437,8 @@ class VelogPoster:
         signed_up_emails: set[str] | None = None,
         on_signup=None,
         on_account=None,
+        account_wait_min: float = 100.0,
+        account_wait_max: float = 200.0,
     ) -> None:
         self._emit = log
         self._prefix = ""  # 진행 중 계정 번호 표시 (예: "[2/5] ")
@@ -448,6 +450,14 @@ class VelogPoster:
         self.on_failed = on_failed
         self.on_signup = on_signup
         self.on_account = on_account
+        lo = float(account_wait_min)
+        hi = float(account_wait_max)
+        if lo < 0:
+            lo = 0.0
+        if hi < lo:
+            hi = lo
+        self._account_wait_min = lo
+        self._account_wait_max = hi
         self._signed_up_emails = {
             str(e).strip().lower() for e in (signed_up_emails or set()) if str(e).strip()
         }
@@ -533,13 +543,20 @@ class VelogPoster:
                     self._emit("", "working")
 
                 if index < total and not self._stop.is_set():
-                    # 계정 간 간격을 사람처럼 불규칙하게 (봇 패턴 완화)
+                    # 발행 성공/실패 후 다음 계정까지 대기 (설정값 범위에서 무작위)
+                    wait_s = _human_delay(self._account_wait_min, self._account_wait_max)
                     if self._image_skip_remaining > 0 or self._image_fail_streak > 0:
-                        wait_s = _human_delay(18, 42)
-                        self._wait(f"다음 계정 전 대기(이미지 제한 완화) {wait_s:.0f}초...", wait_s)
+                        self._wait(
+                            f"다음 계정 전 대기(이미지 제한 완화) {wait_s:.0f}초 "
+                            f"({self._account_wait_min:.0f}~{self._account_wait_max:.0f})...",
+                            wait_s,
+                        )
                     else:
-                        wait_s = _human_delay(12, 35)
-                        self._wait(f"다음 계정 전 대기 {wait_s:.0f}초...", wait_s)
+                        self._wait(
+                            f"다음 계정 전 대기 {wait_s:.0f}초 "
+                            f"({self._account_wait_min:.0f}~{self._account_wait_max:.0f})...",
+                            wait_s,
+                        )
 
         self._prefix = ""
         self._emit("", "working")
@@ -612,7 +629,7 @@ class VelogPoster:
         if not is_signup:
             self.log("로그인 중.. (기존 계정)", "info")
         elif profile_name:
-            self._set_blog_title(page, profile_name)
+            self._set_blog_title(page, profile_name, image_folder=image_folder)
         image_link = random.choice(homepages) if (image_folder and homepages) else ""
         target = self._write_post(
             self._first_page(),
@@ -760,7 +777,7 @@ class VelogPoster:
         if not is_signup:
             self.log("로그인 중.. (기존 계정)", "info")
         elif profile_name:
-            self._set_blog_title(velog, profile_name)
+            self._set_blog_title(velog, profile_name, image_folder=image_folder)
 
         image_link = random.choice(homepages) if (image_folder and homepages) else ""
         target = self._write_post(
@@ -781,6 +798,17 @@ class VelogPoster:
                 self.on_result(email, url)
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            watch_max = int(account.get("watch_max_min", 20) or 20)
+        except (TypeError, ValueError):
+            watch_max = 20
+        try:
+            watch_interval = int(account.get("watch_interval_min", 5) or 5)
+        except (TypeError, ValueError):
+            watch_interval = 5
+        self._watch_and_republic_if_private(
+            pw, url, max_min=watch_max, interval_min=watch_interval,
+        )
 
     def _run_one_guerrilla(self, pw, chrome: Path, account: dict[str, str]) -> None:
         """Guerrilla Mail 임시메일 → 벨로그 가입/로그인 → 작성 → 출간."""
@@ -828,7 +856,7 @@ class VelogPoster:
         if not is_signup:
             self.log("로그인 중.. (기존 계정)", "info")
         elif profile_name:
-            self._set_blog_title(velog, profile_name)
+            self._set_blog_title(velog, profile_name, image_folder=image_folder)
 
         image_link = random.choice(homepages) if (image_folder and homepages) else ""
         target = self._write_post(
@@ -885,7 +913,7 @@ class VelogPoster:
         mail = self._first_page()
         self._inject_stealth(mail)
         self._naver_login(pw, mail, naver_id, naver_pw)
-        self._naver_open_inbox(pw, mail)
+        self._naver_open_inbox(pw, mail, naver_id, naver_pw)
 
         self._ensure_connected(pw)
         assert self._context is not None
@@ -904,7 +932,7 @@ class VelogPoster:
         if not is_signup:
             self.log("로그인 중.. (기존 계정)", "info")
         elif profile_name:
-            self._set_blog_title(velog, profile_name)
+            self._set_blog_title(velog, profile_name, image_folder=image_folder)
 
         image_link = random.choice(homepages) if (image_folder and homepages) else ""
         target = self._write_post(
@@ -2002,28 +2030,29 @@ class VelogPoster:
 
     # -- 네이버 메일 ----------------------------------------------------
     def _naver_mail_page(self) -> Page:
-        for host in ("mail.naver.com", "nid.naver.com", "naver.com"):
+        """메일/로그인 탭을 hostname 기준으로 찾는다 (URL 쿼리의 mail 주소에 속지 않음)."""
+        for host in ("mail.naver.com", "nid.naver.com", "www.naver.com", "naver.com"):
             try:
                 return self._page_by_host(host)
             except PostingError:
                 continue
         return self._first_page()
 
-    def _naver_fill_credentials(self, page: Page, naver_id: str, naver_pw: str) -> None:
-        def fill(selectors: list[str], value: str) -> bool:
-            for sel in selectors:
-                try:
-                    loc = page.locator(sel)
-                    if loc.count() == 0 or not loc.first.is_visible():
-                        continue
-                    loc.first.click(timeout=5_000)
-                    self._sleep(0.15)
-                    page.keyboard.press("Control+A")
-                    page.keyboard.press("Backspace")
-                    self._type_like_human(page, value)
-                    return True
-                except Error:
+    def _naver_fill_field(self, page: Page, selectors: list[str], value: str) -> bool:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if loc.count() == 0 or not loc.first.is_visible():
                     continue
+                loc.first.click(timeout=5_000)
+                self._sleep(0.15)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                self._type_like_human(page, value)
+                return True
+            except Error:
+                continue
+        try:
             return bool(page.evaluate(
                 """(sels, val) => {
                     for (const s of sels) {
@@ -2043,12 +2072,74 @@ class VelogPoster:
                 selectors,
                 value,
             ))
+        except Error:
+            return False
 
-        if not fill(["#id", 'input[name="id"]', 'input[autocomplete="username"]'], naver_id):
+    def _naver_read_id_value(self, page: Page) -> str:
+        try:
+            return str(page.evaluate(
+                """() => {
+                    const el = document.querySelector(
+                      'input#id, input[name="id"], input[autocomplete="username"]'
+                    );
+                    return (el && el.value) ? String(el.value) : '';
+                }"""
+            ) or "").strip()
+        except Error:
+            return ""
+
+    def _naver_fill_credentials(self, page: Page, naver_id: str, naver_pw: str) -> None:
+        if not self._naver_fill_field(
+            page, ["#id", 'input[name="id"]', 'input[autocomplete="username"]'], naver_id
+        ):
             raise PostingError("네이버 아이디 입력칸을 찾지 못했습니다.")
         self._sleep(_jitter(0.35, 0.2))
-        if not fill(["#pw", 'input[name="pw"]', 'input[type="password"]'], naver_pw):
+        if not self._naver_fill_field(
+            page, ["#pw", 'input[name="pw"]', 'input[type="password"]'], naver_pw
+        ):
             raise PostingError("네이버 비밀번호 입력칸을 찾지 못했습니다.")
+
+    def _naver_click_login(self, page: Page) -> None:
+        try:
+            page.keyboard.press("Enter")
+            return
+        except Error:
+            pass
+        btn = page.locator('#log\\.login, button[type="submit"], .btn_login')
+        if btn.count() > 0:
+            btn.first.click(timeout=5_000)
+
+    def _naver_relogin_password_only(
+        self, page: Page, naver_id: str, naver_pw: str
+    ) -> None:
+        """캡챠 후 다시 뜬 로그인 폼: 아이디는 비었을 때만, 비밀번호는 다시 입력."""
+        self.log("캡챠 후 로그인 화면 — 비밀번호 재입력 후 로그인합니다.", "info")
+        self._naver_turn_off_ip_security(page)
+        self._sleep(0.3)
+        if not self._naver_read_id_value(page) and naver_id:
+            if not self._naver_fill_field(
+                page,
+                ["#id", 'input[name="id"]', 'input[autocomplete="username"]'],
+                naver_id,
+            ):
+                raise PostingError("네이버 아이디 입력칸을 찾지 못했습니다.")
+            self._sleep(_jitter(0.3, 0.15))
+        if not self._naver_fill_field(
+            page, ["#pw", 'input[name="pw"]', 'input[type="password"]'], naver_pw
+        ):
+            raise PostingError("네이버 비밀번호 입력칸을 찾지 못했습니다.")
+        self._sleep(_jitter(0.35, 0.2))
+        self._naver_click_login(page)
+
+    def _naver_attach_browser(self, browser) -> None:
+        self._browser = browser
+        self._handoff = False
+        self._context = browser.contexts[0] if browser.contexts else None
+        if self._context is not None:
+            try:
+                self._context.add_init_script(STEALTH_SCRIPT)
+            except Error:
+                pass
 
     def _naver_turn_off_ip_security(self, page: Page) -> None:
         try:
@@ -2090,53 +2181,233 @@ class VelogPoster:
                 }"""
             ))
         except Error:
-            return "nid.naver.com" in (page.url or "").lower()
+            host = urlparse(page.url or "").netloc.lower()
+            return "nid.naver.com" in host
+
+    @staticmethod
+    def _naver_page_host(page: Page) -> str:
+        try:
+            return urlparse(page.url or "").netloc.lower()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _naver_is_auth_challenge(self, page: Page) -> bool:
+        """캡챠·OTP·기기확인 등 2차 인증 화면인지."""
+        host = self._naver_page_host(page)
+        # 메일함이면 인증 화면이 아님 (쿼리에 mail URL이 있어도 hostname 기준)
+        if host == "mail.naver.com" or host.endswith(".mail.naver.com"):
+            return False
+        path_q = ((page.url or "").split("?", 1)[0] + "?" + urlparse(page.url or "").query).lower()
+        # hostname만 보고 nid 계열인지
+        on_nid = "nid.naver.com" in host or host.startswith("nid.")
+        challenge_bits = (
+            "/challenge", "otp", "captcha", "releaseprotect", "idsafety",
+            "deviceconfirm", "2step", "twostep", "reauth", "certify",
+            "ext/cert", "login/ext",
+        )
+        if on_nid and any(bit in path_q for bit in challenge_bits):
+            return True
+        try:
+            return bool(page.evaluate(
+                r"""() => {
+                    const t = (document.body && document.body.innerText || '').slice(0, 3500);
+                    return /보안을\s*위해\s*추가|추가\s*확인|추가\s*인증|정답을\s*입력|보안문자|자동입력\s*방지|캡차|캡챠|일회용\s*번호|인증번호|2단계\s*인증|기기\s*확인|OTP|등록된\s*기기|새로운\s*기기|영수증/.test(t);
+                }"""
+            ))
+        except Error:
+            return on_nid and not self._naver_still_on_login(page)
+
+    def _naver_login_complete(self, page: Page) -> bool:
+        """수동 캡챠/2차 인증까지 끝나 로그인된 상태인지."""
+        if self._naver_still_on_login(page):
+            return False
+        if self._naver_is_auth_challenge(page):
+            return False
+        host = self._naver_page_host(page)
+        # 로그인 URL 쿼리에 mail.naver.com 이 있어도 hostname이 nid면 미완료
+        if host == "mail.naver.com" or host.endswith(".mail.naver.com"):
+            return True
+        if "nid.naver.com" in host or host.startswith("nid."):
+            return False
+        if host in {"www.naver.com", "naver.com"}:
+            return True
+        return False
+
+    def _naver_find_page(self, browser, hosts: tuple[str, ...]):
+        """hostname(netloc) 기준으로 탭을 찾는다. URL 쿼리 문자열은 무시."""
+        for host in hosts:
+            host_l = host.lower()
+            for ctx in browser.contexts:
+                for page in reversed(list(ctx.pages)):
+                    try:
+                        if page.is_closed():
+                            continue
+                        netloc = urlparse(page.url or "").netloc.lower()
+                        if netloc == host_l or netloc.endswith("." + host_l):
+                            return page
+                    except Error:
+                        continue
+        return None
+
+    def _naver_wait_manual_login(
+        self, pw, naver_id: str = "", naver_pw: str = ""
+    ) -> None:
+        """CDP를 끊고 캡챠/2차 인증을 사용자가 끝낼 때까지 기다린 뒤 재연결한다.
+
+        캡챠 후 로그인 폼이 다시 뜨면 비밀번호만 재입력해 로그인한다.
+        """
+        self.log(
+            "캡챠·2차 인증이 뜨면 브라우저에서 직접 완료해 주세요. "
+            "끝나면 비밀번호를 다시 넣고 메일함으로 진행합니다.",
+            "info",
+        )
+        if self._browser is not None:
+            self._disconnect_only()
+        if not self._endpoint:
+            raise PostingError("네이버 로그인 대기 중 브라우저 연결이 없습니다.")
+
+        last_relogin_at = -999
+        for index in range(240):  # 약 8분 (2초 간격)
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            self._sleep(2)
+            browser = None
+            kept = False
+            try:
+                browser = pw.chromium.connect_over_cdp(self._endpoint, timeout=8_000)
+                page = self._naver_find_page(
+                    browser,
+                    ("mail.naver.com", "nid.naver.com", "www.naver.com", "naver.com"),
+                )
+                if page is None and browser.contexts:
+                    pages = [p for p in browser.contexts[0].pages if not p.is_closed()]
+                    page = pages[0] if pages else None
+
+                if page is not None and self._naver_login_complete(page):
+                    self._naver_attach_browser(browser)
+                    kept = True
+                    self.log("네이버 로그인 완료 — 다음 단계로 진행합니다.", "success")
+                    return
+
+                # 캡챠 종료 후 다시 로그인 폼 → 비밀번호만 재입력
+                if (
+                    page is not None
+                    and naver_pw
+                    and self._naver_still_on_login(page)
+                    and not self._naver_is_auth_challenge(page)
+                    and (index - last_relogin_at) >= 4
+                ):
+                    self._naver_attach_browser(browser)
+                    kept = True
+                    last_relogin_at = index
+                    try:
+                        self._naver_relogin_password_only(page, naver_id, naver_pw)
+                    except PostingError as exc:
+                        self.log(str(exc), "warn")
+                        self._disconnect_only()
+                        kept = False
+                        continue
+                    self._sleep(_jitter(2.0, 0.6))
+                    try:
+                        page = self._naver_mail_page()
+                    except PostingError:
+                        page = self._first_page()
+                    if self._naver_login_complete(page):
+                        self.log("네이버 로그인 완료 — 다음 단계로 진행합니다.", "success")
+                        return
+                    if self._naver_is_auth_challenge(page):
+                        self.log(
+                            "추가 보안 확인이 다시 떴습니다. 브라우저에서 완료해 주세요.",
+                            "info",
+                        )
+                        self._disconnect_only()
+                        kept = False
+                        continue
+                    # 아직 로그인 폼이면 CDP만 끊고 다음 재시도를 기다린다
+                    self._disconnect_only()
+                    kept = False
+                    continue
+
+                if page is not None and index in {5, 15, 30, 60, 90, 150}:
+                    if self._naver_is_auth_challenge(page):
+                        self.log(
+                            "보안 추가 확인/캡챠 완료를 기다리는 중... (끝나면 자동 진행)",
+                            "info",
+                        )
+                    elif self._naver_still_on_login(page):
+                        self.log(
+                            "로그인 화면 대기 중 — 비밀번호 재입력을 시도합니다...",
+                            "info",
+                        )
+                    else:
+                        self.log(
+                            f"로그인 대기 중... (현재: {self._naver_page_host(page) or page.url[:60]})",
+                            "info",
+                        )
+            except Error:
+                pass
+            finally:
+                if browser is not None and not kept:
+                    try:
+                        browser.close()
+                    except Error:
+                        pass
+        raise PostingError(
+            "네이버 로그인 시간 초과 — 캡챠·2차 인증을 완료했는지 확인해 주세요."
+        )
 
     def _naver_login(self, pw, page: Page, naver_id: str, naver_pw: str) -> None:
         self.log(f"네이버 로그인 중... ({naver_id})", "info")
-        if "nid.naver.com" not in (page.url or "").lower():
+        if "nid.naver.com" not in self._naver_page_host(page):
             self._goto(page, NAVER_LOGIN_URL)
         self._wait("네이버 로그인 화면 준비 중...", _jitter(2.0, 0.8))
         self._naver_turn_off_ip_security(page)
         self._sleep(0.4)
         self._naver_fill_credentials(page, naver_id, naver_pw)
         self._sleep(_jitter(0.4, 0.25))
+        self._naver_click_login(page)
+
+        # 캡챠 없이 바로 통과한 경우만 짧게 확인 (쿼리의 mail URL에 속지 않음)
+        self._sleep(_jitter(1.5, 0.5))
         try:
-            page.keyboard.press("Enter")
+            page = self._first_page()
+            for p in reversed(list(self._context.pages if self._context else [])):
+                host = self._naver_page_host(p)
+                if "nid.naver.com" in host or host.endswith("mail.naver.com"):
+                    page = p
+                    break
         except Error:
-            btn = page.locator('#log\\.login, button[type="submit"], .btn_login')
-            if btn.count() > 0:
-                btn.first.click(timeout=5_000)
+            page = self._first_page()
+        if self._naver_is_auth_challenge(page) or self._naver_still_on_login(page):
+            self._naver_wait_manual_login(pw, naver_id, naver_pw)
+            return
+        if self._naver_login_complete(page):
+            self.log("네이버 로그인 완료", "success")
+            return
+        self._naver_wait_manual_login(pw, naver_id, naver_pw)
 
-        self.log("캡챠·추가 인증이 뜨면 브라우저에서 직접 완료해 주세요.", "info")
-        for i in range(90):  # 최대 약 3분
-            if self._stop.wait(0):
-                raise PostingError("사용자가 작업을 중단했습니다.")
-            self._sleep(2)
-            try:
-                page = self._naver_mail_page()
-            except PostingError:
-                page = self._first_page()
-            if not self._naver_still_on_login(page):
-                self.log("네이버 로그인 완료", "success")
-                self._sleep(_jitter(1.2, 0.5))
-                return
-            if i in {10, 20, 40}:
-                self.log("아직 로그인 화면입니다. 캡챠/2단계 인증을 확인해 주세요.", "info")
-        raise PostingError("네이버 로그인 시간 초과 (캡챠·2단계 인증 확인 필요)")
-
-    def _naver_open_inbox(self, pw, page: Page) -> None:
+    def _naver_open_inbox(
+        self, pw, page: Page, naver_id: str = "", naver_pw: str = ""
+    ) -> None:
         self.log("네이버 메일함으로 이동하는 중...", "info")
         self._ensure_connected(pw)
         page = self._naver_mail_page()
+        # 보안 추가 확인(캡챠) 중이면 절대 메일로 이동하지 않는다
+        if self._naver_still_on_login(page) or self._naver_is_auth_challenge(page):
+            self.log("보안 추가 확인 화면입니다. 완료될 때까지 메일함으로 이동하지 않습니다.", "info")
+            self._naver_wait_manual_login(pw, naver_id, naver_pw)
+            self._ensure_connected(pw)
+            page = self._naver_mail_page()
+        if self._naver_still_on_login(page) or self._naver_is_auth_challenge(page):
+            raise PostingError("네이버 보안 추가 확인이 끝나지 않았습니다.")
         try:
             self._goto(page, NAVER_MAIL_INBOX)
         except Error:
             self._goto(page, NAVER_MAIL_HOME)
         self._wait("메일함 로딩 중...", _jitter(3.5, 1.0))
         page = self._naver_mail_page()
-        if self._naver_still_on_login(page):
-            raise PostingError("네이버 메일함 진입에 실패했습니다. 로그인 상태를 확인해 주세요.")
+        if self._naver_still_on_login(page) or self._naver_is_auth_challenge(page):
+            raise PostingError("네이버 메일함 진입에 실패했습니다. 로그인·2차 인증을 확인해 주세요.")
 
     def _wait_naver_velog_mail(self, page: Page) -> str:
         self.log("네이버 메일함에서 벨로그 인증 메일을 기다리는 중...", "info")
@@ -2418,13 +2689,157 @@ class VelogPoster:
                 return True
         return False
 
-    def _set_blog_title(self, page: Page, title: str) -> None:
-        """신규 가입 직후 설정 페이지에서 벨로그 제목을 프로필 이름으로 바꾼다."""
-        self.log("벨로그 제목을 설정하는 중...", "info")
+    def _setting_profile_upload_state(self, page: Page) -> str:
+        """설정 페이지 프로필 업로드 버튼 상태: uploading | ready | other."""
+        try:
+            return str(page.evaluate(
+                """() => {
+                    const area = document.querySelector(
+                      '[class*="SettingUserProfile_thumbnailArea"], [class*="SettingUserProfile"]'
+                    ) || document.body;
+                    const buttons = Array.from(area.querySelectorAll('button'));
+                    const norm = (b) => (b.innerText || '').replace(/\\s+/g, '');
+                    if (buttons.some(b => /업로드중/.test(norm(b)))) return 'uploading';
+                    const ready = buttons.find(b => {
+                      const t = norm(b);
+                      if (t !== '이미지업로드') return false;
+                      if (b.disabled) return false;
+                      if (/disabled/i.test(b.className || '')) return false;
+                      return true;
+                    });
+                    return ready ? 'ready' : 'other';
+                }"""
+            ) or "other")
+        except Error:
+            return "other"
+
+    def _upload_setting_profile_image(self, page: Page, folder: str) -> None:
+        """설정 > 프로필 썸네일에 이미지 폴더의 랜덤 이미지를 올린다."""
+        images = self._list_upload_images(folder)
+        if not images:
+            self.log("프로필 이미지: 사용할 이미지가 없어 건너뜁니다.", "info")
+            return
+
+        chosen = random.choice(images)
+        upload_path = self._prepare_image_for_upload(chosen)
+        self.log(f"프로필 이미지를 등록하는 중: {chosen.name}", "info")
+
+        area = page.locator(
+            '[class*="SettingUserProfile_thumbnailArea"], [class*="SettingUserProfile"]'
+        ).first
+        try:
+            area.wait_for(state="visible", timeout=12_000)
+        except Error:
+            pass
+
+        upload_btn = None
+        for root in (area, page.locator("body")):
+            loc = root.get_by_role("button", name="이미지 업로드")
+            try:
+                if loc.count() > 0 and loc.first.is_visible():
+                    upload_btn = loc.first
+                    break
+            except Error:
+                continue
+        if upload_btn is None:
+            loc = page.locator('button:has-text("이미지 업로드")')
+            try:
+                if loc.count() > 0 and loc.first.is_visible():
+                    upload_btn = loc.first
+            except Error:
+                pass
+        if upload_btn is None:
+            raise PostingError("설정 페이지의 이미지 업로드 버튼을 찾지 못했습니다.")
+
+        try:
+            upload_btn.scroll_into_view_if_needed(timeout=5_000)
+        except Error:
+            pass
+
+        before_src = ""
+        try:
+            before_src = str(page.evaluate(
+                """() => {
+                    const img = document.querySelector(
+                      '[class*="SettingUserProfile"] img[alt="profile"], '
+                      + '[class*="SettingUserProfile_thumbnail"] img'
+                    );
+                    return img ? (img.currentSrc || img.src || '') : '';
+                }"""
+            ) or "")
+        except Error:
+            pass
+
+        try:
+            with page.expect_file_chooser(timeout=15_000) as fc:
+                upload_btn.click()
+            fc.value.set_files(str(upload_path))
+        except (Error, PWTimeoutError) as exc:
+            raise PostingError("프로필 이미지 파일 선택창을 열지 못했습니다.") from exc
+
+        self.log("프로필 이미지 업로드 완료를 기다리는 중...", "info")
+        saw_uploading = False
+        for _ in range(90):
+            self._sleep(1)
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            state = self._setting_profile_upload_state(page)
+            if state == "uploading":
+                saw_uploading = True
+                continue
+            if state == "ready" and saw_uploading:
+                break
+            # 업로드가 너무 빨라 uploading 을 못 본 경우: 썸네일 URL 변화로 확인
+            if state == "ready":
+                try:
+                    after_src = str(page.evaluate(
+                        """() => {
+                            const img = document.querySelector(
+                              '[class*="SettingUserProfile"] img[alt="profile"], '
+                              + '[class*="SettingUserProfile_thumbnail"] img'
+                            );
+                            return img ? (img.currentSrc || img.src || '') : '';
+                        }"""
+                    ) or "")
+                except Error:
+                    after_src = ""
+                if after_src and after_src != before_src and "user-thumbnail.png" not in after_src:
+                    break
+                if saw_uploading:
+                    break
+        else:
+            raise PostingError("프로필 이미지 업로드가 시간 안에 끝나지 않았습니다.")
+
+        # 업로드중 → 이미지 업로드 복귀 한 번 더 확인
+        if self._setting_profile_upload_state(page) != "ready":
+            for _ in range(15):
+                self._sleep(0.5)
+                if self._setting_profile_upload_state(page) == "ready":
+                    break
+            else:
+                raise PostingError("프로필 이미지 업로드 버튼이 복귀하지 않았습니다.")
+
+        self._remember_image(chosen)
+        self.log("프로필 이미지 등록 완료", "success")
+        self._sleep(_jitter(0.6, 0.3))
+
+    def _set_blog_title(
+        self, page: Page, title: str, *, image_folder: str = ""
+    ) -> None:
+        """신규 가입 직후 설정에서 프로필 이미지(선택) → 벨로그 제목을 바꾼다."""
         try:
             self._goto(page, "https://velog.io/setting")
             self._sleep(_jitter(2, 0.5))
 
+            if image_folder.strip():
+                try:
+                    self._upload_setting_profile_image(page, image_folder.strip())
+                except PostingError as exc:
+                    self.log(f"프로필 이미지 등록 실패(제목 설정은 계속): {exc}", "info")
+                except Error as exc:
+                    self.log(f"프로필 이미지 등록 실패(제목 설정은 계속): {exc}", "info")
+
+            self.log("벨로그 제목을 설정하는 중...", "info")
             row = page.locator('div[class*="SettingRow"]').filter(
                 has=page.locator('h3', has_text="벨로그 제목"),
             ).first
@@ -3052,9 +3467,283 @@ class VelogPoster:
         )
         return None
 
+    def _watch_and_republic_if_private(
+        self,
+        pw,
+        post_url: str,
+        *,
+        max_min: int = 20,
+        interval_min: int = 5,
+    ) -> None:
+        """출간 후 Chrome을 유지한 채 발행 URL을 감시하고, 비공개면 재공개한다."""
+        max_min = max(1, min(180, int(max_min or 20)))
+        interval_min = max(1, min(60, int(interval_min or 5)))
+        if interval_min > max_min:
+            interval_min = max_min
+        deadline = time.monotonic() + max_min * 60
+        interval_s = interval_min * 60
+
+        self.log(
+            f"발행 URL 비공개 감시 시작 (최대 {max_min}분, {interval_min}분마다 새로고침)",
+            "info",
+        )
+        self._ensure_connected(pw)
+        page = self._open_published_post(pw, post_url)
+        if page is None:
+            self.log("발행 URL 탭을 열지 못해 비공개 감시를 건너뜁니다.", "info")
+            return
+
+        # 첫 확인은 즉시, 이후 간격마다 새로고침
+        first = True
+        while time.monotonic() < deadline:
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            if not first:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                wait_s = min(interval_s, left)
+                self._wait(
+                    f"다음 새로고침까지 대기 ({wait_s / 60:.1f}분)...",
+                    wait_s,
+                )
+                if self._stop.wait(0):
+                    raise PostingError("사용자가 작업을 중단했습니다.")
+                self._ensure_connected(pw)
+                page = self._open_published_post(pw, post_url)
+                if page is None:
+                    self.log("발행 URL 탭을 다시 열지 못했습니다. 감시 종료.", "info")
+                    return
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=60_000)
+                except Error:
+                    try:
+                        self._goto(page, post_url)
+                    except Error as exc:
+                        self.log(f"새로고침 실패: {exc}", "info")
+                        first = False
+                        continue
+                self._sleep(_jitter(2.0, 0.8))
+            first = False
+
+            try:
+                page = self._page_by_host("velog.io")
+            except PostingError:
+                page = self._open_published_post(pw, post_url)
+                if page is None:
+                    continue
+
+            if not self._post_shows_private(page):
+                remaining = max(0, deadline - time.monotonic())
+                self.log(
+                    f"비공개 아님 — 계속 감시합니다 (남은 {remaining / 60:.1f}분)",
+                    "info",
+                )
+                continue
+
+            self.log("비공개가 감지되었습니다. 전체 공개로 복구합니다...", "info")
+            try:
+                if self._republic_private_post(pw, page, post_url):
+                    self.log("비공개 → 전체 공개 복구 완료", "success")
+                    return
+                self.log("재공개 시도가 끝나지 않았습니다. 감시를 이어갑니다.", "info")
+            except PostingError as exc:
+                if self._stop.is_set() or "중단" in str(exc):
+                    raise
+                self.log(f"재공개 실패(감시 계속): {exc}", "info")
+            except Error as exc:
+                self.log(f"재공개 중 오류(감시 계속): {exc}", "info")
+
+        self.log(
+            f"비공개 감시 시간({max_min}분)이 지났습니다. 다음 계정으로 진행합니다.",
+            "info",
+        )
+
+    def _open_published_post(self, pw, post_url: str) -> Page | None:
+        """발행 URL 탭을 찾아 열고 페이지를 반환한다."""
+        self._ensure_connected(pw)
+        if self._context is None:
+            return None
+        page = None
+        try:
+            page = self._page_by_host("velog.io")
+        except PostingError:
+            try:
+                page = self._context.new_page()
+                self._inject_stealth(page)
+            except Error:
+                return None
+        try:
+            if not self._is_post_url(page.url or "") or (post_url and post_url not in (page.url or "")):
+                self._goto(page, post_url)
+                self._sleep(_jitter(2.0, 0.8))
+        except Error as exc:
+            self.log(f"발행 URL 이동 실패: {exc}", "info")
+            return None
+        return page
+
+    def _post_shows_private(self, page: Page) -> bool:
+        """본인 글 화면에서 「비공개」 잠금 UI가 보이는지."""
+        try:
+            return bool(page.evaluate(
+                r"""() => {
+                    const text = (document.body && document.body.innerText || '').slice(0, 8000);
+                    // 소유자 액션(수정/삭제)과 함께 비공개 배지가 있을 때
+                    const hasOwner =
+                      /통계/.test(text) && /수정/.test(text) && /삭제/.test(text);
+                    if (!hasOwner) return false;
+                    const nodes = Array.from(document.querySelectorAll('div, span, button'));
+                    for (const el of nodes) {
+                      const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+                      if (t === '비공개' || /^비공개$/.test(t)) {
+                        if (el.offsetParent !== null || el.getClientRects().length) {
+                          return true;
+                        }
+                      }
+                    }
+                    return /비공개/.test(text) && hasOwner;
+                }"""
+            ))
+        except Error:
+            return False
+
+    def _republic_private_post(self, pw, page: Page, post_url: str) -> bool:
+        """비공개 글: 수정 → 수정하기 → 전체 공개 → 수정하기 → 비공개 해제 확인."""
+        self._ensure_connected(pw)
+        try:
+            page = self._page_by_host("velog.io")
+        except PostingError:
+            page = self._open_published_post(pw, post_url)
+            if page is None:
+                return False
+
+        # 1) 게시글 「수정」
+        clicked = False
+        for loc in (
+            page.locator("button").filter(has_text=re.compile(r"^수정$")),
+            page.get_by_role("button", name="수정"),
+            page.locator("button:has-text('수정')"),
+        ):
+            try:
+                if loc.count() == 0:
+                    continue
+                btn = loc.first
+                if btn.is_visible():
+                    btn.scroll_into_view_if_needed(timeout=5_000)
+                    btn.click(timeout=10_000)
+                    clicked = True
+                    break
+            except Error:
+                continue
+        if not clicked:
+            raise PostingError("비공개 글의 수정 버튼을 찾지 못했습니다.")
+        self._sleep(_jitter(2.5, 0.8))
+
+        # 2) 에디터 상단 「수정하기」(임시저장 옆)
+        top_edit = None
+        for loc in (
+            page.locator("button.sc-jrQzAO:has-text('수정하기')"),
+            page.locator("button:has-text('수정하기')").filter(
+                has_not=page.locator("[data-testid='publish']"),
+            ),
+            page.get_by_role("button", name="수정하기"),
+        ):
+            try:
+                n = loc.count()
+                for i in range(n):
+                    cand = loc.nth(i)
+                    if not cand.is_visible():
+                        continue
+                    # publish 패널의 수정하기는 아직 아님
+                    try:
+                        testid = cand.get_attribute("data-testid") or ""
+                    except Error:
+                        testid = ""
+                    if testid == "publish":
+                        continue
+                    top_edit = cand
+                    break
+                if top_edit is not None:
+                    break
+            except Error:
+                continue
+        if top_edit is None:
+            raise PostingError("에디터의 수정하기 버튼을 찾지 못했습니다.")
+        try:
+            top_edit.scroll_into_view_if_needed(timeout=5_000)
+        except Error:
+            pass
+        top_edit.click(timeout=15_000)
+        self._sleep(_jitter(1.5, 0.5))
+
+        # 3) 「전체 공개」
+        public_btn = None
+        for loc in (
+            page.locator("button:has(.description:has-text('전체 공개'))"),
+            page.locator("button").filter(has_text=re.compile(r"전체\s*공개")),
+            page.get_by_role("button", name=re.compile(r"전체\s*공개")),
+        ):
+            try:
+                if loc.count() > 0 and loc.first.is_visible():
+                    public_btn = loc.first
+                    break
+            except Error:
+                continue
+        if public_btn is None:
+            raise PostingError("전체 공개 버튼을 찾지 못했습니다.")
+        public_btn.click(timeout=10_000)
+        self._sleep(_jitter(0.8, 0.3))
+
+        # 4) data-testid=publish 「수정하기」
+        publish = page.locator('button[data-testid="publish"]')
+        try:
+            publish.first.wait_for(state="visible", timeout=15_000)
+        except Error as exc:
+            raise PostingError("출간 패널의 수정하기 버튼을 찾지 못했습니다.") from exc
+        for _ in range(30):
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            try:
+                if publish.count() > 0 and publish.first.is_visible() and not publish.first.is_disabled():
+                    publish.first.click(timeout=15_000)
+                    break
+            except Error:
+                pass
+            self._sleep(1)
+        else:
+            raise PostingError("출간 패널의 수정하기 버튼이 활성화되지 않았습니다.")
+
+        self.log("전체 공개로 재출간했습니다. 비공개 해제 확인 중...", "info")
+        # 5) 게시글 URL로 돌아와 비공개 UI 사라짐 확인
+        for _ in range(40):
+            if self._stop.wait(1.5):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            self._ensure_connected(pw)
+            try:
+                page = self._page_by_host("velog.io")
+            except PostingError:
+                page = self._open_published_post(pw, post_url)
+                if page is None:
+                    continue
+            url = page.url or ""
+            if not self._is_post_url(url):
+                try:
+                    self._goto(page, post_url)
+                    self._sleep(_jitter(1.5, 0.5))
+                except Error:
+                    continue
+            if not self._post_shows_private(page):
+                # 좋아요 버튼 등 공개 뷰 힌트
+                try:
+                    like = page.locator('[data-testid="like-btn"]')
+                    if like.count() > 0 and like.first.is_visible():
+                        return True
+                except Error:
+                    pass
+                return True
+        return not self._post_shows_private(page)
+
     @staticmethod
-
-
     def _is_post_url(url: str) -> bool:
         """발행된 게시글 주소(velog.io/@아이디/제목)인지 판별."""
         return "velog.io/@" in url and "/write" not in url
@@ -3196,14 +3885,16 @@ class VelogPoster:
         return False
 
     def _page_by_host(self, host: str) -> Page:
-        """현재 컨텍스트에서 host 가 들어간 탭을 찾는다. 최신 탭 우선."""
+        """현재 컨텍스트에서 host 가 netloc 에 맞는 탭을 찾는다. 최신 탭 우선."""
         if self._context is None:
             raise PostingError("브라우저 연결이 없습니다.")
+        host_l = host.lower()
         for page in reversed(self._context.pages):
             try:
                 if page.is_closed():
                     continue
-                if host in (page.url or ""):
+                netloc = urlparse(page.url or "").netloc.lower()
+                if netloc == host_l or netloc.endswith("." + host_l):
                     return page
             except Error:
                 continue

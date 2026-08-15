@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-APP_VERSION = "1.0.42"
+APP_VERSION = "1.0.43"
 APP_NAME = "VelogPoster"
 EXE_NAME = "VelogPoster.exe"
 ZIP_INNER_FOLDER = "VelogPoster"
