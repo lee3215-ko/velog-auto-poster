@@ -1498,20 +1498,15 @@ class VelogPoster:
             self.log(f"AdGuard 임시 메일 생성: {email}", "success")
             return email
 
-        btn = self._adguard_find_create_button(root)
-        if btn is None:
-            self._adguard_raise_if_blocked(page, root)
-            raise PostingError("AdGuard '주소 생성' 버튼을 찾지 못했습니다.")
+        # 창이 작거나 해상도가 낮아 버튼이 잘리는 경우 대비
+        self._maximize_browser_window()
+        self._adguard_fit_page_for_create(page)
+        self._sleep(_jitter(0.6, 0.3))
 
-        point = self._element_screen_point(btn)
-        self.log("자동화 클릭 대신 화면 클릭으로 주소를 만듭니다...", "info")
-        if self._process is not None:
-            self._focus_pid_window(self._process.pid)
-        self._disconnect_only()
-        self._sleep(_jitter(0.8, 0.3))
-        if point:
-            self._os_click(point[0], point[1])
-        self._sleep(_human_delay(3.5, 6.0))
+        email = self._adguard_try_create_clicks(pw, page)
+        if email:
+            self.log(f"AdGuard 임시 메일 생성: {email}", "success")
+            return email
         self._ensure_connected(pw)
         try:
             page = self._adguard_mail_page()
@@ -1519,12 +1514,191 @@ class VelogPoster:
             page = self._first_page()
         root = self._adguard_scope(page)
         self._adguard_raise_if_blocked(page, root)
-        email = self._adguard_wait_email(root, seconds=20)
-        if email:
-            self.log(f"AdGuard 임시 메일 생성: {email}", "success")
-            return email
-        self._adguard_raise_if_blocked(page, root)
         raise PostingError("AdGuard 임시 메일 주소가 시간 내에 나타나지 않았습니다.")
+
+    def _adguard_fit_page_for_create(self, page: Page) -> None:
+        """작은 창/낮은 해상도에서도 주소 생성 버튼이 보이게 맞춘다."""
+        try:
+            page.evaluate(
+                """() => {
+                    try { document.body.style.zoom = '1'; } catch (e) {}
+                    window.scrollTo(0, 0);
+                }"""
+            )
+        except Error:
+            pass
+        try:
+            # CDP viewport 가 있으면 넉넉히
+            page.set_viewport_size({"width": 1400, "height": 900})
+        except Error:
+            pass
+        self._sleep(0.25)
+
+    def _maximize_browser_window(self) -> None:
+        """Chrome 창을 최대화해 버튼이 잘리지 않게 한다."""
+        if sys.platform != "win32" or self._process is None:
+            return
+        pid = int(getattr(self._process, "pid", 0) or 0)
+        if pid <= 0:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            SW_MAXIMIZE = 3
+            found: list[int] = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            def _enum(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                proc = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc))
+                if int(proc.value) == int(pid):
+                    # 제목 없는 툴 창 제외
+                    length = user32.GetWindowTextLengthW(hwnd)
+                    if length > 0:
+                        found.append(int(hwnd))
+                return True
+
+            user32.EnumWindows(_enum, 0)
+            for hwnd in found[:3]:
+                try:
+                    user32.ShowWindow(hwnd, SW_MAXIMIZE)
+                    user32.SetForegroundWindow(hwnd)
+                except Exception:  # noqa: BLE001
+                    continue
+            self._sleep(0.35)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _adguard_prepare_create_button(self, page: Page, btn):
+        """버튼을 뷰포트 중앙으로 스크롤하고, 필요하면 살짝 축소한다."""
+        self._scroll_into_view(btn)
+        try:
+            in_view = bool(btn.evaluate(
+                """el => {
+                    const r = el.getBoundingClientRect();
+                    const vh = window.innerHeight || 0;
+                    const vw = window.innerWidth || 0;
+                    if (r.width < 8 || r.height < 8) return false;
+                    const cy = r.top + r.height / 2;
+                    const cx = r.left + r.width / 2;
+                    return cy >= 0 && cy <= vh && cx >= 0 && cx <= vw;
+                }"""
+            ))
+        except Error:
+            in_view = False
+        if not in_view:
+            try:
+                page.evaluate("() => { document.body.style.zoom = '0.85'; window.scrollTo(0,0); }")
+                self._sleep(0.2)
+                self._scroll_into_view(btn)
+            except Error:
+                pass
+        self._sleep(0.25)
+
+    def _adguard_try_create_clicks(self, pw, page: Page) -> str:
+        """주소 생성: 스크롤 → OS클릭 / Playwright클릭 / 확장 대기 순으로 재시도."""
+        for attempt in range(1, 5):
+            if self._stop.wait(0):
+                raise PostingError("사용자가 작업을 중단했습니다.")
+            self._ensure_connected(pw)
+            try:
+                page = self._adguard_mail_page()
+            except PostingError:
+                page = self._first_page()
+            self._adguard_dismiss_banners(page)
+            root = self._adguard_scope(page)
+            self._adguard_raise_if_blocked(page, root)
+
+            email = self._adguard_wait_email(root, seconds=3)
+            if email:
+                return email
+
+            btn = self._adguard_find_create_button(root)
+            if btn is None:
+                # 확장 프로그램이 이미 눌렀을 수 있음
+                self.log(
+                    f"주소 생성 버튼을 아직 못 찾음 — 확장/로딩 대기 ({attempt}/4)...",
+                    "info",
+                )
+                self._sleep(_human_delay(2.0, 3.5))
+                email = self._adguard_wait_email(root, seconds=8)
+                if email:
+                    return email
+                continue
+
+            self._adguard_prepare_create_button(page, btn)
+            point = self._element_screen_point(btn)
+            self.log(
+                f"주소 생성 클릭 시도 ({attempt}/4)"
+                + (f" @ ({int(point[0])},{int(point[1])})" if point else " (좌표 없음→대체 클릭)"),
+                "info",
+            )
+
+            if self._process is not None:
+                self._focus_pid_window(self._process.pid)
+            self._disconnect_only()
+            self._sleep(_jitter(0.6, 0.25))
+
+            clicked = False
+            if point and point[0] > 1 and point[1] > 1:
+                self._os_click(point[0], point[1])
+                clicked = True
+                self._sleep(_human_delay(2.5, 4.0))
+
+            # 재연결 후 주소 확인. 없으면 Playwright/JS 클릭으로 한 번 더
+            self._ensure_connected(pw)
+            try:
+                page = self._adguard_mail_page()
+            except PostingError:
+                page = self._first_page()
+            root = self._adguard_scope(page)
+            email = self._adguard_wait_email(root, seconds=10)
+            if email:
+                return email
+
+            btn = self._adguard_find_create_button(root)
+            if btn is not None:
+                self._adguard_prepare_create_button(page, btn)
+                try:
+                    self._stable_click(btn)
+                    clicked = True
+                    self.log("주소 생성 버튼을 직접 클릭했습니다.", "info")
+                except Error:
+                    try:
+                        btn.evaluate("el => el.click()")
+                        clicked = True
+                    except Error:
+                        pass
+                self._sleep(_human_delay(2.5, 4.0))
+                # 봇 탐지 완화: 클릭 직후 잠깐 연결 해제
+                self._disconnect_only()
+                self._sleep(_jitter(1.2, 0.5))
+                self._ensure_connected(pw)
+                try:
+                    page = self._adguard_mail_page()
+                except PostingError:
+                    page = self._first_page()
+                root = self._adguard_scope(page)
+                email = self._adguard_wait_email(root, seconds=12)
+                if email:
+                    return email
+
+            if not clicked:
+                self.log("주소 생성 클릭에 실패해 다시 시도합니다...", "info")
+            # 다음 시도 전 창/줌 재조정
+            self._maximize_browser_window()
+            try:
+                page.evaluate(
+                    "() => { document.body.style.zoom = '0.8'; window.scrollTo(0, 0); }"
+                )
+            except Error:
+                pass
+            self._sleep(_jitter(0.8, 0.3))
+        return ""
 
     def _adguard_wait_email(self, root, *, seconds: float) -> str:
         deadline = time.time() + seconds
@@ -1553,20 +1727,35 @@ class VelogPoster:
     const r = el.getBoundingClientRect();
     return r.width > 8 && r.height > 8;
   }
+  function bring(el) {
+    try {
+      el.scrollIntoView({block:'center', inline:'nearest', behavior:'instant'});
+    } catch (e) {}
+  }
   function tick() {
     if (document.querySelector(".error-screen")) return;
     const copy = document.querySelector(".address__copy-text");
     if (copy && /@/.test(copy.textContent || "")) return;
     const byClass = document.querySelector("button.address__get-address-btn");
     const buttons = [...document.querySelectorAll("button")];
-    const btn = (byClass && visible(byClass) ? byClass : null) || buttons.find((b) => {
-      const t = (b.textContent || "").replace(/\\s+/g, " ").trim();
-      if (!visible(b) || /변경|change|복사|copy/i.test(t)) return false;
-      return /주소\\s*생성|Get address|Create address/i.test(t);
-    });
+    let btn = byClass || null;
+    if (!btn || !visible(btn)) {
+      btn = buttons.find((b) => {
+        const t = (b.textContent || "").replace(/\\s+/g, " ").trim();
+        if (/변경|change|복사|copy/i.test(t)) return false;
+        return /주소\\s*생성|Get address|Create address/i.test(t);
+      }) || null;
+    }
     if (btn && !clicked) {
-      clicked = true;
-      btn.click();
+      bring(btn);
+      if (!visible(btn)) {
+        try { document.body.style.zoom = '0.85'; } catch (e) {}
+        bring(btn);
+      }
+      if (visible(btn)) {
+        clicked = true;
+        btn.click();
+      }
     }
   }
   tick();
@@ -1581,16 +1770,27 @@ class VelogPoster:
         try:
             point = locator.evaluate(
                 """el => {
+                    el.scrollIntoView({block:'center', inline:'nearest', behavior:'instant'});
                     const r = el.getBoundingClientRect();
-                    const chrome = Math.max(0, window.outerHeight - window.innerHeight);
+                    if (r.width < 4 || r.height < 4) return null;
+                    const vv = window.visualViewport;
+                    const ox = vv ? vv.offsetLeft : 0;
+                    const oy = vv ? vv.offsetTop : 0;
+                    // 탭/주소창 높이 (zoom 반영)
+                    const chromeH = Math.max(0, window.outerHeight - window.innerHeight);
+                    const zoom = Number(document.body && document.body.style && document.body.style.zoom) || 1;
+                    const cx = (r.left + r.width / 2 + ox) * zoom;
+                    const cy = (r.top + r.height / 2 + oy) * zoom;
                     return [
-                        window.screenX + r.left + r.width / 2,
-                        window.screenY + chrome + r.top + r.height / 2
+                        window.screenX + cx,
+                        window.screenY + chromeH + cy
                     ];
                 }"""
             )
             if isinstance(point, (list, tuple)) and len(point) == 2:
-                return float(point[0]), float(point[1])
+                x, y = float(point[0]), float(point[1])
+                if x > 1 and y > 1:
+                    return x, y
         except Error:
             pass
         try:
@@ -1745,11 +1945,18 @@ class VelogPoster:
         return False
 
     def _adguard_find_create_button(self, root):
+        # attached 이지만 화면 밖인 버튼도 스크롤 대상이 되도록 visible 완화
         for sel in _ADGUARD_CREATE_SELECTORS:
             loc = root.locator(sel)
             try:
-                if loc.count() > 0 and loc.first.is_visible():
-                    return loc.first
+                if loc.count() == 0:
+                    continue
+                btn = loc.first
+                try:
+                    btn.wait_for(state="attached", timeout=2_000)
+                except Error:
+                    pass
+                return btn
             except Error:
                 continue
         try:
@@ -1757,7 +1964,7 @@ class VelogPoster:
                 "button",
                 name=re.compile(r"(주소\s*생성|Get address|Create address|Generate)", re.I),
             )
-            if loc.count() > 0 and loc.first.is_visible():
+            if loc.count() > 0:
                 return loc.first
         except Error:
             pass
@@ -1766,8 +1973,6 @@ class VelogPoster:
             for i in range(loc.count()):
                 btn = loc.nth(i)
                 try:
-                    if not btn.is_visible():
-                        continue
                     cls = btn.get_attribute("class") or ""
                     text = (btn.inner_text() or "").replace("\n", " ").strip().lower()
                 except Error:

@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.44",
-    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/515393275",
-    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.44/VelogPoster.zip",
-    "notes":  "AdGuard 비공개 재공개 Cloudflare 수정, 감시 중 CDP 해제, 수정하기 미활성 시 성공 오인 방지",
+    "version":  "1.0.45",
+    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.45/VelogPoster.zip",
+    "notes":  "AdGuard 주소생성 버튼: 창 최대화/스크롤/줌/다중재시도로 해상도·창크기 이슈 보완",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/515393275",
-                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.44/VelogPoster.zip",
+                          "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.45/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ],
-    "asset_id":  515393275,
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/515393275"
+                      ]
 }
