@@ -1,10 +1,13 @@
 {
     "version":  "1.0.45",
-    "url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/516458612",
     "download_url":  "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.45/VelogPoster.zip",
     "notes":  "AdGuard 주소생성 버튼: 창 최대화/스크롤/줌/다중재시도로 해상도·창크기 이슈 보완",
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/516458612",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/download/v1.0.45/VelogPoster.zip",
                           "https://github.com/lee3215-ko/velog-auto-poster/releases/latest/download/VelogPoster.zip"
-                      ]
+                      ],
+    "asset_id":  516458612,
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/velog-auto-poster/releases/assets/516458612"
 }
