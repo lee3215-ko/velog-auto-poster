@@ -4,6 +4,7 @@ block_cipher = None
 hiddenimports = [
     "velog_poster",
     "tempmail_generator",
+    "naver_index_check",
     "paths",
     "updater",
     "update_ui",

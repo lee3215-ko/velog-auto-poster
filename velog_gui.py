@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from naver_index_check import check_index_batch, velog_username_from_url
 from paths import APP_VERSION, EXE_NAME, SETTINGS_PATH, UPDATE_VERSION_URL
 from tempmail_generator import TempMailGenerator, normalize_email_domain, normalize_email_domains
 from update_ui import schedule_update_check
@@ -87,6 +88,8 @@ ACCOUNT_KEYS = (
     "velog_id", "inbox_url", "manuscript_path",
     "published_url", "published_at", "created_at", "mail_mismatch",
     "fail_count", "mail_provider",
+    "indexed", "index_message", "index_checked_at",
+    "index_sample_url", "index_query", "index_profile_url",
 )
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 MANUSCRIPT_EXTS = {".txt", ".html", ".htm", ".md"}
@@ -314,6 +317,8 @@ class VelogApp(tk.Tk):
         self._run_total = 0
         self._run_done = 0
         self._cleaning = False
+        self._indexing = False
+        self._index_stop = False
 
         # 임시 메일 생성 탭
         self.generated_emails: list[dict[str, str]] = []
@@ -909,7 +914,7 @@ class VelogApp(tk.Tk):
                 "2. 새 탭에서 벨로그 가입 → 이미지·원고 작성 → 출간\n"
                 "3. Chrome을 닫지 않고 발행 URL을 주기적으로 새로고침\n"
                 "4. 「비공개」가 보이면 수정 → 전체 공개로 복구\n"
-                "5. 완료 후 다음 계정으로 진행 (성공 계정은 선택 탭에 추가)"
+                "5. 완료 후 다음 계정으로 진행 (원고는 폴더에서 무작위 배정)"
             ),
             style="Hint.TLabel",
             justify="left",
@@ -1761,6 +1766,15 @@ class VelogApp(tk.Tk):
             btns, text="목록정리하기", style="Pick.TButton", command=self._start_clean_list,
         )
         self.clean_btn.pack(side="left", padx=(0, 6), pady=(0, 4))
+        self.index_btn = ttk.Button(
+            btns, text="전체 인덱싱확인", style="Pick.TButton", command=self._start_index_check,
+        )
+        self.index_btn.pack(side="left", padx=(0, 6), pady=(0, 4))
+        ToolTip(
+            self.index_btn,
+            "발행 URL이 있는 계정의 벨로그 프로필을 네이버 site: 검색으로 확인합니다.\n"
+            "프로필만 검색되어도 인덱싱됨으로 표시합니다. (로그인 불필요)",
+        )
 
         nb_wrap = ttk.Frame(parent, style="CardBorder.TFrame")
         nb_wrap.pack(fill="both", expand=True)
@@ -1784,24 +1798,28 @@ class VelogApp(tk.Tk):
         frame.columnconfigure(0, weight=1)
         tree = ttk.Treeview(
             frame,
-            columns=("no", "id", "status", "inbox", "manuscript", "result"),
+            columns=("no", "id", "status", "index", "inbox", "manuscript", "result"),
             show="headings", selectmode="extended",
         )
         tree.heading("no", text="#")
         tree.heading("id", text="아이디")
         tree.heading("status", text="유효기간")
+        tree.heading("index", text="인덱싱")
         tree.heading("inbox", text="인증 메일함")
         tree.heading("manuscript", text="원고")
         tree.heading("result", text="발행 결과")
         tree.column("no", width=44, stretch=False, anchor="center", minwidth=44)
-        tree.column("id", width=180, stretch=False, minwidth=140)
-        tree.column("status", width=88, stretch=False, anchor="center", minwidth=72)
-        tree.column("inbox", width=280, stretch=True, minwidth=180)
-        tree.column("manuscript", width=200, stretch=True, minwidth=140)
-        tree.column("result", width=320, stretch=True, minwidth=200)
+        tree.column("id", width=160, stretch=False, minwidth=120)
+        tree.column("status", width=72, stretch=False, anchor="center", minwidth=64)
+        tree.column("index", width=88, stretch=False, anchor="center", minwidth=72)
+        tree.column("inbox", width=240, stretch=True, minwidth=160)
+        tree.column("manuscript", width=180, stretch=True, minwidth=120)
+        tree.column("result", width=280, stretch=True, minwidth=180)
         tree.tag_configure("done", background=DONE_BG, foreground=DONE_FG)
         tree.tag_configure("expired", background="#ffe3e3", foreground="#c92a2a")
         tree.tag_configure("mismatch", background="#fff3bf", foreground="#5c3c00")
+        tree.tag_configure("indexed", background="#e0f2fe", foreground="#075985")
+        tree.tag_configure("not_indexed", background="#fff7ed", foreground="#9a3412")
         tree.tag_configure("even", background="#ffffff")
         tree.tag_configure("odd", background="#f4f7fb")
         tree.grid(row=0, column=0, sticky="nsew")
@@ -2401,11 +2419,28 @@ class VelogApp(tk.Tk):
                 at_disp = parsed.strftime("%Y-%m-%d %H:%M")
             result = f"{at_disp}  {url}" if url else "—"
             status = self._status_text(acc)
+            index_txt = self._index_status_text(acc)
             vid = acc.get("velog_id", "")
             if acc.get("mail_mismatch"):
                 vid = "⚠ " + vid
-            tree.insert("", "end", iid=str(index), tags=self._row_tags(acc, index),
-                        values=(index + 1, vid, status, acc.get("inbox_url", ""), man, result))
+            tree.insert(
+                "", "end", iid=str(index), tags=self._row_tags(acc, index),
+                values=(index + 1, vid, status, index_txt, acc.get("inbox_url", ""), man, result),
+            )
+
+    @staticmethod
+    def _index_status_text(acc: dict) -> str:
+        flag = str(acc.get("indexed") or "").strip().lower()
+        if flag in {"true", "1", "yes"}:
+            return "인덱싱됨"
+        if flag in {"false", "0", "no"}:
+            return "미인덱싱"
+        if flag in {"error", "fail", "null"}:
+            msg = str(acc.get("index_message") or "").strip()
+            return (msg[:12] + "…") if len(msg) > 12 else (msg or "확인실패")
+        if not str(acc.get("published_url") or "").strip():
+            return "—"
+        return "미확인"
 
     def _status_text(self, acc: dict) -> str:
         if acc.get("published_url"):
@@ -2423,6 +2458,11 @@ class VelogApp(tk.Tk):
             tags.append("expired")
         if acc.get("mail_mismatch"):
             tags.append("mismatch")
+        flag = str(acc.get("indexed") or "").strip().lower()
+        if flag in {"true", "1", "yes"}:
+            tags.append("indexed")
+        elif flag in {"false", "0", "no"}:
+            tags.append("not_indexed")
         return tuple(tags)
 
     @staticmethod
@@ -3371,7 +3411,7 @@ class VelogApp(tk.Tk):
 
     def _start_clean_list(self) -> None:
         """현재 탭의 발행 URL을 열어 404이면 해당 계정을 목록에서 삭제한다."""
-        if self._poster is not None or self._cleaning:
+        if self._poster is not None or self._cleaning or self._indexing:
             messagebox.showinfo("목록 정리", "다른 작업이 끝난 뒤 다시 시도해 주세요.", parent=self)
             return
         tab = self._current_tab()
@@ -3429,6 +3469,166 @@ class VelogApp(tk.Tk):
                 self._events.put((f"{velog_id} → 확인 실패 (유지) {url}", "clean"))
         payload = json.dumps({"dead": dead, "ok": ok, "fail": fail}, ensure_ascii=False)
         self._events.put((payload, "clean_done"))
+
+    def _start_index_check(self) -> None:
+        """현재 탭의 발행 URL → 벨로그 프로필 site: 네이버 인덱싱 확인."""
+        if self._poster is not None or self._cleaning or self._indexing:
+            messagebox.showinfo("인덱싱 확인", "다른 작업이 끝난 뒤 다시 시도해 주세요.", parent=self)
+            return
+        tab = self._current_tab()
+        if tab is None:
+            return
+        targets: list[dict] = []
+        skipped = 0
+        for acc in tab["accounts"]:
+            url = str(acc.get("published_url", "")).strip()
+            if not url:
+                continue
+            if not velog_username_from_url(url):
+                continue
+            flag = str(acc.get("indexed") or "").strip().lower()
+            if flag in {"true", "1", "yes"}:
+                skipped += 1
+                continue
+            targets.append(acc)
+        if not targets:
+            msg = "확인할 계정이 없습니다."
+            if skipped:
+                msg += f"\n이미 인덱싱됨으로 표시된 {skipped}건은 건너뛰었습니다."
+            else:
+                msg += "\n발행 URL이 있는 계정이 필요합니다."
+            messagebox.showinfo("인덱싱 확인", msg, parent=self)
+            return
+        skip_note = f"\n(이미 인덱싱됨 {skipped}건 건너뜀)" if skipped else ""
+        if not messagebox.askyesno(
+            "인덱싱 확인",
+            f"현재 탭 [{tab.get('title', '')}] 에서 {len(targets)}건을 네이버 site: 검색으로 확인합니다.\n"
+            f"발행 URL의 @아이디 프로필만 검색되어도 인덱싱됨으로 표시합니다.{skip_note}\n\n"
+            "계속할까요?",
+            parent=self,
+        ):
+            return
+
+        self._indexing = True
+        self._index_stop = False
+        self._active_tab = tab
+        if hasattr(self, "index_btn"):
+            self.index_btn.configure(state="disabled")
+        if hasattr(self, "clean_btn"):
+            self.clean_btn.configure(state="disabled")
+        self.start_btn.configure(state="disabled")
+        self._append(
+            f"[{tab.get('title', '')}] 인덱싱 확인 시작 — {len(targets)}건"
+            + (f" (인덱싱됨 {skipped}건 생략)" if skipped else ""),
+            "info",
+        )
+        self.status.set("인덱싱 확인 중...")
+        items = [
+            {
+                "velog_id": str(acc.get("velog_id", "")),
+                "published_url": str(acc.get("published_url", "")).strip(),
+            }
+            for acc in targets
+        ]
+        threading.Thread(target=self._run_index_check, args=(items,), daemon=True).start()
+
+    def _run_index_check(self, items: list[dict[str, str]]) -> None:
+        def on_progress(p: dict) -> None:
+            if p.get("phase") == "checking":
+                self._events.put(
+                    (
+                        f"인덱싱 확인 {p.get('current')}/{p.get('total')}: "
+                        f"{p.get('velog_id') or p.get('url')}",
+                        "index",
+                    )
+                )
+            elif p.get("phase") == "done":
+                result = p.get("result") or {}
+                flag = str(result.get("indexed") or "")
+                msg = str(result.get("index_message") or "")
+                vid = str(result.get("velog_id") or "")
+                label = "인덱싱됨" if flag == "true" else ("미인덱싱" if flag == "false" else "실패")
+                self._events.put((f"{vid} → {label} ({msg})", "index"))
+
+        try:
+            out = check_index_batch(
+                items,
+                on_progress=on_progress,
+                stop_flag=lambda: self._index_stop,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._events.put((json.dumps({"error": str(exc)}, ensure_ascii=False), "index_done"))
+            return
+        payload = json.dumps(
+            {"results": out.get("results") or [], "summary": out.get("summary") or {}},
+            ensure_ascii=False,
+        )
+        self._events.put((payload, "index_done"))
+
+    def _finish_index_check(self, payload: str) -> None:
+        results: list[dict] = []
+        summary: dict = {}
+        error = ""
+        try:
+            data = json.loads(payload or "{}")
+            results = list(data.get("results") or [])
+            summary = dict(data.get("summary") or {})
+            error = str(data.get("error") or "")
+        except (TypeError, ValueError):
+            error = "결과 파싱 실패"
+
+        tab = self._active_tab or self._current_tab()
+        if tab is not None and results and not error:
+            by_key: dict[str, dict] = {}
+            for row in results:
+                url = str(row.get("published_url") or "").strip().lower()
+                vid = str(row.get("velog_id") or "").strip().lower()
+                if url:
+                    by_key[f"u:{url}"] = row
+                if vid:
+                    by_key[f"v:{vid}"] = row
+            for acc in tab["accounts"]:
+                url = str(acc.get("published_url") or "").strip().lower()
+                vid = str(acc.get("velog_id") or "").strip().lower()
+                patch = by_key.get(f"u:{url}") or by_key.get(f"v:{vid}")
+                if not patch:
+                    continue
+                for key in (
+                    "indexed", "index_message", "index_checked_at",
+                    "index_sample_url", "index_query", "index_profile_url",
+                ):
+                    if key in patch:
+                        acc[key] = str(patch.get(key) or "")
+
+        self._indexing = False
+        self._index_stop = False
+        if hasattr(self, "index_btn"):
+            self.index_btn.configure(state="normal")
+        if hasattr(self, "clean_btn"):
+            self.clean_btn.configure(state="normal" if self._poster is None else "disabled")
+        if self._poster is None:
+            self.start_btn.configure(state="normal")
+        self._refresh_tree()
+        self._save_settings()
+
+        if error:
+            self._append(f"인덱싱 확인 실패: {error}", "error")
+            self.status.set("인덱싱 확인 실패")
+            messagebox.showerror("인덱싱 확인", error, parent=self)
+            return
+
+        checked = int(summary.get("checked") or 0)
+        indexed_n = int(summary.get("indexed") or 0)
+        not_n = int(summary.get("not_indexed") or 0)
+        failed = int(summary.get("failed") or 0)
+        msg = (
+            f"인덱싱 확인 완료: {checked}건 · "
+            f"인덱싱됨 {indexed_n} · 미인덱싱 {not_n}"
+            + (f" · 실패 {failed}" if failed else "")
+        )
+        self._append(msg, "success")
+        self.status.set(msg)
+        messagebox.showinfo("인덱싱 확인", msg, parent=self)
 
     def _finish_clean_list(self, payload: str) -> None:
         dead: list[str] = []
@@ -3536,7 +3736,7 @@ class VelogApp(tk.Tk):
 
     # -- 실행 / 중단 ------------------------------------------------------
     def _start(self) -> None:
-        if self._cleaning or self._tm_worker is not None:
+        if self._cleaning or self._indexing or self._tm_worker is not None:
             messagebox.showinfo("출간", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
             return
         tab = self._current_tab()
@@ -3634,7 +3834,7 @@ class VelogApp(tk.Tk):
         self._worker.start()
 
     def _start_adguard(self) -> None:
-        if self._cleaning or self._poster is not None or self._tm_worker is not None:
+        if self._cleaning or self._indexing or self._poster is not None or self._tm_worker is not None:
             messagebox.showinfo("출간", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
             return
         folder = self.manuscript_folder.get().strip()
@@ -3654,6 +3854,7 @@ class VelogApp(tk.Tk):
                 parent=self,
             )
             return
+        random.shuffle(files)
         loop = bool(self.ag_loop_until_stop.get())
         try:
             count = int(self.ag_count.get())
@@ -3703,7 +3904,7 @@ class VelogApp(tk.Tk):
         self._switch_main_view("log")
         self._append(
             f"AdGuard 출간 시작 — 「{tab_title}」 {len(jobs)}건 "
-            f"(출간 후 비공개 감시 {watch_max}분 / {watch_interval}분마다 새로고침)",
+            f"(원고 무작위 배정 · 비공개 감시 {watch_max}분 / {watch_interval}분마다)",
             "info",
         )
         self._poster = VelogPoster(
@@ -3717,7 +3918,7 @@ class VelogApp(tk.Tk):
         self._worker.start()
 
     def _start_guerrilla(self) -> None:
-        if self._cleaning or self._poster is not None or self._tm_worker is not None:
+        if self._cleaning or self._indexing or self._poster is not None or self._tm_worker is not None:
             messagebox.showinfo("출간", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
             return
         folder = self.manuscript_folder.get().strip()
@@ -3797,7 +3998,7 @@ class VelogApp(tk.Tk):
         self._worker.start()
 
     def _start_naver(self) -> None:
-        if self._cleaning or self._poster is not None or self._tm_worker is not None:
+        if self._cleaning or self._indexing or self._poster is not None or self._tm_worker is not None:
             messagebox.showinfo("출간", "다른 작업이 끝난 뒤 시작해 주세요.", parent=self)
             return
         unused = self._unused_naver_accounts()
@@ -4167,6 +4368,13 @@ class VelogApp(tk.Tk):
                 if level == "clean_done":
                     self._finish_clean_list(message)
                     continue
+                if level == "index":
+                    self._append(message, "info")
+                    self.status.set(message)
+                    continue
+                if level == "index_done":
+                    self._finish_index_check(message)
+                    continue
                 self.status.set(message)
                 tag = "success" if level == "success" else ("error" if level == "error" else "info")
                 self._append(message, tag)
@@ -4371,7 +4579,13 @@ class VelogApp(tk.Tk):
         if hasattr(self, "tm_start_btn"):
             self.tm_start_btn.configure(state="disabled" if running else "normal")
         if hasattr(self, "clean_btn"):
-            self.clean_btn.configure(state="disabled" if (running or self._cleaning) else "normal")
+            self.clean_btn.configure(
+                state="disabled" if (running or self._cleaning or self._indexing) else "normal",
+            )
+        if hasattr(self, "index_btn"):
+            self.index_btn.configure(
+                state="disabled" if (running or self._cleaning or self._indexing) else "normal",
+            )
         if running:
             self.status.set("출간 작업 진행 중...")
             if hasattr(self, "ag_status"):
