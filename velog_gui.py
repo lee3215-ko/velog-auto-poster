@@ -98,6 +98,8 @@ DONE_BG = "#dcfce7"
 DONE_FG = "#166534"
 GAUGE_DAYS = 6.0
 GAUGE_SEGMENTS = 6
+EXPIRED_TAB_TITLE = "만료"
+EXPIRED_TAB_ROLE = "expired"
 _404_MARKERS = (
     "페이지를 찾을 수 없",
     "존재하지 않는 포스트",
@@ -299,6 +301,7 @@ class VelogApp(tk.Tk):
         self._collapse_state = {"image": False, "advanced": False, "account": False, "manuscript": True}
         self.status = tk.StringVar(value="대기 중 — 계정을 등록한 뒤 [전체 출간 시작]을 누르세요.")
         self.tab_summary = tk.StringVar(value="계정 0개")
+        self.index_record = tk.StringVar(value="")
         self.working_id = tk.StringVar(value="")
         self.log_summary = tk.StringVar(value="로그 0줄")
         self.progress_text = tk.StringVar(value="")
@@ -1723,7 +1726,7 @@ class VelogApp(tk.Tk):
             chip.pack(side="left", padx=(0, 8))
         ttk.Label(
             legend,
-            text="원고 더블클릭 · 결과 더블클릭=URL · Ctrl+C=복사 · Del=삭제",
+            text="원고 더블클릭 · 결과 더블클릭=URL · Del=삭제 · 만료 계정은 「만료」탭으로 이동",
             style="Sub.TLabel",
         ).pack(side="right")
 
@@ -1775,6 +1778,10 @@ class VelogApp(tk.Tk):
             "발행 URL이 있는 계정의 벨로그 프로필을 네이버 site: 검색으로 확인합니다.\n"
             "프로필만 검색되어도 인덱싱됨으로 표시합니다. (로그인 불필요)",
         )
+        self.index_record_label = ttk.Label(
+            btns, textvariable=self.index_record, style="Sub.TLabel",
+        )
+        self.index_record_label.pack(side="left", padx=(4, 0), pady=(0, 4))
 
         nb_wrap = ttk.Frame(parent, style="CardBorder.TFrame")
         nb_wrap.pack(fill="both", expand=True)
@@ -1844,10 +1851,49 @@ class VelogApp(tk.Tk):
             bg, fg = TM_TAB_COLORS[i % len(TM_TAB_COLORS)]
             self.tm_tree.tag_configure(self._tm_tab_tag(i), background=bg, foreground=fg)
 
+    @staticmethod
+    def _is_expired_tab(tab: dict | None) -> bool:
+        if not isinstance(tab, dict):
+            return False
+        if str(tab.get("role") or "") == EXPIRED_TAB_ROLE:
+            return True
+        return str(tab.get("title") or "").strip() == EXPIRED_TAB_TITLE
+
+    def _ensure_expired_tab(self) -> dict:
+        """만료 계정을 모을 전용 탭을 보장한다."""
+        for tab in self.tabs:
+            if self._is_expired_tab(tab):
+                tab["role"] = EXPIRED_TAB_ROLE
+                tab["title"] = EXPIRED_TAB_TITLE
+                return tab
+        tab = {
+            "title": EXPIRED_TAB_TITLE,
+            "accounts": [],
+            "role": EXPIRED_TAB_ROLE,
+        }
+        self.tabs.append(tab)
+        return tab
+
+    def _place_expired_tab_last(self) -> None:
+        expired = next((t for t in self.tabs if self._is_expired_tab(t)), None)
+        if expired is None:
+            return
+        others = [t for t in self.tabs if t is not expired]
+        self.tabs = others + [expired]
+
+    def _normal_tab_indices(self) -> list[int]:
+        return [i for i, t in enumerate(self.tabs) if not self._is_expired_tab(t)]
+
     def _ask_account_tab(self) -> int | None:
-        """계정을 추가할 탭을 선택한다. 탭이 1개면 0, 2개 이상이면 선택 창."""
-        if len(self.tabs) <= 1:
-            return 0
+        """계정을 추가할 탭을 선택한다. 만료 탭은 제외."""
+        self._ensure_expired_tab()
+        normal = self._normal_tab_indices()
+        if not normal:
+            self.tabs.insert(0, {"title": "기본", "accounts": []})
+            self._ensure_expired_tab()
+            normal = self._normal_tab_indices()
+        if len(normal) == 1:
+            return normal[0]
 
         win = tk.Toplevel(self)
         win.title("탭 선택")
@@ -1866,9 +1912,12 @@ class VelogApp(tk.Tk):
         try:
             default_index = self.notebook.index(self.notebook.select())
         except Exception:
-            default_index = 0
+            default_index = normal[0]
+        if default_index not in normal:
+            default_index = normal[0]
         choice = tk.IntVar(value=default_index)
-        for i, tab in enumerate(self.tabs):
+        for i in normal:
+            tab = self.tabs[i]
             ttk.Radiobutton(frame, text=tab["title"], variable=choice, value=i).pack(anchor="w", pady=2)
 
         result: list[int | None] = [None]
@@ -1896,6 +1945,8 @@ class VelogApp(tk.Tk):
             self.notebook.forget(tid)
         if not self.tabs:
             self.tabs.append({"title": "기본", "accounts": []})
+        self._ensure_expired_tab()
+        self._place_expired_tab_last()
         for tab in self.tabs:
             frame, tree = self._make_tree(self.notebook)
             tab["frame"] = frame
@@ -1911,6 +1962,7 @@ class VelogApp(tk.Tk):
         tab = self._current_tab()
         if tab is None:
             self.tab_summary.set("계정 0개")
+            self.index_record.set("")
             return
         accs = tab["accounts"]
         total = len(accs)
@@ -1918,33 +1970,129 @@ class VelogApp(tk.Tk):
         pending = total - done
         expired = sum(1 for a in accs if self._remaining_days(a.get("created_at", "")) <= 0)
         mismatch = sum(1 for a in accs if a.get("mail_mismatch"))
+        indexed_n, not_n, unchecked_n = self._index_counts(accs)
+        if self._is_expired_tab(tab):
+            parts = [f"만료 보관 {total}", f"발행URL {done}"]
+            if done:
+                parts.append(f"인덱싱됨 {indexed_n}")
+                parts.append(f"미인덱싱 {not_n}")
+                if unchecked_n:
+                    parts.append(f"미확인 {unchecked_n}")
+            self.tab_summary.set(" · ".join(parts))
+            self.index_record.set(self._index_record_text(tab))
+            if total == 0:
+                self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
+            else:
+                self.empty_label.place_forget()
+            return
         parts = [f"전체 {total}", f"대기 {pending}", f"완료 {done}"]
+        if done:
+            parts.append(f"인덱싱됨 {indexed_n}")
+            parts.append(f"미인덱싱 {not_n}")
+            if unchecked_n:
+                parts.append(f"미확인 {unchecked_n}")
         if expired:
             parts.append(f"만료 {expired}")
         if mismatch:
             parts.append(f"⚠ {mismatch}")
         self.tab_summary.set(" · ".join(parts))
+        self.index_record.set(self._index_record_text(tab))
 
         if total == 0:
             self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
         else:
             self.empty_label.place_forget()
 
+    @staticmethod
+    def _index_counts(accs: list[dict]) -> tuple[int, int, int]:
+        indexed_n = 0
+        not_n = 0
+        unchecked_n = 0
+        for acc in accs:
+            if not str(acc.get("published_url") or "").strip():
+                continue
+            flag = str(acc.get("indexed") or "").strip().lower()
+            if flag in {"true", "1", "yes"}:
+                indexed_n += 1
+            elif flag in {"false", "0", "no"}:
+                not_n += 1
+            else:
+                unchecked_n += 1
+        return indexed_n, not_n, unchecked_n
+
+    def _index_record_text(self, tab: dict) -> str:
+        """탭별 마지막 인덱싱 확인 요약 (탭 전환 시에도 유지)."""
+        rec = tab.get("last_index_check")
+        if not isinstance(rec, dict):
+            rec = {}
+        at = str(rec.get("at") or "").strip()
+        if not at:
+            # 예전 데이터: 계정별 확인 시각으로 추정
+            latest = ""
+            for acc in tab.get("accounts") or []:
+                stamp = str(acc.get("index_checked_at") or "").strip()
+                if stamp > latest:
+                    latest = stamp
+            if not latest:
+                published = sum(
+                    1 for a in (tab.get("accounts") or [])
+                    if str(a.get("published_url") or "").strip()
+                )
+                return "인덱싱확인 기록 없음" if published else ""
+            at = latest
+            indexed_n, not_n, unchecked_n = self._index_counts(tab.get("accounts") or [])
+            checked = indexed_n + not_n
+            failed = 0
+        else:
+            indexed_n = int(rec.get("indexed") or 0)
+            not_n = int(rec.get("not_indexed") or 0)
+            failed = int(rec.get("failed") or 0)
+            checked = int(rec.get("checked") or (indexed_n + not_n + failed))
+            unchecked_n = int(rec.get("unchecked") or 0)
+
+        disp = at
+        parsed = self._parse_time(at)
+        if parsed is not None:
+            disp = parsed.strftime("%m-%d %H:%M")
+        parts = [f"마지막 인덱싱확인 {disp}", f"확인 {checked}건", f"됨 {indexed_n}", f"미 {not_n}"]
+        if failed:
+            parts.append(f"실패 {failed}")
+        if unchecked_n:
+            parts.append(f"남은미확인 {unchecked_n}")
+        return " · ".join(parts)
+
     def _add_tab(self) -> None:
         name = simpledialog.askstring(
             "탭 추가", "새 탭 이름을 입력하세요.",
-            initialvalue=f"탭 {len(self.tabs) + 1}", parent=self,
+            initialvalue=f"탭 {len(self._normal_tab_indices()) + 1}", parent=self,
         )
         if not name:
             return
-        self.tabs.append({"title": name.strip(), "accounts": []})
+        title = name.strip()
+        if not title:
+            return
+        if title == EXPIRED_TAB_TITLE:
+            messagebox.showinfo(
+                "탭 추가",
+                f"「{EXPIRED_TAB_TITLE}」은 예약된 탭 이름입니다.",
+                parent=self,
+            )
+            return
+        self.tabs.insert(len(self._normal_tab_indices()), {"title": title, "accounts": []})
         self._rebuild_tabs()
-        self.notebook.select(len(self.tabs) - 1)
+        # 방금 추가한 일반 탭 선택
+        for i, tab in enumerate(self.tabs):
+            if tab["title"] == title and not self._is_expired_tab(tab):
+                self.notebook.select(i)
+                break
         self._save_settings()
 
     def _rename_tab(self) -> None:
         tab = self._current_tab()
         if tab is None:
+            return
+        if self._is_expired_tab(tab):
+            messagebox.showinfo("탭 이름 변경", "「만료」탭 이름은 변경할 수 없습니다.", parent=self)
             return
         i = self.notebook.index(self.notebook.select())
         name = simpledialog.askstring(
@@ -1953,15 +2101,28 @@ class VelogApp(tk.Tk):
         )
         if not name:
             return
-        tab["title"] = name.strip()
+        new_title = name.strip()
+        if not new_title:
+            return
+        if new_title == EXPIRED_TAB_TITLE:
+            messagebox.showinfo(
+                "탭 이름 변경",
+                f"「{EXPIRED_TAB_TITLE}」은 예약된 탭 이름입니다.",
+                parent=self,
+            )
+            return
+        tab["title"] = new_title
         self.notebook.tab(i, text=tab["title"])
         self._save_settings()
 
     def _delete_tab(self) -> None:
-        if len(self.tabs) <= 1:
-            messagebox.showinfo("탭 삭제", "탭은 최소 1개는 있어야 합니다.", parent=self)
-            return
         i = self.notebook.index(self.notebook.select())
+        if self._is_expired_tab(self.tabs[i]):
+            messagebox.showinfo("탭 삭제", "「만료」탭은 삭제할 수 없습니다.", parent=self)
+            return
+        if len(self._normal_tab_indices()) <= 1:
+            messagebox.showinfo("탭 삭제", "일반 탭은 최소 1개는 있어야 합니다.", parent=self)
+            return
         if not messagebox.askyesno(
             "탭 삭제",
             f"'{self.tabs[i]['title']}' 탭과 그 안의 계정을 모두 삭제할까요?",
@@ -2339,14 +2500,18 @@ class VelogApp(tk.Tk):
         if not row:
             return
         index = int(row)
+        try:
+            col_name = self.tree["columns"][int(str(col).lstrip("#")) - 1]
+        except (ValueError, IndexError, TypeError):
+            return
 
-        if col == "#6":
+        if col_name == "result":
             url = self.accounts[index].get("published_url", "")
             if url:
                 webbrowser.open(url)
             return
 
-        if col != "#5":
+        if col_name != "manuscript":
             return
         path = filedialog.askopenfilename(
             parent=self, title="원고 파일 선택",
@@ -2502,16 +2667,36 @@ class VelogApp(tk.Tk):
         return max(0.0, GAUGE_DAYS - elapsed)
 
     def _purge_expired_accounts(self) -> int:
-        """6일 만료 계정을 목록에서 삭제한다."""
-        removed = 0
+        """6일 만료 계정을 「만료」탭으로 옮긴다."""
+        existed = any(self._is_expired_tab(t) for t in self.tabs)
+        expired_tab = self._ensure_expired_tab()
+        moved = 0
         for tab in self.tabs:
-            before = len(tab["accounts"])
-            tab["accounts"] = [
-                a for a in tab["accounts"]
-                if self._remaining_days(a.get("created_at", "")) > 0
-            ]
-            removed += before - len(tab["accounts"])
-        return removed
+            if tab is expired_tab or self._is_expired_tab(tab):
+                continue
+            keep: list[dict] = []
+            for acc in tab["accounts"]:
+                if self._remaining_days(acc.get("created_at", "")) > 0:
+                    keep.append(acc)
+                else:
+                    expired_tab["accounts"].append(acc)
+                    moved += 1
+            tab["accounts"] = keep
+        # 만료 탭이 새로 생겼으면 UI 탭을 다시 구성
+        if not existed and hasattr(self, "notebook") and self.notebook.winfo_exists():
+            try:
+                selected = self.notebook.index(self.notebook.select())
+            except Exception:
+                selected = 0
+            # notebook이 이미 만들어진 뒤에만 rebuild
+            if self.notebook.tabs():
+                self._rebuild_tabs()
+                try:
+                    if 0 <= selected < len(self.tabs):
+                        self.notebook.select(selected)
+                except Exception:
+                    pass
+        return moved
 
     def _list_available_manuscripts(self, folder: str) -> list[Path]:
         root = Path(folder)
@@ -3600,6 +3785,21 @@ class VelogApp(tk.Tk):
                     if key in patch:
                         acc[key] = str(patch.get(key) or "")
 
+        checked = int(summary.get("checked") or 0)
+        indexed_n = int(summary.get("indexed") or 0)
+        not_n = int(summary.get("not_indexed") or 0)
+        failed = int(summary.get("failed") or 0)
+        if tab is not None and not error:
+            _, _, unchecked_n = self._index_counts(tab.get("accounts") or [])
+            tab["last_index_check"] = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "checked": checked,
+                "indexed": indexed_n,
+                "not_indexed": not_n,
+                "failed": failed,
+                "unchecked": unchecked_n,
+            }
+
         self._indexing = False
         self._index_stop = False
         if hasattr(self, "index_btn"):
@@ -3617,10 +3817,6 @@ class VelogApp(tk.Tk):
             messagebox.showerror("인덱싱 확인", error, parent=self)
             return
 
-        checked = int(summary.get("checked") or 0)
-        indexed_n = int(summary.get("indexed") or 0)
-        not_n = int(summary.get("not_indexed") or 0)
-        failed = int(summary.get("failed") or 0)
         msg = (
             f"인덱싱 확인 완료: {checked}건 · "
             f"인덱싱됨 {indexed_n} · 미인덱싱 {not_n}"
@@ -3688,7 +3884,7 @@ class VelogApp(tk.Tk):
             for tab in self.tabs:
                 self._fill_tree(tab)
             self._save_settings()
-            self.status.set(f"만료 계정 {removed}개를 목록에서 삭제했습니다.")
+            self.status.set(f"만료 계정 {removed}개를 「{EXPIRED_TAB_TITLE}」탭으로 옮겼습니다.")
         for tab in self.tabs:
             tree = tab.get("tree")
             if tree is None:
@@ -3743,12 +3939,27 @@ class VelogApp(tk.Tk):
         if tab is None or not tab["accounts"]:
             messagebox.showwarning("계정 확인", "현재 탭에 계정을 하나 이상 등록해 주세요.", parent=self)
             return
+        if self._is_expired_tab(tab):
+            messagebox.showwarning(
+                "출간",
+                f"「{EXPIRED_TAB_TITLE}」탭에서는 출간할 수 없습니다.\n다른 탭으로 이동해 주세요.",
+                parent=self,
+            )
+            return
         self._active_tab = tab
 
         removed = self._purge_expired_accounts()
         if removed:
-            self._fill_tree(tab)
+            for t in self.tabs:
+                if t.get("tree") is not None:
+                    self._fill_tree(t)
             self._update_summary()
+            # 같은 탭 dict 유지 (만료로만 일부 계정이 빠짐)
+            if tab not in self.tabs:
+                tab = self._current_tab()
+                if tab is None or self._is_expired_tab(tab):
+                    return
+            self._active_tab = tab
 
         folder = self.manuscript_folder.get().strip()
         assigned = 0
@@ -5069,10 +5280,32 @@ class VelogApp(tk.Tk):
                 for t in tabs:
                     if not isinstance(t, dict):
                         continue
-                    self.tabs.append({
+                    last_check = t.get("last_index_check")
+                    tab_row = {
                         "title": str(t.get("title", "탭")),
                         "accounts": self._clean_accounts(t.get("accounts", []), now_iso),
-                    })
+                    }
+                    if (
+                        str(t.get("role") or "") == EXPIRED_TAB_ROLE
+                        or str(tab_row["title"]).strip() == EXPIRED_TAB_TITLE
+                    ):
+                        tab_row["role"] = EXPIRED_TAB_ROLE
+                        tab_row["title"] = EXPIRED_TAB_TITLE
+                    if isinstance(last_check, dict) and last_check:
+                        def _as_int(key: str) -> int:
+                            try:
+                                return int(last_check.get(key) or 0)
+                            except (TypeError, ValueError):
+                                return 0
+                        tab_row["last_index_check"] = {
+                            "at": str(last_check.get("at") or ""),
+                            "checked": _as_int("checked"),
+                            "indexed": _as_int("indexed"),
+                            "not_indexed": _as_int("not_indexed"),
+                            "failed": _as_int("failed"),
+                            "unchecked": _as_int("unchecked"),
+                        }
+                    self.tabs.append(tab_row)
             else:
                 self.tabs.append({
                     "title": "기본",
@@ -5207,7 +5440,16 @@ class VelogApp(tk.Tk):
 
     def _save_settings(self) -> None:
         try:
-            tabs = [{"title": t["title"], "accounts": t["accounts"]} for t in self.tabs]
+            tabs = []
+            for t in self.tabs:
+                row = {"title": t["title"], "accounts": t["accounts"]}
+                if self._is_expired_tab(t):
+                    row["role"] = EXPIRED_TAB_ROLE
+                    row["title"] = EXPIRED_TAB_TITLE
+                last_check = t.get("last_index_check")
+                if isinstance(last_check, dict) and last_check:
+                    row["last_index_check"] = last_check
+                tabs.append(row)
             SETTINGS_PATH.write_text(
                 json.dumps(
                     {
